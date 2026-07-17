@@ -43,24 +43,23 @@
     <g><rect x="262" y="238" width="300" height="30" class="card"/>
       <rect x="278" y="249" width="8" height="8" fill="#E0883C"/>
       <text x="298" y="257" class="lbl">ns-proton-1</text><text x="430" y="257" class="dim">wg0 → Proton</text>
-      <path d="M562 253 H 694" class="wg"/></g>
+      <path d="M562 253 H 694" class="wg" marker-end="url(#ar)"/></g>
     <g><rect x="262" y="276" width="300" height="30" class="card"/>
       <rect x="278" y="287" width="8" height="8" fill="#E0883C"/>
       <text x="298" y="295" class="lbl">ns-proton-2</text><text x="430" y="295" class="dim">wg0 → Proton</text>
-      <path d="M562 291 H 694" class="wg"/></g>
+      <path d="M562 291 H 694" class="wg" marker-end="url(#ar)"/></g>
     <g><rect x="262" y="314" width="300" height="30" class="card"/>
       <rect x="278" y="325" width="8" height="8" fill="#E0883C"/>
       <text x="298" y="333" class="lbl">ns-proton-3</text><text x="430" y="333" class="dim">wg0 → Proton</text>
-      <path d="M562 329 H 694" class="wg"/></g>
+      <path d="M562 329 H 694" class="wg" marker-end="url(#ar)"/></g>
     <text x="298" y="366" class="dim">…up to 9 rotating slots</text>
     <!-- dns tunnel -->
     <g><rect x="262" y="382" width="300" height="46" fill="#23231a" stroke="#7E7A46" stroke-width="1.4"/>
       <rect x="278" y="401" width="8" height="8" fill="#7E7A46"/>
       <text x="298" y="401" class="lbl" fill="#b7b58a">ns-dns · unbound</text>
       <text x="298" y="419" class="dim">DNS over its own tunnel (serve-stale)</text>
-      <path d="M562 405 H 694" class="wg" stroke="#7E7A46"/></g>
+      <path d="M562 405 H 694" class="wg" stroke="#7E7A46" marker-end="url(#ar)"/></g>
   </g>
-  <path d="M670 225 H 700" class="flow" marker-end="url(#ar)"/>
 
   <!-- ========== column 3: exits ========== -->
   <text x="820" y="126" text-anchor="middle" class="hd">Proton exits</text>
