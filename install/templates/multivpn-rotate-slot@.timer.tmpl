@@ -1,0 +1,11 @@
+[Unit]
+Description=Rotate multivpn slot %i daily with 12h jitter
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=12h
+Persistent=true
+Unit=multivpn-rotate-slot@%i.service
+
+[Install]
+WantedBy=timers.target

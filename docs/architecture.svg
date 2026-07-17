@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="560" viewBox="0 0 960 560"
+     font-family="'DejaVu Sans Mono','Courier New',monospace">
+  <defs>
+    <marker id="ar" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto">
+      <path d="M0 0 L6 3 L0 6 z" fill="#7E7A46"/>
+    </marker>
+    <style>
+      .card{fill:#232019;stroke:#4A4436;stroke-width:1.4}
+      .lbl{fill:#D8CBB4;font-size:14px}
+      .mut{fill:#8f8a7a;font-size:12px}
+      .dim{fill:#6b6455;font-size:11px}
+      .hd{fill:#E8E0CF;font-size:15px;font-weight:bold}
+      .flow{stroke:#7E7A46;stroke-width:2;fill:none}
+      .wg{stroke:#5b553f;stroke-width:1.4;fill:none;stroke-dasharray:4 3}
+    </style>
+  </defs>
+
+  <rect width="960" height="560" fill="#1B1815"/>
+  <text x="34" y="42" font-size="15" font-weight="bold" fill="#E0883C">How Proteus routes traffic</text>
+  <text x="34" y="64" class="dim">one client VLAN in · many rotating Proton exits out</text>
+
+  <!-- ========== column 1: client ========== -->
+  <rect x="34" y="150" width="150" height="150" class="card"/>
+  <text x="109" y="178" text-anchor="middle" class="hd">Client VLAN</text>
+  <text x="109" y="200" text-anchor="middle" class="mut">172.16.1.0/24</text>
+  <g fill="#D8CBB4"><rect x="68" y="234" width="8" height="8"/><rect x="105" y="234" width="8" height="8"/><rect x="142" y="234" width="8" height="8"/>
+     <rect x="86" y="262" width="8" height="8"/><rect x="124" y="262" width="8" height="8"/></g>
+  <text x="109" y="292" text-anchor="middle" class="dim">phones · TVs · laptops</text>
+  <path d="M184 225 H 232" class="flow" marker-end="url(#ar)"/>
+
+  <!-- ========== column 2: gateway ========== -->
+  <rect x="240" y="96" width="430" height="368" fill="#201D17" stroke="#6a5f3f" stroke-width="1.6"/>
+  <text x="262" y="126" class="hd">PROTEUS gateway</text>
+  <text x="262" y="146" class="dim">Debian · netns per exit · nftables kill-switch</text>
+
+  <!-- dispatcher bar -->
+  <rect x="262" y="162" width="386" height="58" fill="#2a2317" stroke="#E0883C" stroke-width="1.4"/>
+  <text x="278" y="186" class="lbl" fill="#E0883C">dispatcher · NFQUEUE 0</text>
+  <text x="278" y="206" class="dim">per-source pinning · health-aware exit selection</text>
+
+  <!-- slots -->
+  <g>
+    <g><rect x="262" y="238" width="300" height="30" class="card"/>
+      <rect x="278" y="249" width="8" height="8" fill="#E0883C"/>
+      <text x="298" y="257" class="lbl">ns-proton-1</text><text x="430" y="257" class="dim">wg0 → Proton</text>
+      <path d="M562 253 H 694" class="wg"/></g>
+    <g><rect x="262" y="276" width="300" height="30" class="card"/>
+      <rect x="278" y="287" width="8" height="8" fill="#E0883C"/>
+      <text x="298" y="295" class="lbl">ns-proton-2</text><text x="430" y="295" class="dim">wg0 → Proton</text>
+      <path d="M562 291 H 694" class="wg"/></g>
+    <g><rect x="262" y="314" width="300" height="30" class="card"/>
+      <rect x="278" y="325" width="8" height="8" fill="#E0883C"/>
+      <text x="298" y="333" class="lbl">ns-proton-3</text><text x="430" y="333" class="dim">wg0 → Proton</text>
+      <path d="M562 329 H 694" class="wg"/></g>
+    <text x="298" y="366" class="dim">…up to 9 rotating slots</text>
+    <!-- dns tunnel -->
+    <g><rect x="262" y="382" width="300" height="46" fill="#23231a" stroke="#7E7A46" stroke-width="1.4"/>
+      <rect x="278" y="401" width="8" height="8" fill="#7E7A46"/>
+      <text x="298" y="401" class="lbl" fill="#b7b58a">ns-dns · unbound</text>
+      <text x="298" y="419" class="dim">DNS over its own tunnel (serve-stale)</text>
+      <path d="M562 405 H 694" class="wg" stroke="#7E7A46"/></g>
+  </g>
+  <path d="M670 225 H 700" class="flow" marker-end="url(#ar)"/>
+
+  <!-- ========== column 3: exits ========== -->
+  <text x="820" y="126" text-anchor="middle" class="hd">Proton exits</text>
+  <text x="820" y="146" text-anchor="middle" class="dim">a different IP each</text>
+  <g font-size="12">
+    <g><rect x="700" y="238" width="228" height="30" fill="#2a2317" stroke="#7a6a44"/><rect x="716" y="249" width="8" height="8" fill="#E0883C"/><text x="734" y="257" class="lbl" font-size="12">US-CA · 198.51.100.6</text></g>
+    <g><rect x="700" y="276" width="228" height="30" fill="#2a2317" stroke="#7a6a44"/><rect x="716" y="287" width="8" height="8" fill="#E0883C"/><text x="734" y="295" class="lbl" font-size="12">US-TX · 198.51.100.39</text></g>
+    <g><rect x="700" y="314" width="228" height="30" fill="#2a2317" stroke="#7a6a44"/><rect x="716" y="325" width="8" height="8" fill="#E0883C"/><text x="734" y="333" class="lbl" font-size="12">US-FL · 203.0.113.141</text></g>
+    <g><rect x="700" y="382" width="228" height="46" fill="#23231a" stroke="#7E7A46"/><rect x="716" y="401" width="8" height="8" fill="#7E7A46"/><text x="734" y="409" class="lbl" font-size="12" fill="#b7b58a">DNS exit</text></g>
+  </g>
+  <text x="820" y="470" text-anchor="middle" class="mut">→  the Internet</text>
+
+  <!-- ========== footer: guardrails ========== -->
+  <text x="34" y="504" class="dim">GUARDRAILS</text>
+  <g font-size="12" fill="#c9bfa6">
+    <g><rect x="34"  y="516" width="110" height="30" fill="#232019" stroke="#7a6a44"/><text x="89"  y="535" text-anchor="middle">kill-switch</text></g>
+    <g><rect x="154" y="516" width="162" height="30" fill="#232019" stroke="#7a6a44"/><text x="235" y="535" text-anchor="middle">auto-revert install</text></g>
+    <g><rect x="326" y="516" width="190" height="30" fill="#232019" stroke="#7a6a44"/><text x="421" y="535" text-anchor="middle">reputation + speed gate</text></g>
+    <g><rect x="526" y="516" width="134" height="30" fill="#232019" stroke="#7a6a44"/><text x="593" y="535" text-anchor="middle">latency scoring</text></g>
+    <g><rect x="670" y="516" width="252" height="30" fill="#232019" stroke="#7a6a44"/><text x="796" y="535" text-anchor="middle">daily rotation + swap-on-degrade</text></g>
+  </g>
+</svg>

@@ -1,0 +1,64 @@
+# /etc/unbound/unbound.conf.d/multivpn-dns.conf
+# Dedicated DNS resolver for the multivpn gateway.
+# Egress is steered via fwmark 0x6 -> table 106 -> ns-dns-6 (a dedicated Proton
+# WG tunnel), so DNS queries never hit the mgmt interface and never share a
+# tunnel with the rotating client-traffic slots.
+
+server:
+    verbosity: 1
+    use-syslog: yes
+
+    # Listeners (main ns): LAN clients + loopback.
+    interface: ${CLIENT_GW_IP}
+    interface: 127.0.0.1
+
+    # Who may ask us.
+    access-control: 127.0.0.0/8 allow
+    access-control: ${CLIENT_VLAN_CIDR} allow
+    access-control: ${MGMT_CIDR} allow
+    access-control: 0.0.0.0/0 refuse
+
+    # Sensible cache + privacy defaults.
+    prefetch: yes
+    qname-minimisation: yes
+    hide-identity: yes
+    hide-version: yes
+    harden-glue: yes
+    harden-dnssec-stripped: yes
+    use-caps-for-id: no
+    edns-buffer-size: 1232
+
+    # Keep short-TTL records cached longer to reduce cold-miss rate. The tunnel
+    # RTT to Quad9 is ~220ms and qname-minimisation multiplies that by 2-4x per
+    # cold lookup, so holding records for at least 5 min meaningfully cuts the
+    # visible lag from surfing (most cold-miss pain is on first-hit anyway).
+    cache-min-ttl: 300
+
+    # Serve stale answers while refreshing in the background (RFC 8767). Over
+    # this tunnel a cold recursion is ~0.5-2s; with serve-expired a record seen
+    # in the last day returns instantly (stale) and unbound refreshes async, so
+    # the client almost never eats the full tunnel round-trip on a repeat name.
+    # client-timeout: try a fresh answer first, fall back to stale after 1.8s.
+    serve-expired: yes
+    serve-expired-ttl: 86400
+    serve-expired-client-timeout: 1800
+    prefetch-key: yes
+
+    # Bigger caches for a multi-host gateway (defaults are 4m each).
+    msg-cache-size: 64m
+    rrset-cache-size: 128m
+
+    # Bind outgoing queries to the main-ns transit IP that feeds ns-dns-6.
+    # This pins the source of upstream traffic to the interface that is
+    # fwmark-routed to the DNS tunnel — belt-and-braces alongside the mangle
+    # rule that stamps mark 0x6 on unbound's packets.
+    outgoing-interface: ${DNS_TRANSIT_MAIN}
+
+    # Do not recurse ourselves — forward everything to Quad9 over the tunnel.
+    do-not-query-localhost: yes
+
+forward-zone:
+    name: "."
+    forward-first: no
+    forward-tls-upstream: no
+${UNBOUND_FORWARD_ADDRS}

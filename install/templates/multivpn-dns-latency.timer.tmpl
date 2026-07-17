@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic dns-6 latency check
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+RandomizedDelaySec=2min
+Unit=multivpn-dns-latency.service
+
+[Install]
+WantedBy=timers.target

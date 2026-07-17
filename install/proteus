@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# proteus — interactive setup wizard for the Proteus rotating-exit gateway.
+#
+#   sudo ./install/proteus          run the guided install on this machine
+#        ./install/proteus --demo   cinematic walkthrough (no root, changes nothing)
+#        ./install/proteus --help
+#
+# The wizard is a friendly front-end over the same phases install.sh runs
+# (config → preflight → apply → confirm). Internals are the `multivpn` stack;
+# "Proteus" is the product it presents.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$HERE/lib/tui.sh"
+
+DEMO=0
+case "${1:-}" in
+    --demo) DEMO=1;;
+    --help|-h) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    "") ;;
+    *) echo "unknown option: $1 (try --help)"; exit 1;;
+esac
+[[ $DEMO == 1 ]] && export PROTEUS_FORCE_COLOR=1
+CONF="$HERE/multivpn.conf"
+
+# --- demo helpers -------------------------------------------------------------
+# type_out: reveal text like someone typing it (demo polish only).
+SPEED=${PROTEUS_SPEED:-1}
+_scaled() { awk -v s="$1" -v sp="$SPEED" 'BEGIN{ printf "%.3f", s*sp }'; }
+type_out() {
+    local s=$1 i d; d=$(_scaled 0.018)
+    if [[ $DEMO == 1 ]]; then
+        for (( i=0; i<${#s}; i++ )); do printf '%s' "${s:$i:1}"; sleep "$d"; done
+        printf '\n'
+    else printf '%s\n' "$s"; fi
+}
+beat() { [[ $DEMO == 1 ]] && sleep "$(_scaled "${1:-0.6}")" || true; }
+# demo_answer: show a prompt already "answered" with a value.
+demo_answer() { printf '   %s?%s %s %s[%s]%s ' "$VIOL" "$RESET" "$1" "$DIM" "$2" "$RESET"; type_out "$2"; }
+
+# ==============================================================================
+#  screens
+# ==============================================================================
+screen_welcome() {
+    clear 2>/dev/null || true
+    proteus_banner
+    box "What this is" \
+        "A transparent gateway that rotates every client's traffic across" \
+        "several ${TEAL}Proton WireGuard${RESET} exits — so each activity leaves from a" \
+        "different IP, and a dud exit is swapped out before you notice." \
+        "" \
+        "${DIM}per-slot network namespaces · kill-switch · reputation + speed gates${RESET}"
+    echo
+    info "This wizard walks you through ${BOLD}config → preflight → apply → go-live${RESET}."
+    [[ $DEMO == 1 ]] && note "(demo mode — nothing on this machine will change)"
+    echo
+    if [[ $DEMO == 1 ]]; then beat 1.6; else pause "press enter to begin…"; fi
+}
+
+# ---- 1. config ---------------------------------------------------------------
+screen_config() {
+    step "Describe the network"
+    note "Proteus sits between your client VLAN and the internet."
+    echo
+    local mgmt_if client_if mgmt_cidr client_cidr gw slots
+    if [[ $DEMO == 1 ]]; then
+        info "detected interfaces:"
+        kv "ens18" "10.0.0.42/24   ${DIM}(mgmt — reachable now)${RESET}"
+        kv "ens19" "—              ${DIM}(client VLAN side)${RESET}"
+        echo; beat 1
+        demo_answer "management interface" "ens18";       mgmt_if=ens18;            beat .4
+        demo_answer "client-VLAN interface" "ens19";      client_if=ens19;          beat .4
+        demo_answer "management CIDR" "10.0.0.0/24";      mgmt_cidr=10.0.0.0/24;     beat .4
+        demo_answer "client VLAN CIDR" "172.16.1.0/24";   client_cidr=172.16.1.0/24; beat .4
+        demo_answer "gateway IP on the VLAN" "172.16.1.5"; gw=172.16.1.5;            beat .4
+        demo_answer "how many rotating exits" "5";        slots=5;                   beat .6
+    else
+        # real detection: list non-loopback links with their v4 addr
+        info "interfaces on this host:"
+        local l
+        while read -r l; do note "$l"; done < <(ip -o -4 addr show 2>/dev/null \
+            | awk '$2!="lo"{printf "%-10s %s\n",$2,$4}')
+        [[ -z "$(ip -o -4 addr show 2>/dev/null | awk '$2!="lo"')" ]] && \
+            while read -r l; do note "$l"; done < <(ip -o link show 2>/dev/null | awk -F': ' '$2!="lo"{print $2}')
+        echo
+        local guess_mgmt guess_client
+        guess_mgmt=$(ip -o -4 route show default 2>/dev/null | awk '{print $5; exit}')
+        guess_client=$(ip -o link show 2>/dev/null | awk -F': ' -v m="$guess_mgmt" '$2!="lo"&&$2!=m{print $2; exit}')
+        mgmt_if=$(ask "management interface (has your SSH/route)" "${guess_mgmt:-eth0}")
+        client_if=$(ask "client-VLAN interface" "${guess_client:-eth1}")
+        mgmt_cidr=$(ask "management CIDR (subnet you admin from)" "$(ip -o -4 addr show "$mgmt_if" 2>/dev/null | awk '{print $4; exit}')")
+        client_cidr=$(ask "client VLAN CIDR" "172.16.1.0/24")
+        gw=$(ask "gateway IP Proteus owns on the VLAN" "${client_cidr%.*}.5")
+        slots=$(ask "how many rotating exits (1-9)" "5")
+    fi
+    echo
+    if [[ $DEMO == 0 ]]; then
+        cat > "$CONF" <<CFG
+MGMT_IFACE=$mgmt_if
+CLIENT_IFACE=$client_if
+MGMT_CIDR=$mgmt_cidr
+CLIENT_VLAN_CIDR=$client_cidr
+CLIENT_GW_IP=$gw
+SLOT_COUNT=$slots
+DNS_UPSTREAMS="9.9.9.9 149.112.112.112"
+PROTON_COUNTRY=US
+STREAMING_MIN_MBPS=25
+CFG
+    fi
+    box "Configuration" \
+        "$(printf '%-14s %s' 'mgmt'    "$mgmt_if  ($mgmt_cidr)")" \
+        "$(printf '%-14s %s' 'client'  "$client_if  ($client_cidr, gw $gw)")" \
+        "$(printf '%-14s %s' 'exits'   "$slots rotating Proton tunnels + a dedicated DNS tunnel")"
+    echo
+    [[ $DEMO == 1 ]] && beat 1.4 || { confirm "Looks right?" Y || { warn "edit $CONF and re-run"; exit 1; }; }
+}
+
+# ---- 2. preflight ------------------------------------------------------------
+_check_line() { # name  status(ok|warn|fail)  detail
+    case "$2" in ok) ok "$3";; warn) warn "$3";; fail) bad "$3";; esac
+}
+screen_doctor() {
+    step "Preflight — the guardrails"
+    note "Every check below runs before anything changes."
+    echo
+    if [[ $DEMO == 1 ]]; then
+        local checks=(
+            "ok|apt + systemd present"
+            "ok|two distinct NICs (gateway mode)"
+            "ok|IP forwarding controllable"
+            "ok|no conflicting namespaces or ip-rules"
+            "ok|live SSH source 10.0.0.240 is inside MGMT_CIDR — you won't be locked out"
+            "warn|no client traffic yet — a brand-new VLAN is legitimately quiet"
+            "ok|Proton API reachable"
+        )
+        local c; for c in "${checks[@]}"; do spin "checking…" 0.3; printf '\e[1A\e[2K'; _check_line "" "${c%%|*}" "${c#*|}"; beat .35; done
+    else
+        source "$HERE/lib/common.sh"; source "$HERE/lib/doctor.sh"
+        load_config "$CONF"; validate_config || { bad "config invalid — fix $CONF"; exit 1; }
+        # doctor_pre prints its own PASS/WARN/FAIL lines; run it and gate on hard fails.
+        if doctor_pre; then :; else bad "preflight failed — fix the ✗ lines above and re-run"; exit 1; fi
+    fi
+    echo; ok "preflight clear."
+    [[ $DEMO == 1 ]] && beat 1.2
+}
+
+# ---- 3. apply (behind the auto-revert) --------------------------------------
+screen_apply() {
+    step "Apply the gateway"
+    note "The kill-switch + routing go in behind a self-cancelling revert timer."
+    note "If you get locked out, do nothing — it rolls back on its own."
+    echo
+    if [[ $DEMO == 1 ]]; then
+        spin "installing dependencies (apt)" 1.4
+        spin "rendering nftables, unbound, systemd units" 1.0
+        spin "installing 16 runtime scripts + 12 units" 0.8
+        spin "arming 600s auto-revert, loading kill-switch" 1.1
+        echo; ok "gateway applied — kill-switch live, forwarding on."
+    else
+        source "$HERE/lib/common.sh"; source "$HERE/lib/render.sh"; source "$HERE/lib/apply.sh"
+        load_config "$CONF"
+        local stage="$HERE/.staging"
+        info "installing dependencies…"; install_deps_wrap
+        info "rendering config…";        render_all "$stage" >/dev/null
+        info "applying files + network (behind ${NFT_REVERT_SECONDS:-600}s revert)…"
+        apply_files "$stage" >/dev/null && apply_network >/dev/null
+        ok "gateway applied — kill-switch live, forwarding on."
+    fi
+    echo
+    box "Safety check" \
+        "Open a ${BOLD}new${RESET} SSH session now and confirm you still have access" \
+        "and that clients still reach the LAN. If anything is wrong, wait —" \
+        "the ruleset auto-reverts and nothing sticks."
+    echo
+    [[ $DEMO == 1 ]] && { beat 1.2; info "new session confirmed ✓ — keeping the ruleset"; beat .8; } \
+        || { pause "reconnected OK? press enter to lock it in (or Ctrl-C to bail)…"; source "$HERE/lib/apply.sh"; confirm 2>/dev/null || true; }
+}
+install_deps_wrap() {   # real mode: run install.sh's dep step quietly
+    ( cd "$HERE/.." && source "$HERE/install.sh" >/dev/null 2>&1 ); install_deps
+}
+
+# ---- 4. go live: login, mint, enable ----------------------------------------
+_slot_row() { # n  server  exit  mbps
+    printf '   %s◆%s slot %s%s%s  %s%-14s%s  %sexit %s%-15s%s  %s%s Mbps%s\n' \
+        "$TEAL" "$RESET" "$BOLD" "$1" "$RESET" "$FOG" "$2" "$RESET" \
+        "$DIM" "$RESET$AQUA" "$3" "$RESET" "$GOOD" "$4" "$RESET"
+}
+screen_confirm() {
+    step "Go live"
+    if [[ $DEMO == 1 ]]; then
+        info "Proton session:"; beat .3; ok "Already logged in as ${BOLD}you••••${RESET} — no login needed"
+        echo; info "minting a fresh exit per slot (mint → probe → gate → promote):"
+        echo; beat .6
+        local rows=(
+          "proton-1|US-CA #753|198.51.100.6|138"
+          "proton-2|US-TX #157|198.51.100.39|121"
+          "proton-3|US-FL #78|203.0.113.12|112"
+          "proton-4|US-NY #741|203.0.113.220|129"
+          "proton-5|US-GA #238|198.51.100.201|118"
+        )
+        local r; for r in "${rows[@]}"; do
+            IFS='|' read -r s srv ip mb <<<"$r"
+            spin "minting $s…" 0.7; printf '\e[1A\e[2K'; _slot_row "${s#proton-}" "$srv" "$ip" "$mb"; beat .2
+        done
+        echo; spin "minting dedicated DNS tunnel" 0.7
+        spin "enabling services (dispatcher, warmup, daily rotation)" 1.0
+    else
+        source "$HERE/install.sh" >/dev/null 2>&1 || true
+        info "Proton login (skips if already logged in):"; proton_bootstrap
+        info "minting initial exits (this takes a couple of minutes):"; initial_mint
+        info "enabling services:"; enable_services
+        doctor_post || true
+    fi
+    echo; ok "all exits promoted · dispatcher active · daily rotation armed."
+    [[ $DEMO == 1 ]] && beat 1
+}
+
+# ---- 5. the payoff: a new IP per activity -----------------------------------
+screen_rotation() {
+    [[ $DEMO == 1 ]] || return 0
+    step "The payoff"
+    note "The dispatcher pins each new activity to a healthy exit — automatically."
+    echo
+    local acts=(
+      "streaming a movie|198.51.100.6|Los Angeles"
+      "online shopping|198.51.100.39|Dallas"
+      "reading the news|203.0.113.12|Miami"
+      "a work video call|203.0.113.220|New York"
+    )
+    local a; for a in "${acts[@]}"; do
+        IFS='|' read -r what ip where <<<"$a"
+        printf '   %s➜%s %-22s ' "$VIOL" "$RESET" "$what"
+        spin "routing…" 0.5; printf '\e[1A\e[2K'
+        printf '   %s➜%s %-22s %sexit%s %s%-15s%s %s(%s)%s\n' \
+            "$VIOL" "$RESET" "$what" "$DIM" "$RESET" "$AQUA$BOLD" "$ip" "$RESET" "$DIM" "$where" "$RESET"
+        beat .5
+    done
+    echo; ok "four activities, four different IPs — no clicks, no config."
+    beat 1
+}
+
+screen_done() {
+    step "Done"
+    box "$(mark) is live" \
+        "Clients on the VLAN now egress through rotating Proton exits." \
+        "" \
+        "$(printf '%s%-22s%s %s' "$INK" 'watch it work'   "$RESET" 'sudo multivpn-slot-rank')" \
+        "$(printf '%s%-22s%s %s' "$INK" 'force a rotation' "$RESET" 'sudo systemctl start multivpn-rotate-slot@proton-1')" \
+        "$(printf '%s%-22s%s %s' "$INK" 'live logs'        "$RESET" 'journalctl -t slot-warmup -f')"
+    echo
+    printf '   %sthanks for trying %s%s%s.%s\n\n' "$DIM" "$RESET" "$(mark)" "$DIM" "$RESET"
+}
+
+# ==============================================================================
+main() {
+    if [[ $DEMO == 0 && $EUID -ne 0 ]]; then
+        source "$HERE/lib/tui.sh"; proteus_banner
+        bad "the real install needs root: ${BOLD}sudo $0${RESET}"
+        info "just looking? try the walkthrough: ${BOLD}$0 --demo${RESET}"
+        exit 1
+    fi
+    steps_total 6
+    screen_welcome
+    screen_config
+    screen_doctor
+    screen_apply
+    screen_confirm
+    screen_rotation
+    screen_done
+}
+main

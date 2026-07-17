@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""
+multivpn-proton-bootstrap — interactive one-shot Proton VPN login.
+
+Run once as root. Prompts for Proton username, password, and (if 2FA is on)
+the TOTP code. The proton-vpn-api-core library persists the auth session under
+/etc/Proton/ (the lib's fixed path when running as uid 0), and subsequent
+proton-mint runs reuse it without prompting.
+
+When the session eventually expires or is revoked, re-run this.
+"""
+from __future__ import annotations
+
+import asyncio
+import getpass
+import os
+import sys
+
+# Force proton-sso onto the JsonFiles keyring: the default factory probes
+# SecretService, which raises SecretServiceNotAvailableException on a
+# headless system (no DBus session). That exception is not caught by the
+# backend's own validator, so we bypass the probe by naming the backend.
+from proton.sso import ProtonSSO
+_sso_orig_init = ProtonSSO.__init__
+def _sso_init_json(self, *args, **kwargs):
+    kwargs.setdefault("keyring_backend_name", "json")
+    _sso_orig_init(self, *args, **kwargs)
+ProtonSSO.__init__ = _sso_init_json
+
+from proton.vpn.core.api import ProtonVPNAPI
+from proton.vpn.core.session_holder import ClientTypeMetadata, SessionHolder
+
+# Impersonate the official Proton VPN Linux GUI app — the API enforces a
+# minimum-version gate per X-pm-appversion header, and our own identifier
+# ("linux-vpn-cli@0.1.0") gets rejected with ProtonAPIError 5003.
+SessionHolder._get_app_version_header_value = staticmethod(
+    lambda _meta: "linux-vpn@4.8.0"
+)
+
+CLIENT_METADATA = ClientTypeMetadata(
+    type="gtk",
+    version="4.8.0",
+    architecture="x86_64",
+)
+
+
+async def run() -> int:
+    api = ProtonVPNAPI(client_type_metadata=CLIENT_METADATA)
+
+    if api.is_user_logged_in():
+        print(f"Already logged in as {api.account_name}. Nothing to do.")
+        return 0
+
+    username = input("Proton username: ").strip()
+    if not username:
+        print("no username", file=sys.stderr)
+        return 2
+    password = getpass.getpass("Proton password: ")
+
+    result = await api.login(username, password)
+
+    if not result.success and result.twofa_required:
+        code = input("2FA code (TOTP): ").strip()
+        result = await api.submit_2fa_code(code)
+
+    if not result.success:
+        print(f"Login failed: {result}", file=sys.stderr)
+        return 1
+
+    print(f"Logged in as {api.account_name}. Tier={api.user_tier}.")
+    return 0
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        print("run as root (session gets written under /etc/Proton)", file=sys.stderr)
+        return 2
+    return asyncio.run(run())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

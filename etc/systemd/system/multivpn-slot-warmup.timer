@@ -1,0 +1,11 @@
+[Unit]
+Description=Proton slot warmup, every 20s
+
+[Timer]
+OnBootSec=45s
+OnUnitActiveSec=10s
+AccuracySec=2s
+Unit=multivpn-slot-warmup.service
+
+[Install]
+WantedBy=timers.target

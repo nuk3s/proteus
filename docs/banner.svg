@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="860" height="300" viewBox="0 0 860 300"
+     font-family="'DejaVu Sans Mono','Courier New',monospace" xml:space="preserve">
+  <!-- terminal panel: warm charcoal, square, hairline frame -->
+  <rect x="0.5" y="0.5" width="859" height="299" fill="#1B1815" stroke="#4A4436"/>
+  <line x1="0" y1="34" x2="860" y2="34" stroke="#332e26"/>
+  <!-- title strip -->
+  <rect x="14" y="12" width="10" height="10" fill="#E0883C"/>
+  <text x="34" y="22" font-size="12" fill="#8f8a7a">proteus — rotating-exit gateway</text>
+
+  <!-- prompt -->
+  <text x="30" y="66" font-size="15"><tspan fill="#7E7A46">admin@proteus</tspan><tspan fill="#8f8a7a">:~$</tspan><tspan fill="#D8CBB4"> proteus --setup</tspan></text>
+
+  <!-- slant wordmark, flat amber -->
+  <g fill="#E0883C" font-size="24">
+    <text x="30" y="104">    ____             __                 </text>
+    <text x="30" y="126">   / __ \_________  / /____  __  _______</text>
+    <text x="30" y="148">  / /_/ / ___/ __ \/ __/ _ \/ / / / ___/</text>
+    <text x="30" y="170"> / ____/ /  / /_/ / /_/  __/ /_/ (__  ) </text>
+    <text x="30" y="192">/_/   /_/   \____/\__/\___/\__,_/____/  </text>
+  </g>
+  <text x="34" y="222" font-size="14" fill="#8f8a7a">~ a new face for every connection</text>
+
+  <line x1="30" y1="240" x2="830" y2="240" stroke="#332e26"/>
+
+  <!-- rotation strip: one client, several shifting exits -->
+  <g font-size="13">
+    <rect x="30" y="256" width="64" height="26" fill="none" stroke="#4A4436"/>
+    <text x="62" y="273" text-anchor="middle" fill="#D8CBB4">client</text>
+    <path d="M96 269 H 138" stroke="#7E7A46" stroke-width="1.4" fill="none"/>
+    <path d="M138 265 l6 4 l-6 4 z" fill="#7E7A46"/>
+    <g fill="#8f8a7a">
+      <rect x="152" y="264" width="8" height="8" fill="#E0883C"/><text x="168" y="273">198.51.100.6</text>
+      <rect x="314" y="264" width="8" height="8" fill="#D7A55F"/><text x="330" y="273">198.51.100.39</text>
+      <rect x="452" y="264" width="8" height="8" fill="#7E7A46"/><text x="468" y="273">203.0.113.220</text>
+      <rect x="624" y="264" width="8" height="8" fill="#B7C08A"/><text x="640" y="273">192.0.2.7</text>
+    </g>
+  </g>
+</svg>

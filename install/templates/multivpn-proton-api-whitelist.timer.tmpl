@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh nftables @proton_api set daily (in case Proton rotates API IPs)
+After=multivpn-proton-api-whitelist.service
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=24h
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

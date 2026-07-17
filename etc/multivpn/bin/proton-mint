@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""
+multivpn-proton-mint — unattended WireGuard config minter for Proton VPN.
+
+Reuses the session persisted by proton-bootstrap. Picks a streaming-capable
+US server, generates a fresh Ed25519/X25519 keypair, asks Proton to register
+the public key by signing a client certificate, and writes a complete wg-quick
+config to <out-dir>/<slot>-<server>-<timestamp>.conf.
+
+Each mint uses a brand-new keypair, so the identity is unlinkable from the
+previous rotation on that slot.
+
+Usage:
+  proton-mint --slot proton-1
+              [--country US] [--streaming | --no-streaming]
+              [--out-dir /etc/multivpn/wg/proton/auto]
+
+Exit codes:
+  0  success, config path printed on stdout
+  1  session not authenticated — run proton-bootstrap
+  2  no suitable server found
+  3  cert mint failed
+  4  could not acquire the mint lock (another mint is stuck)
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import datetime
+import fcntl
+import os
+import random
+import sys
+import time
+from pathlib import Path
+
+from serverlist_cache import repair as repair_serverlist_cache
+
+# System-wide mint lock. proton-vpn-core persists a shared cache
+# (/var/cache/Proton/VPN/serverlist.json, ~23 MB). Two proton-mint processes
+# fetching concurrently race on that write and leave a corrupt file with a
+# stray trailing byte — which then blocks session deserialization on EVERY
+# subsequent mint, so no rotation can self-heal (observed 2026-05-09 and again
+# 2026-07-12; see gotchas.md). Multiple rotate-slot@ / rotate-dns timers can
+# fire in the same second, so we serialize all mints on one flock. The lock is
+# advisory and tied to the open fd — it releases automatically if the process
+# dies, so a crash can't deadlock future mints.
+MINT_LOCK_PATH = "/run/multivpn-mint.lock"
+MINT_LOCK_TIMEOUT_S = 120
+
+
+def acquire_mint_lock(path: str = MINT_LOCK_PATH, timeout_s: int = MINT_LOCK_TIMEOUT_S):
+    """Block until we hold an exclusive lock on `path`, or raise on timeout.
+
+    Returns the held file object; keep it alive for the process lifetime.
+    """
+    f = open(path, "w")
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return f
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                f.close()
+                raise TimeoutError(
+                    f"could not acquire mint lock {path} within {timeout_s}s"
+                )
+            time.sleep(0.5)
+
+# Force proton-sso onto the JsonFiles keyring (see proton-bootstrap comment).
+from proton.sso import ProtonSSO
+_sso_orig_init = ProtonSSO.__init__
+def _sso_init_json(self, *args, **kwargs):
+    kwargs.setdefault("keyring_backend_name", "json")
+    _sso_orig_init(self, *args, **kwargs)
+ProtonSSO.__init__ = _sso_init_json
+
+from proton.vpn.core.api import ProtonVPNAPI
+from proton.vpn.core.session_holder import ClientTypeMetadata, SessionHolder
+from proton.vpn.session.servers import ServerFeatureEnum
+
+# Impersonate the official Proton VPN Linux GUI app; see proton-bootstrap.
+SessionHolder._get_app_version_header_value = staticmethod(
+    lambda _meta: "linux-vpn@4.8.0"
+)
+
+CLIENT_METADATA = ClientTypeMetadata(
+    type="gtk",
+    version="4.8.0",
+    architecture="x86_64",
+)
+
+# Proton WG inner addressing is fixed per-account — the cert registers our
+# pubkey against the account, no IP is assigned in the response.
+WG_CLIENT_ADDRESS = "10.2.0.2/32"
+WG_DNS = "10.2.0.1"
+WG_PORT = 51820
+CERT_DURATION_MIN = 1440  # 24h — matches our daily rotation cadence
+
+
+def pick_server(server_list, country: str, require_streaming: bool, user_tier: int):
+    candidates = []
+    for logical in server_list.logicals:
+        if not logical.enabled:
+            continue
+        if logical.exit_country.upper() != country.upper():
+            continue
+        if logical.tier > user_tier:
+            continue
+        if require_streaming and ServerFeatureEnum.STREAMING not in logical.features:
+            continue
+        if logical.load is not None and logical.load > 85:
+            continue
+        physicals = [p for p in logical.physical_servers if p.enabled and p.x25519_pk and p.entry_ip]
+        if not physicals:
+            continue
+        candidates.append((logical, physicals))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda c: (c[0].load if c[0].load is not None else 100,
+                                    c[0].score if c[0].score is not None else 999))
+    top = candidates[: max(5, len(candidates) // 10)]
+    logical, physicals = random.choice(top)
+    physical = random.choice(physicals)
+    return logical, physical
+
+
+def render_wg_conf(*, private_key: str, server_pk: str, endpoint_ip: str) -> str:
+    return (
+        "[Interface]\n"
+        f"PrivateKey = {private_key}\n"
+        f"Address = {WG_CLIENT_ADDRESS}\n"
+        f"DNS = {WG_DNS}\n"
+        "\n"
+        "[Peer]\n"
+        f"PublicKey = {server_pk}\n"
+        "AllowedIPs = 0.0.0.0/0\n"
+        f"Endpoint = {endpoint_ip}:{WG_PORT}\n"
+        "PersistentKeepalive = 25\n"
+    )
+
+
+async def run(args: argparse.Namespace) -> int:
+    api = ProtonVPNAPI(client_type_metadata=CLIENT_METADATA)
+    if not api.is_user_logged_in():
+        print("not logged in — run proton-bootstrap first", file=sys.stderr)
+        return 1
+
+    session = api._session_holder.session  # noqa: SLF001
+
+    try:
+        sl = await session.fetch_server_list()
+    except Exception as e:
+        print(f"server list fetch failed: {e}", file=sys.stderr)
+        return 2
+
+    user_tier = api.user_tier if api.user_tier is not None else 0
+    pick = pick_server(sl, args.country, args.streaming, user_tier)
+    if not pick:
+        print(f"no servers matched country={args.country} streaming={args.streaming} tier={user_tier}",
+              file=sys.stderr)
+        return 2
+    logical, physical = pick
+
+    # Refresh the account certificate so the registered key stays warm on
+    # Proton's edge — POSTing a different pubkey to /vpn/v1/certificate
+    # returns a valid cert but does NOT re-register the WG-edge key (proven
+    # by handshake failing with a freshly-minted key). So we reuse the
+    # session's registered wg key for every mint; only the server rotates.
+    try:
+        cert = await session.fetch_certificate()
+    except Exception as e:
+        print(f"cert refresh failed: {e}", file=sys.stderr)
+        return 3
+
+    pubkey_creds = session.vpn_account.vpn_credentials.pubkey_credentials
+    conf = render_wg_conf(
+        private_key=pubkey_creds.wg_private_key,
+        server_pk=physical.x25519_pk,
+        endpoint_ip=physical.entry_ip,
+    )
+
+    ts = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in logical.name)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    os.chmod(out_dir, 0o700)
+    out_path = out_dir / f"{args.slot}-{safe_name}-{ts}.conf"
+
+    header = (
+        f"# proton-mint generated {ts}\n"
+        f"# slot={args.slot}\n"
+        f"# logical={logical.name}\n"
+        f"# exit_country={logical.exit_country}\n"
+        f"# physical_domain={physical.domain}\n"
+        f"# features={','.join(f.name for f in logical.features) or 'none'}\n"
+        f"# cert_serial={cert.SerialNumber}\n"
+        f"# cert_expires={cert.ExpirationTime}\n"
+    )
+    out_path.write_text(header + conf)
+    os.chmod(out_path, 0o600)
+    print(out_path)
+    return 0
+
+
+def main() -> int:
+    if os.geteuid() != 0:
+        print("run as root", file=sys.stderr)
+        return 2
+    p = argparse.ArgumentParser()
+    p.add_argument("--slot", required=True, help="e.g. proton-1")
+    p.add_argument("--country", default="US")
+    p.add_argument("--streaming", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--out-dir", default="/etc/multivpn/wg/proton/auto")
+    args = p.parse_args()
+
+    # Serialize before touching proton-vpn-core (its constructor reads the
+    # shared cache). Held until this process exits.
+    try:
+        _mint_lock = acquire_mint_lock()  # noqa: F841 — held for process lifetime
+    except TimeoutError as e:
+        print(str(e), file=sys.stderr)
+        return 4
+
+    # Repair a corrupt/absent server-list cache while holding the lock, before
+    # proton-vpn-core reads it. A corrupt cache is self-perpetuating (it blocks
+    # the fetch that would replace it), so without this a reboot/kill mid-write
+    # wedges every future mint.
+    action = repair_serverlist_cache()
+    if action != "valid":
+        print(f"serverlist cache: {action}", file=sys.stderr)
+
+    return asyncio.run(run(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

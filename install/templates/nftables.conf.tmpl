@@ -1,0 +1,167 @@
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+define LAN_MGMT = ${MGMT_CIDR}
+define CLIENT_VLAN = ${CLIENT_VLAN_CIDR}
+define RFC1918 = { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }
+
+table inet filter {
+    # Destination -> fwmark lookup. Populated by the NFQUEUE dispatcher.
+    # Entries expire after 12h of no refresh, giving per-destination stickiness.
+    map vpn_dispatch {
+        type ipv4_addr : mark
+        flags timeout
+        timeout 12h
+        size 65536
+    }
+
+    # Per-source pin: source IP -> fwmark. Populated by the dispatcher when
+    # a brand-new source IP is seen; consulted in prerouting_mangle so all
+    # of that source's flows ride the same slot regardless of destination.
+    # See the design notes.
+    map source_pin {
+        type ipv4_addr : mark
+        flags timeout
+        timeout 6h
+        size 256
+    }
+
+    # Currently-active WireGuard peer endpoints (main-ns egress whitelist).
+    # Populated by vpnns-up.sh and multivpn-wg-peers.service after nftables loads.
+    set wg_peers {
+        type ipv4_addr
+        size 64
+    }
+
+    # Proton API endpoints (vpn-api.proton.me and kin). Populated by
+    # multivpn-proton-api-whitelist.service at boot and refreshed daily.
+    set proton_api {
+        type ipv4_addr
+        size 32
+    }
+
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        iif lo accept
+        ct state established,related accept
+        ct state invalid counter drop
+
+        ip  protocol icmp  icmp  type { echo-request, destination-unreachable, time-exceeded, parameter-problem } accept
+        ip6 nexthdr icmpv6 icmpv6 type { echo-request, destination-unreachable, time-exceeded, parameter-problem, packet-too-big, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept
+
+        iifname "${MGMT_IFACE}" tcp dport 22 ip saddr $RFC1918 counter accept comment "ssh-mgmt"
+
+        # Local resolver: clients on the client VLAN may query unbound on 172.16.1.5.
+        iifname "${CLIENT_IFACE}" ip saddr $CLIENT_VLAN udp dport 53 counter accept comment "client-dns"
+        iifname "${CLIENT_IFACE}" ip saddr $CLIENT_VLAN tcp dport 53 counter accept comment "client-dns-tcp"
+
+        # Mgmt-net diagnostic DNS (10.0.0.0/24 → unbound).
+        iifname "${MGMT_IFACE}" ip saddr $LAN_MGMT  udp dport 53 counter accept comment "mgmt-dns"
+        iifname "${MGMT_IFACE}" ip saddr $LAN_MGMT  tcp dport 53 counter accept comment "mgmt-dns-tcp"
+
+        counter log prefix "nft-input-dropped " level debug comment "input-dropped"
+    }
+
+    # Priority mangle (-150) so the mark lands before the routing decision.
+    chain prerouting_mangle {
+        type filter hook prerouting priority mangle; policy accept;
+
+        # Only touch traffic entering from the client VLAN with a non-RFC1918 destination.
+        iifname != "${CLIENT_IFACE}" return
+        ip saddr != $CLIENT_VLAN return
+        ip daddr $RFC1918 return
+        ip daddr { 127.0.0.0/8, 169.254.0.0/16, 192.0.2.0/4, 198.51.100.0/4 } return
+
+        # 1. For already-tracked flows: restore the fwmark from conntrack so
+        #    the flow sticks to its tunnel even if the map entry expired
+        #    mid-stream.
+        meta mark set ct mark
+        meta mark != 0x0 return
+
+        # 2. NEW: per-source pin (TV-style stable per-client routing).
+        meta mark set ip saddr map @source_pin
+        meta mark != 0x0 ct mark set meta mark return
+
+        # 3. Per-destination stickiness fallback (covers the brief window after
+        #    a full nftables reload where source_pin is empty but conntrack
+        #    isn't yet populated).
+        meta mark set ip daddr map @vpn_dispatch
+        meta mark != 0x0 ct mark set meta mark return
+
+        # 4. Brand-new (unpinned source AND unmapped destination): dispatcher decides.
+        #    "bypass" means if no daemon is listening, the packet is dropped by
+        #    default policy later — the safe behavior for our kill-switch.
+        ct state new counter queue num 0 bypass
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+
+        tcp flags syn tcp option maxseg size set rt mtu
+
+        # Ordered before ct-state-invalid drop: UniFi routes mgmt->VLAN directly,
+        # so we see only the return half (SYN-ACK with no SYN in our conntrack =
+        # invalid). Accept legit client-VLAN->private transit first, then drop.
+        iifname "${CLIENT_IFACE}" ip saddr $CLIENT_VLAN ip daddr $RFC1918 oifname "${MGMT_IFACE}" counter accept comment "client-to-private"
+
+        ct state invalid counter drop
+        ct state established,related accept
+
+        # Marked path: client VLAN -> anywhere, via a VPN namespace veth.
+        # Policy routing (ip rule fwmark N lookup 100+N) has already selected the right veth.
+        iifname "${CLIENT_IFACE}" meta mark != 0x0 counter accept comment "client-marked-to-vpn"
+
+        counter log prefix "nft-fwd-dropped " level debug comment "forward-dropped"
+    }
+
+    # Route-hook mangle chain: stamp unbound's outbound packets with fwmark ${DNS_FWMARK_HEX}
+    # BEFORE the routing decision so `ip rule fwmark ${DNS_FWMARK_HEX} lookup 106` picks the
+    # dns-6 tunnel veth as the egress path.
+    chain output_route {
+        type route hook output priority mangle; policy accept;
+
+        meta skuid "unbound" meta mark set ${DNS_FWMARK_HEX} comment "route-unbound-via-dns-tunnel"
+    }
+
+    # Kill-switch. Only applies to packets originating in the MAIN namespace.
+    # Packets generated inside a VPN ns traverse that ns's own output chain.
+    # The WireGuard encrypted UDP socket is created in the main ns, so its
+    # handshake/keepalive packets hit here and must match @wg_peers.
+    chain output {
+        type filter hook output priority filter; policy drop;
+
+        oif lo accept
+        ct state established,related accept
+        ct state invalid counter drop
+
+        # Private networks (mgmt LAN, client VLAN, transit /30s, DNS resolver).
+        ip daddr $RFC1918 accept
+
+        # Diagnostics.
+        ip  protocol icmp  accept
+        ip6 nexthdr icmpv6 accept
+
+        # DHCP client renew/rebind on ens18 mgmt interface.
+        oifname "${MGMT_IFACE}" udp sport 68 udp dport 67 counter accept comment "dhcp-client"
+
+        # WireGuard handshakes/keepalives to currently-active VPN peers.
+        oifname "${MGMT_IFACE}" udp dport 51820 ip daddr @wg_peers counter accept comment "wg-peers"
+
+        # apt package fetches (run as the _apt user).
+        meta skuid "_apt" oifname "${MGMT_IFACE}" tcp dport { 80, 443 } counter accept comment "apt"
+
+        # NTP time sync.
+        meta skuid "systemd-timesync" oifname "${MGMT_IFACE}" udp dport 123 counter accept comment "ntp"
+
+        # Proton VPN control-plane API (bootstrap + cert mints).
+        oifname "${MGMT_IFACE}" tcp dport 443 ip daddr @proton_api counter accept comment "proton-api"
+
+        # unbound resolver egress via the dedicated dns-6 tunnel.
+        # Scoped by uid+mark so no other process can ride this rule.
+        meta skuid "unbound" meta mark ${DNS_FWMARK_HEX} oifname "v-dns" counter accept comment "unbound-dns-egress"
+
+        counter log prefix "nft-output-dropped " level debug comment "output-dropped"
+    }
+}

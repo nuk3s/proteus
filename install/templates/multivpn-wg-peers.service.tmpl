@@ -1,0 +1,13 @@
+[Unit]
+Description=Re-populate multivpn wg_peers nftables set after nftables loads
+After=nftables.service
+Wants=nftables.service
+Before=multivpn-dispatcher.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/multivpn/bin/repopulate-wg-peers.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

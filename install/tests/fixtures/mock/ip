@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+case "$*" in
+  "link show ens18") echo "2: ens18: <BROADCAST> mtu 1500 ..."; exit 0;;
+  "link show ens19") echo "3: ens19: <BROADCAST> mtu 1500 ..."; exit 0;;
+  "link show missing0") echo 'Device "missing0" does not exist.' >&2; exit 1;;
+  "netns list") exit 0;;              # no leftover netns
+  "rule") exit 0;;                     # no leftover rules
+  *) exit 0;;
+esac

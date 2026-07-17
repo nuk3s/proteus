@@ -1,0 +1,11 @@
+[Unit]
+Description=Rotate multivpn slot %i to a fresh Proton WG config
+After=network-online.target multivpn-dispatcher.service
+Wants=network-online.target
+Requires=multivpn-dispatcher.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/multivpn/bin/rotate-slot.sh %i
+TimeoutStartSec=5min
+Nice=10

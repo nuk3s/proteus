@@ -1,0 +1,8 @@
+[Unit]
+Description=Check dns-6 tunnel latency to Quad9 and rotate if degraded
+After=multivpn-dns-tunnel.service unbound.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/multivpn/bin/dns-latency-check.sh
+Nice=10

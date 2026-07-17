@@ -1,0 +1,41 @@
+# multivpn.conf — installer configuration.
+# Copy this file to install/multivpn.conf and edit before running install.sh.
+
+# Management NIC — the interface SSH/admin traffic arrives on (e.g. ens18).
+MGMT_IFACE=ens18
+
+# Client NIC — the interface facing the client VLAN this box gateways for
+# (e.g. ens19). Must be a distinct NIC from MGMT_IFACE (gateway mode requires
+# two NICs; single-NIC SOCKS mode is a future spec, not this installer).
+CLIENT_IFACE=ens19
+
+# CIDR of the management LAN (SSH/admin access is only accepted from here).
+MGMT_CIDR=10.0.0.0/24
+
+# CIDR of the client VLAN this box is the default gateway for.
+CLIENT_VLAN_CIDR=172.16.1.0/24
+
+# This box's IP on the client VLAN (also unbound's client-facing DNS listener).
+# Must lie inside CLIENT_VLAN_CIDR.
+CLIENT_GW_IP=172.16.1.5
+
+# Number of rotating Proton WireGuard slots (client egress tunnels). 1-9
+# (capped at 9: a 2-digit index overflows the 15-char veth name limit during
+# staged rotation, e.g. v-proton-10-s-ns is 16 chars).
+SLOT_COUNT=5
+
+# Space-separated upstream DNS resolvers used both by the dedicated DNS
+# tunnel (unbound forward-zone) and as the per-netns resolv.conf for each
+# rotating slot.
+DNS_UPSTREAMS="9.9.9.9 149.112.112.112"
+
+# Proton country code used when minting new WireGuard configs.
+PROTON_COUNTRY=US
+
+# Minimum acceptable throughput (Mbps) for a slot to be considered healthy
+# by the streaming-bandwidth probe.
+STREAMING_MIN_MBPS=25
+
+# Seconds before the apply-phase nftables auto-revert fires if you never
+# run `install.sh --confirm`. This is the SSH-lockout safety net.
+NFT_REVERT_SECONDS=900

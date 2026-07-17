@@ -1,0 +1,12 @@
+[Unit]
+Description=Populate nftables @proton_api set with Proton API IPs
+After=network-online.target nftables.service
+Wants=network-online.target nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/multivpn/bin/proton-api-whitelist
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

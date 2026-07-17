@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+# slot-rank — pretty-print current Proton-slot ranking by COMPOSITE_SCORE.
+#
+# Reads /run/multivpn-slot-health/<slot>.state for each proton-N slot and
+# prints one row per slot, sorted by score descending.
+
+set -uo pipefail
+
+HEALTH_DIR=/run/multivpn-slot-health
+STATE_DIR=/etc/multivpn/state
+
+now=$(date +%s)
+printf '%-10s %-9s %8s %8s %8s %10s %7s\n' \
+    SLOT STATUS SCORE MED_MS MAD_MS THR_MBPS AGE_S
+
+rows=$(mktemp)
+trap 'rm -f "$rows"' EXIT
+
+for state in "$STATE_DIR"/proton-*.state; do
+    [[ -e "$state" ]] || continue
+    inst=$(basename "$state" .state)
+    [[ "$inst" =~ ^proton-[0-9]+$ ]] || continue
+    f="$HEALTH_DIR/$inst.state"
+
+    status="?" score="--" lat="--" jit="--" thr="--" age="--"
+    if [[ -r "$f" ]]; then
+        status=$(awk -F= '$1=="STATUS"          {print $2}' "$f")
+        score=$( awk -F= '$1=="COMPOSITE_SCORE" {print $2}' "$f")
+        # median/MAD are the values the score actually uses (robust to
+        # cold-catch spikes); fall back to mean/stddev for pre-upgrade
+        # state files that don't carry the median fields yet.
+        lat=$(   awk -F= '$1=="LATENCY_MEDIAN_MS"{print $2}' "$f")
+        [[ -n "$lat" ]] || lat=$(awk -F= '$1=="LATENCY_MEAN_MS" {print $2}' "$f")
+        jit=$(   awk -F= '$1=="LATENCY_MAD_MS"   {print $2}' "$f")
+        [[ -n "$jit" ]] || jit=$(awk -F= '$1=="LATENCY_JITTER_MS"{print $2}' "$f")
+        thr=$(   awk -F= '$1=="THROUGHPUT_MBPS" {print $2}' "$f")
+        ts=$(    awk -F= '$1=="SCORE_UPDATED_AT"{print $2}' "$f")
+        [[ -n "$ts" ]] && age=$(( now - ts ))
+    fi
+    # Sort key: numeric score descending. Use printf to pad for sort -k.
+    printf '%020.3f\t%-10s %-9s %8s %8s %8s %10s %7s\n' \
+        "${score:--999999}" "$inst" "$status" "${score:---}" "${lat:---}" \
+        "${jit:---}" "${thr:---}" "$age" >> "$rows"
+done
+
+# Sort by first column (score) descending and strip the sort-key column.
+sort -r "$rows" | cut -f2-

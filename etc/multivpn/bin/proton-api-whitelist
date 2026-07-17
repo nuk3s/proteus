@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Resolve Proton API hostnames and populate the `proton_api` nftables set.
+# Idempotent: flushes and re-populates on each run.
+#
+# Invoked at boot by multivpn-proton-api-whitelist.service and daily by its
+# timer. Also called from rotate-slot.sh before each mint so a stale DNS
+# answer doesn't break rotation.
+set -euo pipefail
+
+HOSTS=(
+    vpn-api.proton.me
+)
+
+# Resolve with retries. At boot this oneshot runs seconds in, before the path
+# to the LAN resolver is ready, so a single getent returns nothing and leaves
+# @proton_api empty — which blocks EVERY mint until the next daily run (oneshot
+# units can't Restart=on-failure). Retrying here also hardens the pre-mint call
+# from rotate-slot.sh. Tunable via env for tests.
+RESOLVE_ATTEMPTS="${RESOLVE_ATTEMPTS:-10}"
+RESOLVE_DELAY="${RESOLVE_DELAY:-3}"
+
+IPS=()
+for attempt in $(seq 1 "$RESOLVE_ATTEMPTS"); do
+    IPS=()
+    for h in "${HOSTS[@]}"; do
+        while read -r ip _; do
+            [[ -n "$ip" ]] && IPS+=("$ip")
+        done < <(getent ahostsv4 "$h" 2>/dev/null | awk '{print $1}' | sort -u)
+    done
+    (( ${#IPS[@]} > 0 )) && break
+    if (( attempt < RESOLVE_ATTEMPTS )); then
+        echo "proton-api-whitelist: no addresses yet (attempt ${attempt}/${RESOLVE_ATTEMPTS}), retrying in ${RESOLVE_DELAY}s" >&2
+        sleep "$RESOLVE_DELAY"
+    fi
+done
+
+if (( ${#IPS[@]} == 0 )); then
+    echo "proton-api-whitelist: no addresses resolved for ${HOSTS[*]} after ${RESOLVE_ATTEMPTS} attempts" >&2
+    exit 1
+fi
+
+# Dedup
+readarray -t UNIQ < <(printf '%s\n' "${IPS[@]}" | sort -u)
+
+# Atomic flush + add.
+nft flush set inet filter proton_api
+for ip in "${UNIQ[@]}"; do
+    nft "add element inet filter proton_api { $ip }"
+done
+
+echo "proton-api-whitelist: ${#UNIQ[@]} IPs -> @proton_api : ${UNIQ[*]}"

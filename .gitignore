@@ -1,0 +1,16 @@
+# Runtime / secrets — never commit
+# WG configs contain private keys
+etc/multivpn/wg/
+# Per-tunnel state (peer pubkeys, endpoints)
+etc/multivpn/state/
+# Proton SSO refresh token
+etc/Proton/
+
+# Backups / editor noise
+*.bak
+*.bak-*
+*~
+__pycache__/
+*.pyc
+install/multivpn.conf
+install/.staging/

@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# pretend our live SSH session is from 10.0.0.200
+echo 'ESTAB 0 0 10.0.0.5:22 10.0.0.200:51000 users:(("sshd",pid=1,fd=3))'

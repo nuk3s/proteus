@@ -1,0 +1,14 @@
+[Unit]
+Description=Bring up the dedicated DNS WireGuard tunnel (dns-6)
+After=network-online.target nftables.service
+Wants=network-online.target
+Before=unbound.service multivpn-dispatcher.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/multivpn/bin/vpnns-up.sh dns-6 /etc/multivpn/wg/proton/auto/dns-6.conf
+RemainAfterExit=yes
+ExecStop=/etc/multivpn/bin/vpnns-down.sh dns-6
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Warmup Proton slot NAT state (one pass over all rotating slots)
+After=multivpn-dispatcher.service
+Wants=multivpn-dispatcher.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/multivpn/bin/slot-warmup.sh
+# Quiet: the script logs via syslog already
+StandardOutput=null
+StandardError=journal

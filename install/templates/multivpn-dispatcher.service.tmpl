@@ -1,0 +1,31 @@
+[Unit]
+Description=Multi-VPN NFQUEUE dispatcher
+After=network-online.target nftables.service
+Wants=network-online.target
+# Requires at least one VPN namespace to be up - but we rely on script to exit 1 if none
+ConditionPathIsDirectory=/etc/multivpn/state
+
+[Service]
+Type=simple
+ExecStart=/etc/multivpn/bin/dispatcher.py
+Restart=on-failure
+RestartSec=5s
+User=root
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/log/multivpn /run/multivpn
+# NFQUEUE needs CAP_NET_ADMIN; shelling out to nft needs root
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

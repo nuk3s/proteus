@@ -1,0 +1,15 @@
+[Unit]
+Description=Bring up the dedicated DNS WireGuard tunnel (${DNS_INSTANCE})
+After=network-online.target nftables.service
+Wants=network-online.target
+Before=unbound.service multivpn-dispatcher.service
+ConditionPathExists=/etc/multivpn/wg/proton/auto/${DNS_INSTANCE}.conf
+
+[Service]
+Type=oneshot
+ExecStart=/etc/multivpn/bin/vpnns-up.sh ${DNS_INSTANCE} /etc/multivpn/wg/proton/auto/${DNS_INSTANCE}.conf ${DNS_INDEX}
+RemainAfterExit=yes
+ExecStop=/etc/multivpn/bin/vpnns-down.sh ${DNS_INSTANCE}
+
+[Install]
+WantedBy=multi-user.target

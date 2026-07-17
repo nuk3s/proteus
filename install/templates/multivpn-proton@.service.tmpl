@@ -1,0 +1,15 @@
+[Unit]
+Description=Bring up multivpn Proton rotating slot %i
+After=network-online.target nftables.service
+Wants=network-online.target
+Before=multivpn-dispatcher.service
+ConditionPathExists=/etc/multivpn/wg/proton/auto/%i.conf
+
+[Service]
+Type=oneshot
+ExecStart=/etc/multivpn/bin/vpnns-up.sh %i /etc/multivpn/wg/proton/auto/%i.conf
+RemainAfterExit=yes
+ExecStop=/etc/multivpn/bin/vpnns-down.sh %i
+
+[Install]
+WantedBy=multi-user.target
