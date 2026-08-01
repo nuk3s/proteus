@@ -11,7 +11,7 @@ REQUIRED_KEYS=(MGMT_IFACE CLIENT_IFACE MGMT_CIDR CLIENT_VLAN_CIDR CLIENT_GW_IP)
 # Defaults applied if the config omits them.
 _apply_defaults() {
     : "${SLOT_COUNT:=5}"
-    : "${DNS_UPSTREAMS:=9.9.9.9 149.112.112.112}"
+    : "${DNS_UPSTREAMS:=9.9.9.9 9.9.9.10 149.112.112.10}"
     : "${PROTON_COUNTRY:=US}"
     : "${STREAMING_MIN_MBPS:=25}"
     : "${NFT_REVERT_SECONDS:=900}"

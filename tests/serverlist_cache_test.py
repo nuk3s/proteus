@@ -1,4 +1,4 @@
-"""Tests for etc/multivpn/bin/serverlist_cache.py — pure repair logic."""
+"""Tests for etc/proteus/bin/serverlist_cache.py — pure repair logic."""
 import json
 from pathlib import Path
 

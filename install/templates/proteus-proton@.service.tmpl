@@ -1,0 +1,15 @@
+[Unit]
+Description=Bring up proteus Proton rotating slot %i
+After=network-online.target nftables.service
+Wants=network-online.target
+Before=proteus-dispatcher.service
+ConditionPathExists=/etc/proteus/wg/proton/auto/%i.conf
+
+[Service]
+Type=oneshot
+ExecStart=/etc/proteus/bin/vpnns-up.sh %i /etc/proteus/wg/proton/auto/%i.conf
+RemainAfterExit=yes
+ExecStop=/etc/proteus/bin/vpnns-down.sh %i
+
+[Install]
+WantedBy=multi-user.target

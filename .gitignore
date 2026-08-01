@@ -1,8 +1,8 @@
 # Runtime / secrets — never commit
 # WG configs contain private keys
-etc/multivpn/wg/
+etc/proteus/wg/
 # Per-tunnel state (peer pubkeys, endpoints)
-etc/multivpn/state/
+etc/proteus/state/
 # Proton SSO refresh token
 etc/Proton/
 
@@ -12,5 +12,5 @@ etc/Proton/
 *~
 __pycache__/
 *.pyc
-install/multivpn.conf
+install/proteus.conf
 install/.staging/

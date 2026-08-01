@@ -1,6 +1,6 @@
 # install/ — gateway installer quickstart
 
-Stands up the L3-gateway multivpn proxy on a fresh Debian/Ubuntu VM from one
+Stands up the L3-gateway proteus proxy on a fresh Debian/Ubuntu VM from one
 config file, with a preflight doctor and an SSH-lockout apply guard.
 
 ## Prerequisite
@@ -12,8 +12,8 @@ still holds the /24 for DHCP; the installer doesn't touch DHCP).
 ## Steps
 
 ```bash
-cp install/multivpn.conf.example install/multivpn.conf
-$EDITOR install/multivpn.conf              # set MGMT_IFACE, CLIENT_IFACE, CIDRs, etc.
+cp install/proteus.conf.example install/proteus.conf
+$EDITOR install/proteus.conf              # set MGMT_IFACE, CLIENT_IFACE, CIDRs, etc.
 
 sudo ./install/install.sh --check          # read-only preflight doctor
 sudo ./install/install.sh                  # doctor -> deps -> render -> apply -> bootstrap -> enable -> verify

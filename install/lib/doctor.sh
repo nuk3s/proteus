@@ -20,7 +20,7 @@ check_os() {
 check_ifaces() {
     local i
     for i in "$MGMT_IFACE" "$CLIENT_IFACE"; do
-        ip link show "$i" >/dev/null 2>&1 || { _fail "interface '$i' not found — fix MGMT_IFACE/CLIENT_IFACE in multivpn.conf"; return 1; }
+        ip link show "$i" >/dev/null 2>&1 || { _fail "interface '$i' not found — fix MGMT_IFACE/CLIENT_IFACE in proteus.conf"; return 1; }
     done
     case "$MGMT_IFACE$CLIENT_IFACE" in *eth[0-9]*) _warn "eth* names may not be stable across reboots; prefer predictable names";; esac
     _pass "interfaces $MGMT_IFACE, $CLIENT_IFACE present"
@@ -43,10 +43,10 @@ check_forwarding() {
 
 check_no_conflict() {
     if ip netns list 2>/dev/null | grep -qE 'ns-(proton|dns)'; then
-        _warn "pre-existing multivpn netns/ip-rules present — vpnns-up.sh will reconcile them on bring-up (fine for a re-run; investigate if this is a fresh box)"; return 2
+        _warn "pre-existing proteus netns/ip-rules present — vpnns-up.sh will reconcile them on bring-up (fine for a re-run; investigate if this is a fresh box)"; return 2
     fi
     if ip rule 2>/dev/null | grep -qE '172\.31\.'; then
-        _warn "pre-existing multivpn netns/ip-rules present — vpnns-up.sh will reconcile them on bring-up (fine for a re-run; investigate if this is a fresh box)"; return 2
+        _warn "pre-existing proteus netns/ip-rules present — vpnns-up.sh will reconcile them on bring-up (fine for a re-run; investigate if this is a fresh box)"; return 2
     fi
     _pass "no conflicting netns / ip rules"
 }
@@ -109,5 +109,5 @@ doctor_post() {
     check_client_traffic || true
     check_return_path || true
     check_upstream || true
-    command -v /etc/multivpn/bin/slot-rank >/dev/null && /etc/multivpn/bin/slot-rank || true
+    command -v /etc/proteus/bin/slot-rank >/dev/null && /etc/proteus/bin/slot-rank || true
 }

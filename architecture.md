@@ -56,7 +56,7 @@ Each probe rotates through 5 user agents (Chrome/Windows, Safari/Mac, Firefox/Li
 
 ## Health-aware dispatch (Tier 1)
 
-Each `slot-warmup` pass writes a per-slot health file at `/run/multivpn-slot-health/proton-N.state`:
+Each `slot-warmup` pass writes a per-slot health file at `/run/proteus-slot-health/proton-N.state`:
 
 ```
 INSTANCE=proton-N
@@ -75,7 +75,7 @@ Effect: a transient ALL_FAIL window on one slot stops affecting NEW clients with
 
 ## Auto-rotation of persistently bad slots (Tier 2)
 
-When `FAIL_STREAK >= ROT_THRESHOLD` (default 5 ≈ 50s of solid failure) and the per-slot cooldown has elapsed (default 300s), `slot-warmup.sh` invokes `systemctl start --no-block multivpn-rotate-slot@proton-N.service`. The cooldown prevents mint-storms when a slot is borderline. The 50s threshold is intentionally above the ~25-35s cold-window so a transient cold-catch doesn't trigger a rotation — only a slot that's been failing through multiple warmup passes (and presumably the dispatcher has already DEGRADED it for live traffic) gets evicted.
+When `FAIL_STREAK >= ROT_THRESHOLD` (default 5 ≈ 50s of solid failure) and the per-slot cooldown has elapsed (default 300s), `slot-warmup.sh` invokes `systemctl start --no-block proteus-rotate-slot@proton-N.service`. The cooldown prevents mint-storms when a slot is borderline. The 50s threshold is intentionally above the ~25-35s cold-window so a transient cold-catch doesn't trigger a rotation — only a slot that's been failing through multiple warmup passes (and presumably the dispatcher has already DEGRADED it for live traffic) gets evicted.
 
 The rotation itself is the same code path as the daily timer — mint, stage, probe, promote — so the auto-trigger is just a faster heartbeat for "this exit is broken, find a new one" without waiting for the next scheduled rotation.
 
@@ -92,16 +92,16 @@ Two mechanisms steer unbound's upstream queries into the dns-6 tunnel:
 
 `dns-6` is not part of the client-traffic rotation pool — the dispatcher's `_load_instances()` filters on `^proton-\d+$`. DNS survives slot rotation cleanly because it rides its own independent tunnel.
 
-`dns-6` has its own separate rotation trigger: `multivpn-dns-latency.timer` fires every 15 min, measures `ns-dns-6 → 9.9.9.9` RTT, and calls `rotate-dns.sh` if latency exceeds 120ms. The cooldown in `rotate-dns.sh` (1h) prevents thrashing when no available exit has a good Quad9 path. The cold-DNS experience is dominated by tunnel RTT × qname-minimisation steps, so a faster exit directly shortens first-hit latency for users.
+`dns-6` has its own separate rotation trigger: `proteus-dns-latency.timer` fires every 15 min, measures `ns-dns-6 → 9.9.9.9` RTT, and calls `rotate-dns.sh` if latency exceeds 120ms. The cooldown in `rotate-dns.sh` (1h) prevents thrashing when no available exit has a good Quad9 path. The cold-DNS experience is dominated by tunnel RTT × qname-minimisation steps, so a faster exit directly shortens first-hit latency for users.
 
 Per-netns resolv.conf files (`/etc/netns/ns-proton-N/resolv.conf`) also point at Quad9, so `ip netns exec` bind-mounts that over `/etc/resolv.conf` for reputation probes and anything else run inside a rotating netns — no leak to the mgmt network's resolver (which the kill-switch doesn't permit anyway).
 
 ## Rotation lifecycle
 
-`multivpn-rotate-slot@proton-N.timer` (daily + 12h jitter, persistent) → `rotate-slot.sh N`:
+`proteus-rotate-slot@proton-N.timer` (daily + 12h jitter, persistent) → `rotate-slot.sh N`:
 
 1. For attempt in 1..5:
-   1. `proton-mint --slot proton-N-s --out-dir /etc/multivpn/wg/proton/auto` → writes a fresh WG config using a brand-new keypair and a Proton API-registered peer selection.
+   1. `proton-mint --slot proton-N-s --out-dir /etc/proteus/wg/proton/auto` → writes a fresh WG config using a brand-new keypair and a Proton API-registered peer selection.
    2. `vpnns-up.sh proton-N-s <conf> $((100 + N))` — stage under name `proton-N-s`, index `100+N` (so staging slots use fwmark `0x65..0x69`, table `201..205`, veth `v-proton-N-s`/`v-proton-N-s-ns` — fits in 15-char kernel veth name limit because the suffix is `-s`, not `-new`).
    3. Wait for handshake (poll `wg show` up to 30s).
    4. Egress probe: `ip netns exec ns-proton-N-s curl https://checkip.amazonaws.com --retry 3 --retry-all-errors --retry-delay 2 --max-time 12` (picked because Amazon doesn't rate-limit and returns the exit IP as plaintext — no TLS chain or JSON parsing to add a failure mode).
@@ -110,8 +110,8 @@ Per-netns resolv.conf files (`/etc/netns/ns-proton-N/resolv.conf`) also point at
 2. If no passer after 5 attempts → log + exit 2. Old slot untouched.
 3. On passer:
    1. `vpnns-up.sh proton-N <new_conf>` — replace the live slot in place. Same fwmark/table/transit means `@vpn_dispatch` entries are still valid.
-   2. `systemctl kill -s HUP multivpn-dispatcher` — re-read state (pool names haven't changed, just endpoint).
-   3. Prune old `/etc/multivpn/wg/proton/auto/proton-N-*.conf` except the two most recent.
+   2. `systemctl kill -s HUP proteus-dispatcher` — re-read state (pool names haven't changed, just endpoint).
+   3. Prune old `/etc/proteus/wg/proton/auto/proton-N-*.conf` except the two most recent.
 
 **Endpoint-collision dedup**: after mint, `rotate-slot.sh` parses the new
 config's `Endpoint = X.X.X.X:51820` line and compares against
@@ -150,9 +150,9 @@ Conntrack provides the mid-stream safety: if a long-lived flow exists when the m
 
 ## Boot ordering
 
-`nftables.service` loads ruleset → `multivpn-dns-tunnel.service` brings up dns-6 → `unbound.service` starts (Before relationship) → `multivpn-proton@proton-{1..5}.service` bring up the rotating slots (each `ExecStart=vpnns-up.sh %i /etc/multivpn/wg/proton/auto/%i.conf`, Before=`multivpn-dispatcher.service`) → `multivpn-dispatcher.service` binds NFQUEUE 0 with the 5-slot pool loaded. `multivpn-proton-api-whitelist.service` and `repopulate-wg-peers.sh` refresh the sets that `flush ruleset` empties. `multivpn-slot-warmup.timer` starts 45s after boot (once the pool is up) and fires every 10s to keep Proton's exit-side flow state warm.
+`nftables.service` loads ruleset → `proteus-dns-tunnel.service` brings up dns-6 → `unbound.service` starts (Before relationship) → `proteus-proton@proton-{1..5}.service` bring up the rotating slots (each `ExecStart=vpnns-up.sh %i /etc/proteus/wg/proton/auto/%i.conf`, Before=`proteus-dispatcher.service`) → `proteus-dispatcher.service` binds NFQUEUE 0 with the 5-slot pool loaded. `proteus-proton-api-whitelist.service` and `repopulate-wg-peers.sh` refresh the sets that `flush ruleset` empties. `proteus-slot-warmup.timer` starts 45s after boot (once the pool is up) and fires every 10s to keep Proton's exit-side flow state warm.
 
-The `proton-N.conf` stable symlink is what `multivpn-proton@.service` reads — `rotate-slot.sh` updates it on every successful promotion, so the next boot always picks up the most recently promoted config for each slot.
+The `proton-N.conf` stable symlink is what `proteus-proton@.service` reads — `rotate-slot.sh` updates it on every successful promotion, so the next boot always picks up the most recently promoted config for each slot.
 
 ## Forward-chain ordering vs asymmetric client-to-mgmt flows
 
@@ -166,7 +166,7 @@ UniFi won't let us install a non-/32 route via 172.16.1.5 (it holds the /24 for 
 
 Observed behavior (empirical, confirmed with tcpdump on v-proton-N and wg0 inside the ns): if a Proton slot has no user-plane TCP activity for ~25-35s, the first SYN on the next client flow is silently dropped upstream of the WG tunnel, even though the WG handshake is fresh (PersistentKeepalive=25 keeps the *transport* alive; Proton's *exit-side* NAT/flow-state decays independently). TCP retries fix it in 2-20s at the cost of user-visible first-hit latency.
 
-`multivpn-slot-warmup.service` fires every 10s (timer + 2s accuracy jitter). Each pass issues parallel `curl -I https://proton.me/` against every slot in the rotating pool (`^proton-\d+$`, matches the dispatcher filter, skips dns-6 and `-s` staging). proton.me is chosen because it's operated by Proton — they already see our WG handshake every 25s, so this keepalive adds no third-party correlation.
+`proteus-slot-warmup.service` fires every 10s (timer + 2s accuracy jitter). Each pass issues parallel `curl -I https://proton.me/` against every slot in the rotating pool (`^proton-\d+$`, matches the dispatcher filter, skips dns-6 and `-s` staging). proton.me is chosen because it's operated by Proton — they already see our WG handshake every 25s, so this keepalive adds no third-party correlation.
 
 Parallelization matters. With a serial loop, a pass over 5 cold slots took ~20s (5 × 4s timeout), pushing per-slot re-hit interval past the cold threshold. Backgrounding the curls and `wait`-ing bounds wall time to the slowest single slot, so every slot gets refreshed every ~10s regardless of how many are momentarily cold.
 

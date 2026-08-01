@@ -1,4 +1,4 @@
-"""Tests for etc/multivpn/bin/dispatcher_logic.py — pure logic only."""
+"""Tests for etc/proteus/bin/dispatcher_logic.py — pure logic only."""
 from pathlib import Path
 import pytest
 

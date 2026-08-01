@@ -1,0 +1,11 @@
+[Unit]
+Description=Rotate proteus slot %i daily with 12h jitter
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=12h
+Persistent=true
+Unit=proteus-rotate-slot@%i.service
+
+[Install]
+WantedBy=timers.target

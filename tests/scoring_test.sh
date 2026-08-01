@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# tests/scoring_test.sh — black-box tests for etc/multivpn/bin/scoring.sh
+# tests/scoring_test.sh — black-box tests for etc/proteus/bin/scoring.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
 # shellcheck source=tests/_assert.sh
 source tests/_assert.sh
-# shellcheck source=etc/multivpn/bin/scoring.sh
-source etc/multivpn/bin/scoring.sh
+# shellcheck source=etc/proteus/bin/scoring.sh
+source etc/proteus/bin/scoring.sh
 
 echo "compute_score: degraded slots score very low regardless of metrics"
 # base=-1000 + lat_term=29 + jit_term=-0.5 + tp_term=0.3*clamp(100,0,100)=30 -> -941.5

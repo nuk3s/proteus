@@ -6,7 +6,7 @@
 #        ./install/proteus --help
 #
 # The wizard is a friendly front-end over the same phases install.sh runs
-# (config → preflight → apply → confirm). Internals are the `multivpn` stack;
+# (config → preflight → apply → confirm). Internals are the `proteus` stack;
 # "Proteus" is the product it presents.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,7 +20,7 @@ case "${1:-}" in
     *) echo "unknown option: $1 (try --help)"; exit 1;;
 esac
 [[ $DEMO == 1 ]] && export PROTEUS_FORCE_COLOR=1
-CONF="$HERE/multivpn.conf"
+CONF="$HERE/proteus.conf"
 
 # --- demo helpers -------------------------------------------------------------
 # type_out: reveal text like someone typing it (demo polish only).
@@ -101,7 +101,7 @@ MGMT_CIDR=$mgmt_cidr
 CLIENT_VLAN_CIDR=$client_cidr
 CLIENT_GW_IP=$gw
 SLOT_COUNT=$slots
-DNS_UPSTREAMS="9.9.9.9 149.112.112.112"
+DNS_UPSTREAMS="9.9.9.9 9.9.9.10 149.112.112.10"
 PROTON_COUNTRY=US
 STREAMING_MIN_MBPS=25
 CFG
@@ -214,17 +214,17 @@ screen_confirm() {
     [[ $DEMO == 1 ]] && beat 1
 }
 
-# ---- 5. the payoff: a new IP per activity -----------------------------------
+# ---- 5. the payoff: a new face for every device ------------------------------
 screen_rotation() {
     [[ $DEMO == 1 ]] || return 0
     step "The payoff"
-    note "The dispatcher pins each new activity to a healthy exit — automatically."
+    note "The dispatcher pins each device to its own healthy exit — automatically."
     echo
     local acts=(
-      "streaming a movie|198.51.100.6|Los Angeles"
-      "online shopping|198.51.100.39|Dallas"
-      "reading the news|203.0.113.12|Miami"
-      "a work video call|203.0.113.220|New York"
+      "the living-room TV|198.51.100.6|Los Angeles"
+      "a work laptop|198.51.100.39|Dallas"
+      "the kids' tablet|203.0.113.12|Miami"
+      "the game console|203.0.113.220|New York"
     )
     local a; for a in "${acts[@]}"; do
         IFS='|' read -r what ip where <<<"$a"
@@ -243,8 +243,8 @@ screen_done() {
     box "$(mark) is live" \
         "Clients on the VLAN now egress through rotating Proton exits." \
         "" \
-        "$(printf '%s%-22s%s %s' "$INK" 'watch it work'   "$RESET" 'sudo multivpn-slot-rank')" \
-        "$(printf '%s%-22s%s %s' "$INK" 'force a rotation' "$RESET" 'sudo systemctl start multivpn-rotate-slot@proton-1')" \
+        "$(printf '%s%-22s%s %s' "$INK" 'watch it work'   "$RESET" 'sudo proteus-slot-rank')" \
+        "$(printf '%s%-22s%s %s' "$INK" 'force a rotation' "$RESET" 'sudo systemctl start proteus-rotate-slot@proton-1')" \
         "$(printf '%s%-22s%s %s' "$INK" 'live logs'        "$RESET" 'journalctl -t slot-warmup -f')"
     echo
     printf '   %sthanks for trying %s%s%s.%s\n\n' "$DIM" "$RESET" "$(mark)" "$DIM" "$RESET"

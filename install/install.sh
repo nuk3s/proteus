@@ -5,7 +5,7 @@ source "$HERE/lib/common.sh"
 source "$HERE/lib/render.sh"
 source "$HERE/lib/doctor.sh"
 source "$HERE/lib/apply.sh"
-CONF="$HERE/multivpn.conf"
+CONF="$HERE/proteus.conf"
 STAGE="$HERE/.staging"
 
 usage() { echo "usage: sudo $0 [--check | --render | --confirm]"; exit 1; }
@@ -16,7 +16,7 @@ main() {
         --check) mode=check;; --render) mode=render;; --confirm) mode=confirm;;
         "") ;; *) usage;;
     esac
-    [[ -r "$CONF" ]] || die "copy install/multivpn.conf.example to $CONF and edit it first"
+    [[ -r "$CONF" ]] || die "copy install/proteus.conf.example to $CONF and edit it first"
     load_config "$CONF"; validate_config
 
     if [[ $mode == check ]]; then
@@ -98,7 +98,7 @@ proton_bootstrap() {
     # gate. proton-bootstrap already applies the override and no-ops if a valid
     # session exists; otherwise it runs the one-time interactive login.
     log "Proton login (skips automatically if a valid session already exists):"
-    /etc/multivpn/bin/proton-bootstrap
+    /etc/proteus/bin/proton-bootstrap
 }
 
 # A fresh box has no minted WG configs, so the slot/dns units (ConditionPathExists)
@@ -110,21 +110,21 @@ initial_mint() {
     log "minting initial config for $SLOT_COUNT slot(s) + dns (each runs mint+probe+gate, ~1-2 min)"
     for (( n=1; n<=SLOT_COUNT; n++ )); do
         log "  proton-$n ..."
-        /etc/multivpn/bin/rotate-slot.sh "proton-$n" \
+        /etc/proteus/bin/rotate-slot.sh "proton-$n" \
             || warn "initial mint for proton-$n failed — its daily timer will retry"
     done
     log "  dns ..."
-    /etc/multivpn/bin/rotate-dns.sh -f || warn "initial dns mint failed — dns-latency timer will retry"
+    /etc/proteus/bin/rotate-dns.sh -f || warn "initial dns mint failed — dns-latency timer will retry"
 }
 
 enable_services() {
     systemctl daemon-reload
     local n
-    for (( n=1; n<=SLOT_COUNT; n++ )); do systemctl enable --now "multivpn-proton@proton-$n" || true; done
-    systemctl enable --now multivpn-dns-tunnel.service unbound multivpn-dispatcher.service
-    systemctl enable --now multivpn-slot-warmup.timer multivpn-dns-latency.timer \
-        multivpn-proton-api-whitelist.timer
-    for (( n=1; n<=SLOT_COUNT; n++ )); do systemctl enable "multivpn-rotate-slot@proton-$n.timer" || true; done
+    for (( n=1; n<=SLOT_COUNT; n++ )); do systemctl enable --now "proteus-proton@proton-$n" || true; done
+    systemctl enable --now proteus-dns-tunnel.service unbound proteus-dispatcher.service
+    systemctl enable --now proteus-slot-warmup.timer proteus-dns-latency.timer \
+        proteus-proton-api-whitelist.timer
+    for (( n=1; n<=SLOT_COUNT; n++ )); do systemctl enable "proteus-rotate-slot@proton-$n.timer" || true; done
 }
 
 main "$@"

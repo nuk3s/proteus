@@ -1,0 +1,13 @@
+[Unit]
+Description=Re-populate proteus wg_peers nftables set after nftables loads
+After=nftables.service
+Wants=nftables.service
+Before=proteus-dispatcher.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/proteus/bin/repopulate-wg-peers.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

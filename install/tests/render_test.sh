@@ -10,8 +10,8 @@ validate_config
 STAGE=$(mktemp -d)
 render_all "$STAGE"
 
-echo "render: multivpn.env matches golden"
-assert_eq "$(cat "$STAGE/multivpn.env")" "$(cat install/tests/fixtures/expected-multivpn.env)" "env renders exactly"
+echo "render: proteus.env matches golden"
+assert_eq "$(cat "$STAGE/proteus.env")" "$(cat install/tests/fixtures/expected-proteus.env)" "env renders exactly"
 
 echo "render: nftables has no unexpanded vars and substituted interfaces"
 assert_eq "$(grep -c '\${' "$STAGE/nftables.conf")" "0" "no leftover \${...} in nftables"
@@ -33,13 +33,13 @@ assert_eq "$r" ok "nft \$RFC1918 survives render"
 # checks above are the environment-independent guard against the blanking bug.)
 
 echo "render: unbound binds the configured gateway IP + dns transit"
-grep -q "interface: 172.16.1.5" "$STAGE/unbound-multivpn-dns.conf" && r=ok || r=fail
+grep -q "interface: 172.16.1.5" "$STAGE/unbound-proteus-dns.conf" && r=ok || r=fail
 assert_eq "$r" ok "unbound interface rendered"
-grep -q "outgoing-interface: 172.31.99.1" "$STAGE/unbound-multivpn-dns.conf" && r=ok || r=fail
+grep -q "outgoing-interface: 172.31.99.1" "$STAGE/unbound-proteus-dns.conf" && r=ok || r=fail
 assert_eq "$r" ok "unbound outgoing-interface uses dns index 99"
 
 echo "render: key systemd units are produced"
-for u in multivpn-dispatcher.service multivpn-proton@.service multivpn-dns-tunnel.service multivpn-rotate-slot@.timer; do
+for u in proteus-dispatcher.service proteus-proton@.service proteus-dns-tunnel.service proteus-rotate-slot@.timer; do
     [[ -f "$STAGE/$u" ]] && r=ok || r=fail
     assert_eq "$r" ok "$u rendered"
 done

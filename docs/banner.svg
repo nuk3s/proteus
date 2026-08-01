@@ -18,14 +18,14 @@
     <text x="30" y="170"> / ____/ /  / /_/ / /_/  __/ /_/ (__  ) </text>
     <text x="30" y="192">/_/   /_/   \____/\__/\___/\__,_/____/  </text>
   </g>
-  <text x="34" y="222" font-size="14" fill="#8f8a7a">~ a new face for every connection</text>
+  <text x="34" y="222" font-size="14" fill="#8f8a7a">~ a new face for every device</text>
 
   <line x1="30" y1="240" x2="830" y2="240" stroke="#332e26"/>
 
   <!-- rotation strip: one client, several shifting exits -->
   <g font-size="13">
     <rect x="30" y="256" width="64" height="26" fill="none" stroke="#4A4436"/>
-    <text x="62" y="273" text-anchor="middle" fill="#D8CBB4">client</text>
+    <text x="62" y="273" text-anchor="middle" fill="#D8CBB4">clients</text>
     <path d="M96 269 H 138" stroke="#7E7A46" stroke-width="1.4" fill="none"/>
     <path d="M138 265 l6 4 l-6 4 z" fill="#7E7A46"/>
     <g fill="#8f8a7a">

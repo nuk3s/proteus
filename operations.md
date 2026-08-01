@@ -6,14 +6,14 @@ Log in as `admin@10.0.0.119` — NOPASSWD sudo. Every command below is from that
 
 ```bash
 # All five rotating slots + dns-6 handshaking
-sudo systemctl is-active multivpn-dispatcher unbound
+sudo systemctl is-active proteus-dispatcher unbound
 for n in 1 2 3 4 5 6; do
     ns=ns-proton-$n; [[ $n == 6 ]] && ns=ns-dns-6
     echo -n "$ns: "; sudo ip netns exec "$ns" wg show wg0 | grep "latest handshake"
 done
 
 # Dispatcher pool should list exactly 5 instances, no dns-6, no -s
-sudo journalctl -u multivpn-dispatcher -n 5 --no-pager | grep -oE 'loaded .*instance.*'
+sudo journalctl -u proteus-dispatcher -n 5 --no-pager | grep -oE 'loaded .*instance.*'
 
 # DNS working
 dig @127.0.0.1 +short cloudflare.com A
@@ -41,8 +41,8 @@ sudo cp /path/to/new.conf /etc/nftables.conf
 sudo nft -f /etc/nftables.conf
 
 # 4. Repopulate sets that flush ruleset empties
-sudo /etc/multivpn/bin/repopulate-wg-peers.sh
-sudo systemctl start multivpn-proton-api-whitelist.service
+sudo /etc/proteus/bin/repopulate-wg-peers.sh
+sudo systemctl start proteus-proton-api-whitelist.service
 
 # 5. Test. If good:
 sudo systemctl stop nft-revert.timer
@@ -54,7 +54,7 @@ See `gotchas.md` → "nftables safety revert" for why not to rely on `nft -c` al
 ## Bootstrap Proton SSO (one-time + whenever token expires)
 
 ```bash
-sudo /etc/multivpn/bin/proton-mint --bootstrap
+sudo /etc/proteus/bin/proton-mint --bootstrap
 # Prompts for Proton username, password, TOTP. Writes refresh token to
 # /etc/Proton/ (0600, owned root). After this, rotation runs unattended
 # until the refresh token expires (weeks-months typically).
@@ -68,20 +68,20 @@ Rotation is automatic, but manual mint is occasionally needed:
 
 ```bash
 # Mint a fresh config for slot N
-sudo /etc/multivpn/bin/proton-mint --slot proton-3 --out-dir /etc/multivpn/wg/proton/auto
+sudo /etc/proteus/bin/proton-mint --slot proton-3 --out-dir /etc/proteus/wg/proton/auto
 
 # Bring it up (or replace what's live)
-sudo /etc/multivpn/bin/vpnns-up.sh proton-3 /etc/multivpn/wg/proton/auto/proton-3-<latest>.conf
+sudo /etc/proteus/bin/vpnns-up.sh proton-3 /etc/proteus/wg/proton/auto/proton-3-<latest>.conf
 
 # Tell dispatcher to re-read state
-sudo systemctl kill -s HUP multivpn-dispatcher.service
+sudo systemctl kill -s HUP proteus-dispatcher.service
 ```
 
 ## Force a rotation now (bypass the timer)
 
 ```bash
-sudo systemctl start multivpn-rotate-slot@proton-4.service
-sudo journalctl -u multivpn-rotate-slot@proton-4.service -f
+sudo systemctl start proteus-rotate-slot@proton-4.service
+sudo journalctl -u proteus-rotate-slot@proton-4.service -f
 ```
 
 Expect ~10-60s for mint + handshake + probes. On success you'll see "promoted" in the log.
@@ -114,10 +114,10 @@ Occasional first-query timeouts (~1 in 20) are unbound's UDP retry budget on col
 ### Manually rotate dns-6 (force past the cooldown)
 
 ```bash
-sudo /etc/multivpn/bin/rotate-dns.sh -f
+sudo /etc/proteus/bin/rotate-dns.sh -f
 ```
 
-Use when you suspect the current dns-6 exit has a bad Quad9 path and don't want to wait for the 15-min timer. The automatic `multivpn-dns-latency.timer` handles the unattended case (rotates when `ns-dns-6 → 9.9.9.9` average RTT crosses 120ms, throttled to once per hour).
+Use when you suspect the current dns-6 exit has a bad Quad9 path and don't want to wait for the 15-min timer. The automatic `proteus-dns-latency.timer` handles the unattended case (rotates when `ns-dns-6 → 9.9.9.9` average RTT crosses 120ms, throttled to once per hour).
 
 ## Diagnose a client slot problem
 
@@ -126,7 +126,7 @@ Use when you suspect the current dns-6 exit has a bad Quad9 path and don't want 
 sudo ip netns exec ns-proton-N wg show
 
 # Is its state file current?
-cat /etc/multivpn/state/proton-N.state
+cat /etc/proteus/state/proton-N.state
 
 # Are its ip rules in place?
 ip rule | grep "fwmark 0x${N}"
@@ -139,22 +139,22 @@ sudo nft list set inet filter wg_peers
 sudo nft list map inet filter vpn_dispatch | head -30
 
 # Force a refresh of peer whitelist after any manual change
-sudo /etc/multivpn/bin/repopulate-wg-peers.sh
+sudo /etc/proteus/bin/repopulate-wg-peers.sh
 ```
 
 ## Recover from a total netns mess
 
 ```bash
 # Wipe everything related to slot N and bring it back from scratch
-sudo /etc/multivpn/bin/vpnns-down.sh proton-N
-sudo /etc/multivpn/bin/vpnns-up.sh proton-N /etc/multivpn/wg/proton/auto/proton-N.conf
-sudo systemctl kill -s HUP multivpn-dispatcher.service
+sudo /etc/proteus/bin/vpnns-down.sh proton-N
+sudo /etc/proteus/bin/vpnns-up.sh proton-N /etc/proteus/wg/proton/auto/proton-N.conf
+sudo systemctl kill -s HUP proteus-dispatcher.service
 ```
 
 If a *staging* instance (`proton-N-s`) got orphaned because `rotate-slot.sh` was killed mid-attempt:
 
 ```bash
-sudo /etc/multivpn/bin/vpnns-down.sh proton-N-s
+sudo /etc/proteus/bin/vpnns-down.sh proton-N-s
 ip rule | grep "from 172.31.$((100+N)).1"   # should be empty; if not:
 sudo ip rule del from "172.31.$((100+N)).1" lookup $((200+N))
 sudo ip rule del fwmark $((0x64+N)) lookup $((200+N))
@@ -167,8 +167,8 @@ sudo ip rule del fwmark $((0x64+N)) lookup $((200+N))
 `SIGHUP` re-reads **state files only**, not the Python source. Dispatcher code changes require a restart:
 
 ```bash
-sudo systemctl restart multivpn-dispatcher.service
-sudo journalctl -u multivpn-dispatcher.service -n 5 --no-pager
+sudo systemctl restart proteus-dispatcher.service
+sudo journalctl -u proteus-dispatcher.service -n 5 --no-pager
 ```
 
 Confirm the pool count in the "loaded N VPN instance(s)" log line.
@@ -176,7 +176,7 @@ Confirm the pool count in the "loaded N VPN instance(s)" log line.
 ## Check rotation timer spread
 
 ```bash
-systemctl list-timers 'multivpn-rotate-slot@proton-*.timer'
+systemctl list-timers 'proteus-rotate-slot@proton-*.timer'
 ```
 
 Good spread means the five slots rotate at different hours — if all cluster at the same time, reduce load by staggering the `Persistent=true` schedule (or just let `RandomizedDelaySec=12h` do its work over a few days).
@@ -185,7 +185,7 @@ Good spread means the five slots rotate at different hours — if all cluster at
 
 ```bash
 # Per-slot judgment by slot-warmup
-for f in /run/multivpn-slot-health/proton-*.state; do
+for f in /run/proteus-slot-health/proton-*.state; do
     echo "=== $(basename "$f" .state) ==="
     sudo cat "$f"
 done
@@ -203,7 +203,7 @@ Smoke-test the dispatcher's filter without breaking anything:
 
 ```bash
 # 1. Mark proton-3 as degraded for ~10s
-sudo tee /run/multivpn-slot-health/proton-3.state <<EOF
+sudo tee /run/proteus-slot-health/proton-3.state <<EOF
 INSTANCE=proton-3
 STATUS=degraded
 LAST_OUTCOME=all_fail
@@ -226,17 +226,17 @@ sudo nft list map inet filter vpn_dispatch | grep example.com
 
 Symptom: LXC / VLAN client reports `tcp_connect` of 2-20s on the first HTTPS hit to a domain not seen recently; subsequent hits to the same host are fast. This is Proton's exit-side flow-state going cold after ~25-35s of no user-plane traffic per slot — the WG transport stays up but the first SYN through the cold path is dropped.
 
-The `multivpn-slot-warmup.timer` (10s cadence) is the fix. Verify:
+The `proteus-slot-warmup.timer` (10s cadence) is the fix. Verify:
 
 ```bash
 # Timer is running
-systemctl list-timers multivpn-slot-warmup.timer --no-pager | head -3
+systemctl list-timers proteus-slot-warmup.timer --no-pager | head -3
 
 # Recent passes — most slots should show code=200 connect<0.5s total<1.5s
 sudo journalctl -t slot-warmup --since "2 min ago" --no-pager | tail -30
 ```
 
-Some per-pass failures (code=000) are expected and benign — they're the warmup itself catching the cold window. What matters is that the *next* pass 10s later shows the slot warm again. If you see consistent fails on the same slot across many passes, that slot's Proton exit is actually bad — it'll be rotated out by the next `multivpn-rotate-slot@proton-N.timer` fire.
+Some per-pass failures (code=000) are expected and benign — they're the warmup itself catching the cold window. What matters is that the *next* pass 10s later shows the slot warm again. If you see consistent fails on the same slot across many passes, that slot's Proton exit is actually bad — it'll be rotated out by the next `proteus-rotate-slot@proton-N.timer` fire.
 
 Measure the effect from an actual client (LXC on 172.16.1.0/24):
 
@@ -249,21 +249,21 @@ for host in openbsd.org apache.org python.org nginx.org gnu.org; do
 done
 ```
 
-Expect ≥80% of runs under 200ms TCP connect. If most are >2s, check `multivpn-slot-warmup.service` status and whether the timer is actually firing.
+Expect ≥80% of runs under 200ms TCP connect. If most are >2s, check `proteus-slot-warmup.service` status and whether the timer is actually firing.
 
 ## Emergency: client VLAN is losing connectivity
 
 Typical causes in order of likelihood:
 
 1. `@wg_peers` got flushed by an `nft -f` without a follow-up `repopulate-wg-peers.sh`. Run it.
-2. All five slots failed rotation in the same window. Check `journalctl -u 'multivpn-rotate-slot@*'` — the old slots should still be up since rotation is atomic, but if Proton's API is throwing 500s your mints are failing. Re-bootstrap SSO if auth errors; wait out API issues.
-3. Dispatcher crashed. `sudo systemctl status multivpn-dispatcher`. `bypass` on the NFQUEUE rule means packets without a dispatcher are dropped by default policy — this is the safe behavior, not a bug.
+2. All five slots failed rotation in the same window. Check `journalctl -u 'proteus-rotate-slot@*'` — the old slots should still be up since a failed rotation leaves the incumbent exit in place, but if Proton's API is throwing 500s your mints are failing. Re-bootstrap SSO if auth errors; wait out API issues.
+3. Dispatcher crashed. `sudo systemctl status proteus-dispatcher`. `bypass` on the NFQUEUE rule means packets without a dispatcher are dropped by default policy — this is the safe behavior, not a bug.
 4. UniFi IPS rule dropping SSH / client traffic from upstream. User has a toggle for it. The VM is not at fault — don't blame the kill-switch without evidence of output-chain drops.
 
 ## Before reporting success after a change
 
 1. Ruleset counters sane (`nft-*-dropped` not climbing for normal traffic).
-2. At least one full rotation cycle completed cleanly (watch `multivpn-rotate-slot@proton-1.service` fire).
+2. At least one full rotation cycle completed cleanly (watch `proteus-rotate-slot@proton-1.service` fire).
 3. DNS resolution via both `127.0.0.1` and `172.16.1.5`.
 4. A forwarded HTTPS connection from a client in 172.16.1.0/24 actually reaches the internet.
 5. `ss -tnp | grep sshd` on the VM shows your live SSH source IP — narrowing any inbound rule without this check risks lockout (user has been burned before).

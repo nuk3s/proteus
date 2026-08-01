@@ -1,0 +1,11 @@
+[Unit]
+Description=Rotate proteus slot %i to a fresh Proton WG config
+After=network-online.target proteus-dispatcher.service
+Wants=network-online.target
+Requires=proteus-dispatcher.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/proteus/bin/rotate-slot.sh %i
+TimeoutStartSec=5min
+Nice=10

@@ -37,8 +37,8 @@ Don't let a future refactor "clarify" the staging suffix — it has to stay ≤2
 
 Any `nft -f /etc/nftables.conf` flushes @wg_peers and @proton_api. The ruleset *declares* them but the elements are populated at runtime by:
 
-- `repopulate-wg-peers.sh` (scans `/etc/multivpn/state/*.state`)
-- `multivpn-proton-api-whitelist.service` (resolves `vpn-api.proton.me` + siblings)
+- `repopulate-wg-peers.sh` (scans `/etc/proteus/state/*.state`)
+- `proteus-proton-api-whitelist.service` (resolves `vpn-api.proton.me` + siblings)
 
 **After any nft reload**, run both. The deploy script for DNS (`/tmp/deploy-dns.sh`) does this in order: reload → repopulate → restart dependent services. If you skip it: all WG handshakes start failing silently within a keepalive interval because the kill-switch no longer permits them.
 
@@ -64,7 +64,7 @@ Cold-cache first query to a zone that Quad9 hasn't cached nearby can exceed unbo
 
 ## SIGHUP to the dispatcher re-reads state, not code
 
-`multivpn-dispatcher.service` reloads the instance pool on SIGHUP — but only by re-running `_load_instances()` on the already-imported Python module. Code changes in `dispatcher.py` require a full `systemctl restart`. The line in `journalctl` you want to confirm is "loaded N VPN instance(s): …" after the restart.
+`proteus-dispatcher.service` reloads the instance pool on SIGHUP — but only by re-running `_load_instances()` on the already-imported Python module. Code changes in `dispatcher.py` require a full `systemctl restart`. The line in `journalctl` you want to confirm is "loaded N VPN instance(s): …" after the restart.
 
 ## Don't query AbuseIPDB / Scamalytics from the mgmt IP
 
@@ -118,11 +118,11 @@ If you add another caller that recreates v-dns-6 (e.g., a future staged rotation
 
 ## Stable `proton-N.conf` symlink must be kept in sync with promoted config
 
-`rotate-slot.sh` writes a new timestamped config and calls `vpnns-up.sh` with that fresh path directly — but the `multivpn-proton@.service` boot unit reads the stable symlink `/etc/multivpn/wg/proton/auto/proton-N.conf`. If the symlink isn't updated on promotion, the next reboot (or any `systemctl restart multivpn-proton@proton-N`) silently reverts the slot to whatever config the symlink still points at — typically the *pre-rotation* one that may have been bad enough to trigger the rotation in the first place.
+`rotate-slot.sh` writes a new timestamped config and calls `vpnns-up.sh` with that fresh path directly — but the `proteus-proton@.service` boot unit reads the stable symlink `/etc/proteus/wg/proton/auto/proton-N.conf`. If the symlink isn't updated on promotion, the next reboot (or any `systemctl restart proteus-proton@proton-N`) silently reverts the slot to whatever config the symlink still points at — typically the *pre-rotation* one that may have been bad enough to trigger the rotation in the first place.
 
 **Fix (landed 2026-04-21):** `rotate-slot.sh` now runs `ln -sfn "$good_conf" "${AUTO_DIR}/${SLOT}.conf"` right after the promote-time `vpnns-up.sh` call, before the "promoted" log line.
 
-If you're debugging and see a slot's wg0 endpoint suddenly revert to an old IP after a restart, check the symlink target vs the `WG_CONF=` line in `/etc/multivpn/state/proton-N.state`. They should match.
+If you're debugging and see a slot's wg0 endpoint suddenly revert to an old IP after a restart, check the symlink target vs the `WG_CONF=` line in `/etc/proteus/state/proton-N.state`. They should match.
 
 ## Proton exit-side flow state goes cold in ~25-35s
 
@@ -130,7 +130,7 @@ WireGuard PersistentKeepalive=25 keeps the encrypted transport alive, and `wg sh
 
 **Symptom:** `curl` from a client VLAN host to a fresh destination hangs 2-20s on TCP connect; subsequent connections to the same host are sub-second.
 
-**Fix:** `multivpn-slot-warmup.timer` fires every 10s, issuing parallel `curl -I https://proton.me/` per slot. proton.me chosen so the keepalive doesn't leak correlation to a third party. Parallelization is load-bearing — a serial loop over cold slots takes ~20s end-to-end, pushing per-slot re-hit past the cold threshold.
+**Fix:** `proteus-slot-warmup.timer` fires every 10s, issuing parallel `curl -I https://proton.me/` per slot. proton.me chosen so the keepalive doesn't leak correlation to a third party. Parallelization is load-bearing — a serial loop over cold slots takes ~20s end-to-end, pushing per-slot re-hit past the cold threshold.
 
 **If you see the log full of `code=000 connect=0.000`:** those are expected during the cold cycle. What you want to verify is that the *next pass 10s later* shows `code=200 connect<0.5s`. If a slot stays consistently failed for many passes, that slot's Proton exit is unhealthy and rotation will eventually replace it.
 
@@ -156,9 +156,9 @@ UniFi is both the DHCP server on the client VLAN and the mgmt-LAN router. When a
 failed: No working transports found` (the kill-switch drops the Proton API
 HTTPS because the destination isn't in `@proton_api`), and `nft list set inet
 filter proton_api` is empty. It stays broken until the daily
-`multivpn-proton-api-whitelist.timer` fires.
+`proteus-proton-api-whitelist.timer` fires.
 
-**Root cause:** `multivpn-proton-api-whitelist.service` is a `oneshot` that runs
+**Root cause:** `proteus-proton-api-whitelist.service` is a `oneshot` that runs
 seconds into boot (`After=network-online.target`), does a single
 `getent ahostsv4 vpn-api.proton.me`, and at that moment the path to the LAN
 resolver (`10.0.0.22`) isn't ready — so it resolves nothing, logs
@@ -171,7 +171,7 @@ DNS-not-ready window self-heals. This also hardens the pre-mint call
 `rotate-slot.sh` makes. The daily timer remains the backstop.
 
 **Manual unwedge if you hit an old build:** `sudo systemctl start
-multivpn-proton-api-whitelist` once DNS is up, then mints work again.
+proteus-proton-api-whitelist` once DNS is up, then mints work again.
 
 ## Corrupt `serverlist.json` wedges ALL minting (recurring; now serialized)
 
@@ -185,7 +185,7 @@ bad exit cascades into a total client-egress outage over days (seen 2026-05-09,
 and again 2026-07-12 where it had been silently broken since ~May 21).
 
 **Root cause:** `proton-vpn-core` persists a ~23 MB shared cache at
-`/var/cache/Proton/VPN/serverlist.json`. Multiple `multivpn-rotate-slot@` /
+`/var/cache/Proton/VPN/serverlist.json`. Multiple `proteus-rotate-slot@` /
 `rotate-dns` timers can fire in the same second (each `RandomizedDelaySec`, plus
 `slot-warmup` auto-rotation triggers), and two `proton-mint` processes fetching
 at once race on that write — leaving a complete JSON document with a stray
@@ -203,13 +203,13 @@ obj,end=json.JSONDecoder().raw_decode(d)      # first valid document
 open(p,"w",encoding="utf-8").write(d[:end])   # drop the trailing byte(s)
 json.load(open(p,encoding="utf-8"))           # verify
 PY
-sudo /etc/multivpn/bin/proton-mint --slot proton-1 --out-dir /tmp/t   # expect exit 0
+sudo /etc/proteus/bin/proton-mint --slot proton-1 --out-dir /tmp/t   # expect exit 0
 ```
 Do NOT just delete it — with the cache absent the session still won't
 deserialize; restoring a valid cache is what unblocks the fetch.
 
 **Prevention (landed 2026-07-12):** two layers.
-1. `proton-mint` takes a system-wide `flock` on `/run/multivpn-mint.lock`
+1. `proton-mint` takes a system-wide `flock` on `/run/proteus-mint.lock`
    (`acquire_mint_lock`) before touching proton-vpn-core, so mints run one at a
    time regardless of how many timers fire — this closes the *concurrent-write*
    vector. The lock is fd-scoped, so a crashed mint can't deadlock the next one.
@@ -238,7 +238,7 @@ with the same x25519 server pubkey and entry IP).
    unlinkability the design assumes.
 2. **Performance:** Proton's exit-side flow-state appears to coalesce both
    slots' keepalive traffic, and the warmup `curl -I https://proton.me/`
-   probes from `multivpn-slot-warmup` start failing on the colliding slots
+   probes from `proteus-slot-warmup` start failing on the colliding slots
    (~30-70% pass rate vs the normal 100%). Cold-SYN drops resume on the
    client side — fresh-destination TCP connects regress from sub-200ms to
    the Linux SYN-retransmit pattern (3s, 11s).
@@ -262,39 +262,39 @@ sudo journalctl -t slot-warmup --since "2 min ago" --no-pager \
 If you see this, check sibling endpoint IPs:
 ```bash
 for n in 1 2 3 4 5; do echo -n "proton-$n: "; \
-    sudo awk -F= '/^WG_ENDPOINT_IP=/ {print $2}' /etc/multivpn/state/proton-$n.state; done
+    sudo awk -F= '/^WG_ENDPOINT_IP=/ {print $2}' /etc/proteus/state/proton-$n.state; done
 ```
 
 If two match, the dedup either failed (bug — investigate `rotate-slot.sh`)
 or the colliding pair was minted before the dedup landed (pre-2026-04-26
 configs). Force-rotate one of the pair to break the tie:
-`sudo systemctl start multivpn-rotate-slot@proton-N.service`.
+`sudo systemctl start proteus-rotate-slot@proton-N.service`.
 
 ## Health-aware dispatch: dispatcher restart required after dispatcher.py edits
 
-`dispatcher.py` reads `/run/multivpn-slot-health/proton-N.state` on every
+`dispatcher.py` reads `/run/proteus-slot-health/proton-N.state` on every
 new-flow decision, so health changes pick up automatically. But the
 dispatcher's *own* code only reloads on `systemctl restart
-multivpn-dispatcher.service`. SIGHUP only re-reads `/etc/multivpn/state/`
+proteus-dispatcher.service`. SIGHUP only re-reads `/etc/proteus/state/`
 (the instance pool), not the Python source. If you edit `_is_healthy()` or
 `pick()` and SIGHUP, your changes won't take effect — restart instead.
 
 Confirm the new code is live:
 ```bash
-sudo journalctl -u multivpn-dispatcher.service -n 3 --no-pager
+sudo journalctl -u proteus-dispatcher.service -n 3 --no-pager
 # Want to see "loaded N VPN instance(s)" *after* the timestamp of your edit.
 ```
 
 ## Health-state file is tmpfs
 
-`/run/multivpn-slot-health/` is on tmpfs and disappears at boot. The
+`/run/proteus-slot-health/` is on tmpfs and disappears at boot. The
 dispatcher treats a missing health file as `STATUS=ok` (the right default —
 better than blocking traffic on every reboot). Within ~10s of boot,
 `slot-warmup.timer` populates the directory and the dispatcher starts
 filtering correctly.
 
 If a slot is mysteriously skipped after a long no-traffic window, check
-the state file directly — `cat /run/multivpn-slot-health/proton-N.state`
+the state file directly — `cat /run/proteus-slot-health/proton-N.state`
 shows the current judgment and how it got there (FAIL_STREAK is the
 useful field).
 
@@ -304,7 +304,7 @@ The dedup logic in `rotate-slot.sh` (added 2026-04-26 — see the entry above)
 is intentionally simple. Two known limitations to be aware of before
 extending it:
 
-1. **Concurrent-rotation race.** Each `multivpn-rotate-slot@proton-N.timer`
+1. **Concurrent-rotation race.** Each `proteus-rotate-slot@proton-N.timer`
    has `RandomizedDelaySec=12h` and runs as a separate systemd unit, so two
    rotations CAN start in the same ~30s window. If they do, both read the
    pre-rotation sibling state, both pick a fresh endpoint independently,
@@ -312,7 +312,7 @@ extending it:
    = ~10-30s) and the next timer fire on either slot will dedup correctly.
    Not currently fixed because the failure mode self-heals within 24h of
    the next rotation; if you find the collision rate is non-zero in steady
-   state, an `flock` on `/run/multivpn-rotate.lock` around the
+   state, an `flock` on `/run/proteus-rotate.lock` around the
    mint→dedup→promote critical section is the cheap fix.
 
 2. **IPv4-only endpoint parser.** `awk -F'[ =:]+' '/^Endpoint = / {print $2}'`
@@ -325,13 +325,13 @@ extending it:
 
 ## Boot race: parallel slots collide on the shared `wg0` name in the main ns
 
-**Symptom:** every boot, one or two `multivpn-proton@proton-N` slots come up as
+**Symptom:** every boot, one or two `proteus-proton@proton-N` slots come up as
 a "zombie" — the netns exists but has no `wg0` and no routing table, and the
 unit log shows `RTNETLINK answers: File exists`. Historically hit `proton-3` and
 `proton-4`.
 
-**Root cause:** all five `multivpn-proton@proton-N.service` units start in
-parallel (`multivpn-proton@.service` orders them after `nftables.service` but
+**Root cause:** all five `proteus-proton@proton-N.service` units start in
+parallel (`proteus-proton@.service` orders them after `nftables.service` but
 not against each other). Each runs `vpnns-up.sh`, which created the WireGuard
 interface in the **main ns** as `wg0` before moving it into the slot's netns.
 `wg0` is a single name in the shared main namespace, so two concurrent
