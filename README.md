@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/gateway-transparent%20L3-E0883C?style=flat-square&labelColor=1B1815">
   <img src="https://img.shields.io/badge/tunnels-Proton%20WireGuard-D7A55F?style=flat-square&labelColor=1B1815">
   <img src="https://img.shields.io/badge/OS-Debian%2013-7E7A46?style=flat-square&labelColor=1B1815">
-  <img src="https://img.shields.io/badge/tests-110%20passing-7E8A4E?style=flat-square&labelColor=1B1815">
+  <img src="https://img.shields.io/badge/tests-219%20passing-7E8A4E?style=flat-square&labelColor=1B1815">
   <img src="https://img.shields.io/badge/deps-bash%20%2B%20python3-8F8A7A?style=flat-square&labelColor=1B1815">
 </p>
 
@@ -24,6 +24,7 @@ The wizard runs the whole setup, and it has a demo mode that changes nothing on 
 
 ```bash
 git clone https://github.com/nuk3s/proteus.git && cd proteus
+./install/proteus --demo      # cinematic walkthrough: no root, changes nothing
 ```
 
 That is the recording above. When you're ready to install for real on a fresh Debian 13 box:
@@ -43,6 +44,39 @@ The plain scripted path is in `install/README.md`: `install.sh --check`, then `i
 Each exit lives in its own network namespace with a single WireGuard interface. A namespace can only reach the internet through its tunnel, so a dead tunnel means no egress for that slot rather than a leak. A dispatcher on `NFQUEUE 0` decides which slot a new flow takes: it pins a source to a slot, keeps that flow sticky through a conntrack mark, and skips any slot that warmup has marked unhealthy. DNS gets its own dedicated tunnel so name lookups don't ride the rotating pool and don't fall back to the clear.
 
 A minted exit has to earn its place. Rotation stages the new tunnel in a parallel namespace, waits for the handshake, checks egress, runs a reputation probe (is this IP blocked by the sites people actually use?), and measures throughput against a streaming floor. Only an exit that clears all of that gets promoted; the incumbent keeps serving until its replacement has passed every gate, so a failed candidate never thins the pool. The swap itself is brief: flows caught on that slot reconnect through the fresh exit.
+
+## Control panel
+
+A passphrase-gated web UI on `:8443` (TLS, self-signed by the installer) shows what every slot
+is doing and exposes the tuning knobs without editing files on the box.
+
+<p align="center">
+  <img src="docs/ui-overview.png" alt="Proteus overview: five exit servers, DNS tunnel, recent rotations and pinned clients" width="880">
+</p>
+
+Each card is one exit: which Proton server it landed on, health score, latency, jitter and measured
+throughput, how long until it rotates, and a button to rotate it now. Below that, the dedicated DNS
+tunnel, a log of recent swaps and which client is pinned where.
+
+Settings are plain-English rather than environment variables — rotation cadence, quality gates,
+exit country, ad/tracker blocking, client isolation, and the health checks a candidate exit has to
+pass before it is allowed to serve traffic.
+
+<p align="center">
+  <img src="docs/ui-settings.png" alt="Proteus settings: health checks and tuning knobs" width="880">
+</p>
+
+Health checks are the interesting part. A candidate exit is probed in a throwaway tunnel *before*
+promotion, and a check can assert on page content rather than just an HTTP status — which is the
+only way to catch a streaming service that answers `200` from an exit it will not actually serve
+video to. Mandatory checks reject the exit; advisory ones are recorded and don't gate.
+
+<p align="center">
+  <img src="docs/ui-login.png" alt="Proteus login" width="620">
+</p>
+
+Screenshots are rendered from synthetic data: exit addresses are RFC 5737 documentation ranges,
+client addresses are the project's default RFC 1918 client VLAN (`172.16.1.0/24`).
 
 ## What keeps it from stranding you
 

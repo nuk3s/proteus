@@ -27,6 +27,8 @@ main() {
         log "== phase: bootstrap =="; proton_bootstrap
         log "== phase: mint =="; initial_mint
         log "== phase: enable =="; enable_services
+        [[ -f /etc/proteus/ui/secrets/passwd ]] || \
+            log "Web UI: set a passphrase with 'sudo /etc/proteus/bin/proteus-ui-passwd', then 'systemctl start proteus-ui'."
         log "== phase: verify =="; doctor_post
         log "install complete."
         return
@@ -58,9 +60,11 @@ install_deps() {
     # (dispatcher.py: `from netfilterqueue import NetfilterQueue` and
     # `from scapy.layers.inet import IP`); without them the dispatcher crash-loops
     # and no client traffic is routed. Both are in Debian 13 main.
+    # openssl mints the web UI's self-signed TLS cert in apply_files (not
+    # guaranteed present on a minbase image).
     apt-get install -y -qq nftables unbound wireguard-tools gettext-base curl dnsutils \
         python3 python3-netfilterqueue python3-scapy conntrack tcpdump iproute2 procps \
-        systemd-timesyncd || die "dependency install failed"
+        systemd-timesyncd openssl || die "dependency install failed"
     # Proton VPN python lib. Debian 13 (trixie) ships python3-proton-vpn-api-core
     # 0.39.0-1 in main — the exact build production runs — pulling python3-proton-core.
     # (The PyPI name "proton-vpn-api-core" is an unrelated empty placeholder with no
@@ -122,9 +126,19 @@ enable_services() {
     local n
     for (( n=1; n<=SLOT_COUNT; n++ )); do systemctl enable --now "proteus-proton@proton-$n" || true; done
     systemctl enable --now proteus-dns-tunnel.service unbound proteus-dispatcher.service
+    # Regenerates /etc/proteus/nft/client-pivot-seed.nft (the boot-time fail
+    # direction) and applies the live isolation mode on top of the freshly-loaded
+    # ruleset; re-runs at every boot after nftables.service. daemon-reload above
+    # is what makes this unit known on a fresh install.
+    systemctl enable --now proteus-client-isolation.service || true
     systemctl enable --now proteus-slot-warmup.timer proteus-dns-latency.timer \
         proteus-proton-api-whitelist.timer
     for (( n=1; n<=SLOT_COUNT; n++ )); do systemctl enable "proteus-rotate-slot@proton-$n.timer" || true; done
+    # The socket is safe to start now (it just listens); proteus-ui.service
+    # refuses to start without a passphrase (no plaintext fallback), so it's
+    # enabled for boot but NOT started here — see the post-enable message.
+    systemctl enable --now proteus-ui-apply.socket
+    systemctl enable proteus-ui.service
 }
 
 main "$@"

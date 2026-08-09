@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+# etc/proteus/bin/proteus-ui-apply
+"""Privileged broker for the proteus web UI.
+
+Socket-activated by systemd (fd 3) in production; --test-socket for tests.
+One JSON object per line in, one JSON reply per line out. This process is the
+security boundary: the web daemon is untrusted. Validate everything, build
+argv directly, never touch a shell.
+"""
+from __future__ import annotations
+
+import argparse
+import grp
+import json
+import logging
+import os
+import re
+import socket
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ui_logic
+
+logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
+log = logging.getLogger("proteus-ui-apply")
+
+ENV_FILE = "/etc/proteus/proteus-local.env"
+DROPIN_DIR = "/etc/systemd/system/proteus-rotate-slot@.timer.d"
+FLAG_FILE = "/etc/proteus/state/rotation-paused"
+TRIGGER_DIR = "/run/proteus"
+CHECKS_FILE = "/etc/proteus/checks.json"
+# Manual rotation is proton-only in v1: DNS rotates via rotate-dns.sh on its own
+# cooldown, and no proteus-rotate-slot@dns*.service unit exists to start.
+ROTATE_SLOT_RE = re.compile(r"proton-[1-9]")
+CADENCE_RE = re.compile(r"^[A-Za-z0-9:*./ -]{1,64}$")
+
+
+def systemctl(*args: str) -> None:
+    subprocess.run(["systemctl", *args], check=True, timeout=60)
+
+
+def write_env(path: str, key: str, value: str) -> None:
+    lines = []
+    if os.path.exists(path):
+        with open(path) as f:
+            lines = [line for line in f.read().splitlines() if not line.startswith(f"{key}=")]
+    lines.append(f"{key}={value}")
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    os.chmod(tmp, 0o644)
+    os.rename(tmp, path)
+
+
+def write_json(path: str, obj: dict) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.chmod(tmp, 0o640)   # root:proteus-ui — group-readable for the UI
+    try:
+        os.chown(tmp, 0, grp.getgrnam("proteus-ui").gr_gid)
+    except (KeyError, OSError):
+        pass
+    os.rename(tmp, path)
+
+
+def handle(cmd: dict, opts) -> dict:
+    c = cmd.get("cmd")
+    if c == "set":
+        key, value = str(cmd.get("key")), str(cmd.get("value"))
+        ok, reason = ui_logic.validate_knob(key, value)
+        if not ok:
+            return {"ok": False, "error": reason}
+        write_env(opts.env_file, key, value)
+        kick = ui_logic.KNOBS[key].kick
+        if kick:
+            try:
+                systemctl("restart", kick)
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                # The value IS on disk at this point — say so rather than
+                # letting the generic exception guard make this look like
+                # nothing happened.
+                return {"ok": False, "error": f"saved but {kick} restart failed", "saved": True}
+        log.info("apply cmd=set key=%s", key)
+        return {"ok": True}
+    if c == "rotate":
+        slot = str(cmd.get("slot", ""))
+        if not ROTATE_SLOT_RE.fullmatch(slot):
+            return {"ok": False, "error": "bad slot"}
+        os.makedirs(opts.trigger_dir, exist_ok=True)
+        with open(os.path.join(opts.trigger_dir, slot), "w") as f:
+            f.write("manual")
+        systemctl("start", "--no-block", f"proteus-rotate-slot@{slot}.service")
+        log.info("apply cmd=rotate slot=%s", slot)
+        return {"ok": True}
+    if c == "pause":
+        with open(opts.flag_file, "w"):
+            pass
+        log.info("apply cmd=pause")
+        return {"ok": True}
+    if c == "resume":
+        try:
+            os.unlink(opts.flag_file)
+        except FileNotFoundError:
+            pass
+        log.info("apply cmd=resume")
+        return {"ok": True}
+    if c == "restart-dispatcher":
+        systemctl("restart", "proteus-dispatcher.service")
+        log.info("apply cmd=restart-dispatcher")
+        return {"ok": True}
+    if c == "set-cadence":
+        cal, delay = str(cmd.get("on_calendar", "")), str(cmd.get("randomized_delay", ""))
+        if not (CADENCE_RE.fullmatch(cal) and CADENCE_RE.fullmatch(delay)):
+            return {"ok": False, "error": "bad cadence"}
+        # "--" stops option parsing: without it a value like "-h" is read as
+        # --help by systemd-analyze, which exits 0 and would let a bogus
+        # cadence sail through validation.
+        if subprocess.run(["systemd-analyze", "calendar", "--", cal],
+                          capture_output=True, timeout=10).returncode != 0:
+            return {"ok": False, "error": "invalid OnCalendar expression"}
+        if subprocess.run(["systemd-analyze", "timespan", "--", delay],
+                          capture_output=True, timeout=10).returncode != 0:
+            return {"ok": False, "error": "invalid RandomizedDelaySec"}
+        os.makedirs(opts.dropin_dir, exist_ok=True)
+        tmp = os.path.join(opts.dropin_dir, ".override.tmp")
+        with open(tmp, "w") as f:
+            f.write(f"[Timer]\nOnCalendar=\nOnCalendar={cal}\nRandomizedDelaySec={delay}\n")
+        os.rename(tmp, os.path.join(opts.dropin_dir, "override.conf"))
+        systemctl("daemon-reload")
+        log.info("apply cmd=set-cadence")
+        return {"ok": True}
+    if c == "set-checks":
+        ok, reason, clean = ui_logic.validate_checks({"checks": cmd.get("checks")})
+        if not ok:
+            return {"ok": False, "error": reason}
+        write_json(opts.checks_file, {"checks": clean})
+        log.info("apply cmd=set-checks n=%d", len(clean))
+        return {"ok": True}
+    return {"ok": False, "error": "unknown command"}
+
+
+def serve(sock: socket.socket, opts) -> None:
+    sock.listen(4)
+    while True:
+        conn, _ = sock.accept()
+        conn.settimeout(10)
+        with conn:
+            # Everything derived from the untrusted client — the read, the
+            # parse, and the dispatch — stays inside this guard. A client can
+            # send anything (bad UTF-8, valid-but-wrong-shaped JSON, nothing
+            # at all until it times out); none of that may kill this process.
+            try:
+                line = conn.makefile().readline(65536)
+                reply = handle(json.loads(line), opts)
+            except Exception as e:  # noqa: BLE001 — never crash the boundary
+                reply = {"ok": False, "error": type(e).__name__}
+            try:
+                conn.sendall((json.dumps(reply) + "\n").encode())
+            except OSError:
+                pass  # client already gone; nothing to do
+
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--test-socket")
+    p.add_argument("--env-file", default=ENV_FILE)
+    p.add_argument("--dropin-dir", default=DROPIN_DIR)
+    p.add_argument("--flag-file", default=FLAG_FILE)
+    p.add_argument("--trigger-dir", default=TRIGGER_DIR)
+    p.add_argument("--checks-file", default=CHECKS_FILE)
+    opts = p.parse_args()
+    if opts.test_socket:
+        sock = socket.socket(socket.AF_UNIX)
+        sock.bind(opts.test_socket)
+    else:
+        sock = socket.socket(fileno=3)  # systemd socket activation, Accept=no
+    serve(sock, opts)
+
+
+if __name__ == "__main__":
+    main()

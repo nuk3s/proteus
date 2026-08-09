@@ -10,6 +10,7 @@ from __future__ import annotations
 import glob
 import ipaddress
 import logging
+import os
 import re
 from dataclasses import dataclass
 from typing import Iterable
@@ -137,7 +138,11 @@ def pick_by_score(
 # A slot whose fresh score is within SPREAD_BAND of the current best counts as
 # "good enough" to receive new pins; slots further back (but not degraded) are
 # skipped so we distribute over slots that don't suck, not all of them.
-SPREAD_BAND = 40.0
+# Env-overridable (PROTEUS_SPREAD_BAND) — read at import time, so callers
+# that need a fresh value after a config change must reload this module (in
+# dispatcher.py, proteus.env / proteus-local.env are loaded into os.environ
+# before this module is imported).
+SPREAD_BAND = float(os.environ.get("PROTEUS_SPREAD_BAND", "40.0"))
 
 
 def pick_distributed(
@@ -243,3 +248,73 @@ def parse_source_pin_elements(elems: object) -> list[tuple[str, int]]:
         except (TypeError, ValueError):
             continue
     return out
+
+
+def parse_source_pin_elements_with_ttl(elems: object) -> list[tuple[str, int, int | None]]:
+    """Like parse_source_pin_elements, but also extracts the remaining TTL.
+
+    `nft -j list map ...` reports a per-element `expires` field (seconds
+    remaining until the element times out — a countdown, NOT an absolute
+    epoch timestamp; verified live against nft 1.1.3: insert with `timeout
+    30s` reads back `expires: 29` immediately and `expires: 24` five seconds
+    later) whenever the map has `flags timeout` and the entry carries a
+    timeout, wrapped as `{"elem": {"val": ip, "expires": N}}`. Bare
+    `[ip, mark]` entries (e.g. from a map without timeouts) carry no such
+    info, so their ttl comes back as None — callers must treat that as
+    "unknown" rather than invent an expiry.
+
+    Returns (ip, mark, ttl_remaining_s) tuples. Malformed entries are
+    silently skipped, matching parse_source_pin_elements.
+    """
+    out: list[tuple[str, int, int | None]] = []
+    if not isinstance(elems, list):
+        return out
+    for entry in elems:
+        if not isinstance(entry, list) or len(entry) < 2:
+            continue
+        raw_key, raw_val = entry[0], entry[1]
+
+        ttl: int | None = None
+        if isinstance(raw_key, str):
+            key = raw_key
+        elif isinstance(raw_key, dict):
+            inner = raw_key.get("elem")
+            if isinstance(inner, dict) and "val" in inner:
+                key = inner["val"]
+                expires = inner.get("expires")
+                if isinstance(expires, (int, float)):
+                    ttl = int(expires)
+            elif "val" in raw_key:
+                key = raw_key["val"]
+            else:
+                continue
+        else:
+            continue
+
+        if isinstance(raw_val, dict) and "val" in raw_val:
+            mark_raw = raw_val["val"]
+        else:
+            mark_raw = raw_val
+
+        try:
+            out.append((str(key), int(mark_raw), ttl))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def build_status_snapshot(pins: dict, counters: dict, now: float) -> dict:
+    """Build the JSON-serializable status snapshot published for the web UI.
+
+    `pins` is {ip: (slot, expiry_epoch_s)}; already-expired entries (expiry
+    <= now) are dropped rather than surfaced with a negative/zero ttl_s.
+    `counters` is {slot: flow_count}, published verbatim.
+    """
+    return {
+        "generated_at": int(now),
+        "pins": [
+            {"ip": ip, "slot": slot, "ttl_s": int(exp - now)}
+            for ip, (slot, exp) in sorted(pins.items()) if exp > now
+        ],
+        "flow_counts": dict(counters),
+    }

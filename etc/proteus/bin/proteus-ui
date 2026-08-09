@@ -1,0 +1,284 @@
+#!/usr/bin/env python3
+# etc/proteus/bin/proteus-ui
+"""Proteus web UI daemon. Unprivileged; mutations go to the broker socket."""
+from __future__ import annotations
+
+import http.server
+import json
+import logging
+import os
+import socket
+import ssl
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ui_logic
+
+SECRETS = "/etc/proteus/ui/secrets"
+STATIC = "/etc/proteus/ui/index.html"
+STATE_DIR = "/etc/proteus/state"
+HEALTH_DIR = "/run/proteus-slot-health"
+RUN_DIR = "/run/proteus"
+CHECKS_FILE = "/etc/proteus/checks.json"
+APPLY_SOCK = f"{RUN_DIR}/apply.sock"
+PORT = int(os.environ.get("PROTEUS_UI_PORT", "8443"))
+
+log = logging.getLogger("proteus-ui")
+logging.basicConfig(stream=sys.stdout, level=logging.INFO,
+                    format="%(levelname)s %(message)s")
+LOCKOUT = ui_logic.Lockout()
+
+
+def read(path: str) -> str:
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def list_slots() -> list[str]:
+    try:
+        return sorted(f[:-6] for f in os.listdir(STATE_DIR) if f.endswith(".state"))
+    except OSError:
+        return []
+
+
+def timer_next(slot: str) -> int | None:
+    try:
+        out = subprocess.run(
+            ["systemctl", "show", f"proteus-rotate-slot@{slot}.timer",
+             "-p", "NextElapseUSecRealtime", "--value"],
+            capture_output=True, text=True, timeout=10).stdout.strip()
+        return int(datetime.strptime(out, "%a %Y-%m-%d %H:%M:%S %Z").timestamp()) if out else None
+    except Exception:
+        return None
+
+
+def unit_active(slot: str) -> bool:
+    try:
+        r = subprocess.run(["systemctl", "is-active", "--quiet",
+                            f"proteus-rotate-slot@{slot}.service"], timeout=10)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def broker(cmd: dict) -> dict:
+    try:
+        s = socket.socket(socket.AF_UNIX)
+        s.settimeout(90)
+        s.connect(APPLY_SOCK)
+        s.sendall((json.dumps(cmd) + "\n").encode())
+        return json.loads(s.makefile().readline())
+    except OSError as e:
+        return {"ok": False, "error": f"broker unreachable: {e.strerror}"}
+
+
+def status() -> dict:
+    now = time.time()
+    slots = []
+    for name in list_slots():
+        # Display metadata (LOGICAL_NAME/EXIT_COUNTRY/EXIT_IP/MINTED_AT) lives
+        # in a separate .meta sidecar, not the .state file — the .state file
+        # is dot-sourced as root by repopulate-wg-peers.sh/vpnns-down.sh, so
+        # Proton's third-party server-name strings must never land in it.
+        # Merge the sidecar over the state dict; same keys either way, so
+        # slot_summary/ui_logic need no changes. A missing .meta reads as ""
+        # -> parse_kv -> {} -> no-op, so slots without one yet are unaffected.
+        st = ui_logic.parse_kv(read(f"{STATE_DIR}/{name}.state"))
+        st.update(ui_logic.parse_kv(read(f"{STATE_DIR}/{name}.meta")))
+        slots.append(ui_logic.slot_summary(
+            name,
+            st,
+            ui_logic.parse_kv(read(f"{HEALTH_DIR}/{name}.state")),
+            next_rotation=timer_next(name),
+            rotating=unit_active(name),
+            now=now,
+        ))
+    history = [json.loads(l) for l in
+               read(f"{RUN_DIR}/rotation-history.jsonl").splitlines() if l.strip()]
+    disp = {}
+    try:
+        disp = json.loads(read(f"{RUN_DIR}/dispatcher-status.json") or "{}")
+    except json.JSONDecodeError:
+        pass
+    env = ui_logic.parse_kv(read("/etc/proteus/proteus.env"))
+    env.update(ui_logic.parse_kv(read("/etc/proteus/proteus-local.env")))
+    return {
+        "generated_at": int(now),
+        "system": {
+            "paused": os.path.exists(f"{STATE_DIR}/rotation-paused"),
+            "exit_country": env.get("PROTEUS_PROTON_COUNTRY"),
+        },
+        "slots": slots,
+        "history": history[-50:][::-1],
+        "clients": disp.get("pins", []),
+        "knobs": {"values": {k: env.get(k) for k in ui_logic.KNOBS},
+                  "schema": ui_logic.knob_schema()},
+        "checks": {"builtin": ui_logic.BUILTIN_CHECKS,
+                   "custom": ui_logic.parse_checks(read(CHECKS_FILE))},
+    }
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "proteus-ui"
+    sys_version = ""
+    # Read timeout: BaseHTTPRequestHandler honors this (sends 408, closes).
+    # Without it a slowloris/dribbling client can pin a thread indefinitely.
+    timeout = 15
+
+    def log_message(self, *a):  # no access logging, by design
+        pass
+
+    def _auth_ok(self) -> bool:
+        # Bearer token in the Authorization header (stored in localStorage by the
+        # page). No cookie: a self-signed cert makes the page a non-secure context,
+        # and browsers refuse to store Secure cookies there. A localStorage token +
+        # explicit Authorization header works regardless of cert trust, and it is
+        # CSRF-proof (a cross-site page cannot read our localStorage or forge the
+        # header for our origin).
+        auth = self.headers.get("Authorization", "")
+        tok = auth[7:] if auth.startswith("Bearer ") else ""
+        return bool(tok) and ui_logic.verify_session(self.server.session_key, tok)
+
+    def _json(self, code: int, obj: dict) -> None:
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _body(self) -> dict:
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+            return json.loads(self.rfile.read(min(n, 65536)) or "{}")
+        except (ValueError, json.JSONDecodeError):
+            return {}
+
+    def _mutating_guard(self) -> bool:
+        # Bearer-token auth is inherently CSRF-proof (the token must be attached
+        # explicitly by our own JS; a cross-site request cannot supply it), so a
+        # valid token is the whole check.
+        if not self._auth_ok():
+            self._json(401, {"error": "auth"})
+            return False
+        return True
+
+    def do_GET(self):
+        if self.path == "/":
+            body = read(STATIC).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Security-Policy",
+                             "default-src 'none'; style-src 'unsafe-inline'; "
+                             "script-src 'unsafe-inline'; connect-src 'self'")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/api/status":
+            if not self._auth_ok():
+                return self._json(401, {"error": "auth"})
+            try:
+                self._json(200, status())
+            except Exception:
+                log.exception("status failed")
+                self._json(500, {"error": "internal"})
+        else:
+            self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        src = self.client_address[0]
+        if self.path == "/api/login":
+            if LOCKOUT.locked(src):
+                log.warning("login lockout src=%s", src)
+                return self._json(429, {"error": "locked out, retry later"})
+            stored = read(f"{SECRETS}/passwd")
+            if ui_logic.verify_passphrase(self._body().get("passphrase", ""), stored):
+                LOCKOUT.clear(src)
+                tok = ui_logic.mint_session(self.server.session_key)
+                # Return the token in the body; the page stashes it in localStorage
+                # and sends it as `Authorization: Bearer`. Works over a self-signed
+                # cert where a Secure cookie would be dropped.
+                self._json(200, {"token": tok})
+            else:
+                LOCKOUT.record_failure(src)
+                log.warning("login failed src=%s", src)
+                self._json(401, {"error": "bad passphrase"})
+        elif self.path == "/api/logout":
+            # Tokens are stateless (HMAC + expiry); logout is client-side (the page
+            # drops it from localStorage). Nothing to do server-side.
+            self._json(200, {"ok": True})
+        elif self.path == "/api/knobs":
+            if not self._mutating_guard():
+                return
+            b = self._body()
+            r = broker({"cmd": "set", "key": b.get("key"), "value": b.get("value")})
+            self._json(200 if r.get("ok") else 400, r)
+        elif self.path == "/api/checks":
+            if not self._mutating_guard():
+                return
+            b = self._body()
+            r = broker({"cmd": "set-checks", "checks": b.get("checks")})
+            self._json(200 if r.get("ok") else 400, r)
+        elif self.path == "/api/action":
+            if not self._mutating_guard():
+                return
+            b = self._body()
+            act = b.get("action")
+            if act == "rotate":
+                slot = str(b.get("slot", ""))
+                if unit_active(slot):
+                    return self._json(409, {"ok": False, "error": "already rotating"})
+                r = broker({"cmd": "rotate", "slot": slot})
+            elif act in ("pause", "resume", "restart-dispatcher"):
+                r = broker({"cmd": act})
+            elif act == "set-cadence":
+                r = broker({"cmd": "set-cadence",
+                            "on_calendar": b.get("on_calendar"),
+                            "randomized_delay": b.get("randomized_delay")})
+            else:
+                r = {"ok": False, "error": "unknown action"}
+            self._json(200 if r.get("ok") else 400, r)
+        else:
+            self._json(404, {"error": "not found"})
+
+
+def main() -> None:
+    for req in (f"{SECRETS}/passwd", f"{SECRETS}/tls/cert.pem", f"{SECRETS}/tls/key.pem"):
+        if not os.path.exists(req):
+            log.error("missing %s; refusing to start (no plaintext fallback)", req)
+            sys.exit(1)
+    # SECRETS must be proteus-ui-writable (provisioned by the installer's
+    # apply.sh via `install -d -o proteus-ui`) for this create to succeed.
+    key_path = f"{SECRETS}/session.key"
+    try:
+        fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, os.urandom(32))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass  # already exists (or a concurrent start won the create race)
+    with open(key_path, "rb") as f:
+        session_key = f.read()
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(f"{SECRETS}/tls/cert.pem", f"{SECRETS}/tls/key.pem")
+    srv = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    srv.session_key = session_key
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    log.info("proteus-ui listening on :%d (TLS)", PORT)
+    srv.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

@@ -33,6 +33,25 @@ tmp=$(mktemp); sed 's#^SLOT_COUNT=.*#SLOT_COUNT=9#' install/tests/fixtures/good.
 ( load_config "$tmp" && validate_config ) 2>/dev/null && r=ok || r=fail
 assert_eq "$r" "ok" "SLOT_COUNT 9 accepted"; rm -f "$tmp"
 
+echo "validate_config: UI_PORT defaults to 8443 when omitted (good.conf has no UI_PORT)"
+( load_config install/tests/fixtures/good.conf && echo "$UI_PORT" ) > /tmp/.ui_port_check.$$ 2>/dev/null
+assert_eq "$(cat /tmp/.ui_port_check.$$)" "8443" "UI_PORT default"; rm -f /tmp/.ui_port_check.$$
+
+echo "validate_config: UI_PORT below 1024 fails"
+tmp=$(mktemp); printf 'UI_PORT=80\n' >> "$tmp"; cat install/tests/fixtures/good.conf >> "$tmp"
+( load_config "$tmp" && validate_config ) 2>/dev/null && r=ok || r=fail
+assert_eq "$r" "fail" "UI_PORT 80 rejected"; rm -f "$tmp"
+
+echo "validate_config: UI_PORT above 65535 fails"
+tmp=$(mktemp); printf 'UI_PORT=70000\n' >> "$tmp"; cat install/tests/fixtures/good.conf >> "$tmp"
+( load_config "$tmp" && validate_config ) 2>/dev/null && r=ok || r=fail
+assert_eq "$r" "fail" "UI_PORT 70000 rejected"; rm -f "$tmp"
+
+echo "validate_config: non-default UI_PORT in range is accepted"
+tmp=$(mktemp); printf 'UI_PORT=9443\n' >> "$tmp"; cat install/tests/fixtures/good.conf >> "$tmp"
+( load_config "$tmp" && validate_config ) 2>/dev/null && r=ok || r=fail
+assert_eq "$r" "ok" "UI_PORT 9443 accepted"; rm -f "$tmp"
+
 echo "ip helpers: pure-bash IPv4 math (preflight runs before python3 is installed)"
 ip_in_cidr 172.16.1.5 172.16.1.0/24 && r=ok || r=fail; assert_eq "$r" ok   "ip inside /24"
 ip_in_cidr 10.0.0.1   172.16.1.0/24 && r=ok || r=fail; assert_eq "$r" fail "ip outside /24"

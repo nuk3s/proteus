@@ -1,6 +1,6 @@
 # Operations
 
-Log in as `admin@10.0.0.119` — NOPASSWD sudo. Every command below is from that account.
+All commands below run on the gateway, as root via sudo.
 
 ## Quick health check
 
@@ -22,6 +22,49 @@ dig @172.16.1.5 +short example.com A
 # Kill-switch drop counter (should be near-zero in steady state)
 sudo nft list chain inet filter output | grep output-dropped
 ```
+
+## Web UI
+
+`https://<mgmt-ip>:8443/` (the cert is self-signed, so the browser warns on first visit). That's
+expected; there's no public CA behind it (see architecture.md → "Web UI").
+
+First-time setup, or resetting a lost passphrase:
+
+```bash
+sudo /etc/proteus/bin/proteus-ui-passwd
+# interactive: prompts twice, no echo, refuses anything under 12 characters
+
+# or scripted:
+printf '%s\n' "$PASSPHRASE" | sudo /etc/proteus/bin/proteus-ui-passwd --stdin
+
+sudo systemctl start proteus-ui.service
+```
+
+The installer enables `proteus-ui.service` but does not start it. Until a passphrase is set the
+daemon refuses to start (there's no plaintext fallback), so on a fresh install (or after any
+reboot before the first `proteus-ui-passwd` run) it will show up in `systemctl --failed`. That's
+expected. Set the passphrase and start it; it won't self-recover on its own.
+
+Pause/resume auto-rotation lives on the knobs tab. It writes/removes
+`/etc/proteus/state/rotation-paused`; every rotation script checks that flag on entry. A
+rotate-now from the UI always overrides the pause.
+
+Every other knob write lands in `/etc/proteus/proteus-local.env`, an overlay sourced after
+`proteus.env` that survives installer re-runs (`install.sh` never touches it). Most knobs apply on
+the next warmup pass, rotation, or DNS check; no restart needed. Two under the Advanced group,
+`PROTEUS_SPREAD_BAND` and `PROTEUS_PIN_TTL_S`, restart `proteus-dispatcher.service` when set,
+which drops all current client pins; the UI shows a confirm step before sending those. The UI
+does not display or edit DNS upstreams at all. Changing the gateway resolver means re-rendering
+unbound's config from `UNBOUND_UPSTREAM` (and with it `UNBOUND_MODULE_CONFIG`, which decides
+whether the validator runs), not writing an env var.
+
+The privileged broker (`proteus-ui-apply.service`) listens on the unix socket
+`/run/proteus/apply.sock`, group `proteus-ui`, socket-activated. The web daemon
+(`proteus-ui.service`) holds no root; it can only ask the broker to act.
+
+Logging posture: the UI writes no access log. Rotation history is RAM-only, capped at the last 50
+events, and is lost on reboot. As of this feature the dispatcher no longer logs per-client flow
+lines at the default level (moved to DEBUG); the box keeps no browsing trail by default.
 
 ## Deploy a config change to nftables safely
 
@@ -95,8 +138,13 @@ sudo systemctl status unbound
 # Is dns-6 handshaking?
 sudo ip netns exec ns-dns-6 wg show | grep handshake
 
-# Does the tunnel reach Quad9?
-sudo ip netns exec ns-dns-6 ping -c 3 9.9.9.9
+# Does the tunnel reach Proton's in-tunnel resolver? (ICMP to 10.2.0.1 is not
+# the client path — query it the way unbound does.)
+sudo ip netns exec ns-dns-6 dig @10.2.0.1 . NS
+
+# Is NetShield actually filtering? First returns nothing (NXDOMAIN), second an address.
+dig +short @172.16.1.5 doubleclick.net
+dig +short @172.16.1.5 cloudflare.com
 
 # Is the fwmark/source-IP steering in place?
 ip rule | grep -E '172.31.6.1|fwmark 0x6'
@@ -109,7 +157,7 @@ sudo nft list chain inet filter output | grep unbound-dns-egress
 sudo unbound-control stats_noreset | grep -E 'cachehits|cachemiss|queries_timed_out|recursivereplies'
 ```
 
-Occasional first-query timeouts (~1 in 20) are unbound's UDP retry budget on cold-cache + Proton+Quad9 RTT. `+time=5 +tries=2` on dig gets ~100% pass rate. Not worth tuning `infra-host-ttl` unless rate drops below ~90%.
+Occasional first-query timeouts are unbound's UDP retry budget on a cold cache: the tunnel RTT to `10.2.0.1` is 11-16ms, but qname-minimisation turns one cold name into several sequential upstream queries and any single lost UDP datagram costs a full retry. `+time=5 +tries=2` on dig gets ~100% pass rate. Not worth tuning `infra-host-ttl` unless rate drops below ~90%.
 
 ### Manually rotate dns-6 (force past the cooldown)
 
@@ -117,7 +165,7 @@ Occasional first-query timeouts (~1 in 20) are unbound's UDP retry budget on col
 sudo /etc/proteus/bin/rotate-dns.sh -f
 ```
 
-Use when you suspect the current dns-6 exit has a bad Quad9 path and don't want to wait for the 15-min timer. The automatic `proteus-dns-latency.timer` handles the unattended case (rotates when `ns-dns-6 → 9.9.9.9` average RTT crosses 120ms, throttled to once per hour).
+Use when you suspect the current dns-6 exit has a slow path to Proton's resolver and don't want to wait for the 15-min timer. The automatic `proteus-dns-latency.timer` handles the unattended case (rotates when a UDP `. NS` query from `ns-dns-6` to `10.2.0.1` crosses 150ms, throttled to once per hour). Restarting unbound is part of the rotation, so expect a 1-2s DNS gap and a cold cache afterward.
 
 ## Diagnose a client slot problem
 
@@ -214,7 +262,7 @@ EOF
 
 # 2. Hit a fresh destination from a client and confirm it didn't
 #    map to mark 0x3:
-#       claude@lantester $ curl -sI https://example.com/
+#       from a VLAN client:  curl -sI https://example.com/
 sudo nft list map inet filter vpn_dispatch | grep example.com
 # expected: a mark other than 0x00000003
 
@@ -258,7 +306,7 @@ Typical causes in order of likelihood:
 1. `@wg_peers` got flushed by an `nft -f` without a follow-up `repopulate-wg-peers.sh`. Run it.
 2. All five slots failed rotation in the same window. Check `journalctl -u 'proteus-rotate-slot@*'` — the old slots should still be up since a failed rotation leaves the incumbent exit in place, but if Proton's API is throwing 500s your mints are failing. Re-bootstrap SSO if auth errors; wait out API issues.
 3. Dispatcher crashed. `sudo systemctl status proteus-dispatcher`. `bypass` on the NFQUEUE rule means packets without a dispatcher are dropped by default policy — this is the safe behavior, not a bug.
-4. UniFi IPS rule dropping SSH / client traffic from upstream. User has a toggle for it. The VM is not at fault — don't blame the kill-switch without evidence of output-chain drops.
+4. UniFi IPS rule dropping SSH / client traffic from upstream. Toggle it off at the controller to confirm. The VM is not at fault — don't blame the kill-switch without evidence of output-chain drops.
 
 ## Before reporting success after a change
 
@@ -266,4 +314,4 @@ Typical causes in order of likelihood:
 2. At least one full rotation cycle completed cleanly (watch `proteus-rotate-slot@proton-1.service` fire).
 3. DNS resolution via both `127.0.0.1` and `172.16.1.5`.
 4. A forwarded HTTPS connection from a client in 172.16.1.0/24 actually reaches the internet.
-5. `ss -tnp | grep sshd` on the VM shows your live SSH source IP — narrowing any inbound rule without this check risks lockout (user has been burned before).
+5. `ss -tnp | grep sshd` on the VM shows your live SSH source IP — narrowing any inbound rule without this check risks lockout, and has caused one before.

@@ -1,0 +1,34 @@
+[Unit]
+Description=Proteus UI privileged broker
+Requires=proteus-ui-apply.socket
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /etc/proteus/bin/proteus-ui-apply
+Restart=on-failure
+RestartSec=1
+# root on purpose: this is the privileged side of the boundary
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# set-cadence writes the timer drop-in under /etc/systemd/system; set/pause/
+# resume write the overlay and flag file under /etc/proteus; rotate writes
+# trigger files under /run/proteus.
+ReadWritePaths=/etc/proteus /etc/systemd/system /run/proteus
+RestrictAddressFamilies=AF_UNIX
+# Defense in depth on the privileged boundary. These do not touch the caps the
+# broker needs (root file writes + systemctl over the private AF_UNIX bus); they
+# only close kernel/namespace/exec-memory vectors.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native

@@ -1,12 +1,33 @@
 # /etc/unbound/unbound.conf.d/proteus-dns.conf
 # Dedicated DNS resolver for the proteus gateway.
-# Egress is steered via fwmark 0x6 -> table 106 -> ns-dns-6 (a dedicated Proton
-# WG tunnel), so DNS queries never hit the mgmt interface and never share a
-# tunnel with the rotating client-traffic slots.
+# Egress is steered via fwmark ${DNS_FWMARK_HEX} -> table ${DNS_TABLE} -> ns-${DNS_INSTANCE}
+# (a dedicated Proton WG tunnel), so DNS queries never hit the mgmt interface
+# and never share a tunnel with the rotating client-traffic slots.
 
 server:
     verbosity: 1
     use-syslog: yes
+
+    # Validator on or off is decided at render time from UNBOUND_UPSTREAM: an
+    # in-tunnel Proton resolver (10.2.0.0/16) gets "iterator", anything else
+    # keeps "validator iterator". Why the default drops it: Proton's NetShield
+    # answers a blocked ad/tracker name with a bare unsigned NXDOMAIN *and*
+    # NXDOMAINs the DS query for it — so a validating resolver cannot prove
+    # insecure delegation and hands clients SERVFAIL for every blocked name
+    # instead of a clean NXDOMAIN (verified with `delv @10.2.0.1 doubleclick.net`
+    # -> "broken trust chain"). Dropping the validator is what makes NetShield
+    # usable downstream. The trust boundary moves to the tunnel: the upstream
+    # validates for us and the query never leaves the encrypted WireGuard path.
+    # Clients no longer see the AD bit from us.
+    #
+    # Do NOT express this as `domain-insecure: "."`. That registers a static
+    # trust anchor for the root, collides with the distro's autotrust anchor in
+    # unbound.conf.d/root-auto-trust-anchor-file.conf (a Debian package file this
+    # repo does not manage), and aborts validator init with "trust anchor for '.'
+    # presented twice" -> "failed to init modules". It took client DNS down on
+    # 2026-08-06. With the validator dropped the autotrust anchor is simply
+    # ignored — no error, no warning — so that file can be left alone.
+    ${UNBOUND_MODULE_CONFIG}
 
     # Listeners (main ns): LAN clients + loopback.
     interface: ${CLIENT_GW_IP}
@@ -24,42 +45,74 @@ server:
     hide-identity: yes
     hide-version: yes
     harden-glue: yes
-    harden-dnssec-stripped: yes
     use-caps-for-id: no
     edns-buffer-size: 1232
 
-    # Keep short-TTL records cached longer to reduce cold-miss rate. The tunnel
-    # RTT to Quad9 is ~220ms and qname-minimisation multiplies that by 2-4x per
-    # cold lookup, so holding records for at least 5 min meaningfully cuts the
-    # visible lag from surfing (most cold-miss pain is on first-hit anyway).
+    # Keep short-TTL records cached longer to reduce cold-miss rate. An in-tunnel
+    # upstream answers in ~12ms, so this matters far less than it did over Quad9
+    # at ~220ms, but it still absorbs the repeat-lookup churn of a busy LAN.
     cache-min-ttl: 300
 
-    # Serve stale answers while refreshing in the background (RFC 8767). Over
-    # this tunnel a cold recursion is ~0.5-2s; with serve-expired a record seen
-    # in the last day returns instantly (stale) and unbound refreshes async, so
-    # the client almost never eats the full tunnel round-trip on a repeat name.
+    # Serve stale answers while refreshing in the background (RFC 8767). This is
+    # also the only cushion for a DNS-tunnel outage: there is deliberately no
+    # second upstream (see the forward-zone note), so a record seen in the last
+    # day keeps resolving while the tunnel rotates.
     # client-timeout: try a fresh answer first, fall back to stale after 1.8s.
     serve-expired: yes
     serve-expired-ttl: 86400
     serve-expired-client-timeout: 1800
-    prefetch-key: yes
 
     # Bigger caches for a multi-host gateway (defaults are 4m each).
     msg-cache-size: 64m
     rrset-cache-size: 128m
 
-    # Bind outgoing queries to the main-ns transit IP that feeds ns-dns-6.
+    # Bind outgoing queries to the main-ns transit IP that feeds the DNS tunnel.
     # This pins the source of upstream traffic to the interface that is
-    # fwmark-routed to the DNS tunnel — belt-and-braces alongside the mangle
-    # rule that stamps mark 0x6 on unbound's packets.
+    # fwmark-routed to that tunnel — belt-and-braces alongside the mangle rule
+    # that stamps the DNS mark on unbound's packets. Load-bearing with the
+    # default upstream: it is an RFC1918 address, so without this pin a routing
+    # fallback would be permitted out the mgmt interface (see the DNS
+    # kill-switch in nftables.conf).
     outgoing-interface: ${DNS_TRANSIT_MAIN}
 
-    # CA bundle for authenticating DoT forwarders (no-op for plain UDP).
-    tls-cert-bundle: /etc/ssl/certs/ca-certificates.crt
-
-    # Do not recurse ourselves — forward everything to Quad9 over the tunnel.
+    # Do not recurse ourselves — forward everything to UNBOUND_UPSTREAM.
     do-not-query-localhost: yes
 
+    # CA store for authenticating a DNS-over-TLS upstream. Rendered only when the
+    # forward-zone below is actually using TLS: the `#authname` form makes unbound
+    # verify the upstream certificate, and without a bundle that verification
+    # fails on every query (checkconf passes, the daemon starts, then 100% of
+    # client lookups SERVFAIL). Rendered as a comment on the plain-UDP path
+    # rather than always emitted, because a missing bundle file stops unbound
+    # from starting at all.
+${UNBOUND_TLS_CERT_BUNDLE}
+
+# Forward to UNBOUND_UPSTREAM over the dedicated DNS tunnel. The default,
+# 10.2.0.1, is the gateway address inside EVERY Proton WireGuard tunnel, so it
+# needs no update when rotate-dns.sh moves the tunnel to a different exit.
+# NetShield (level set by PROTEUS_NETSHIELD_LEVEL, baked into the tunnel's
+# certificate at key registration) filters ads/trackers/malware there — that is
+# the layer that actually reaches clients, since client port-53 traffic is
+# redirected to us.
+#
+# forward-tls-upstream and the forward-addr line below are both rendered: plain
+# UDP for an in-tunnel resolver, DNS-over-TLS (ip@853#authname) for a known
+# public one. The DoT form exists for a specific reason, kept on record for
+# anyone pointing this back at a public resolver:
+#   Quad9 rate-limits UDP and ICMP per source IP, and a VPN exit carrying our
+#   sustained query volume trips it within the hour — the exit goes completely
+#   dark on UDP while TCP/853 keeps working (measured 2026-08-01: 100% UDP+ICMP
+#   loss, TCP fine, same exit). Under UDP forwarding that looked like a dead
+#   tunnel and drove ~18 rotate-dns/day, each restarting unbound and wiping the
+#   cache clients rely on.
+# That hazard does not apply to an in-tunnel resolver: the query never leaves
+# the WireGuard tunnel, Proton does not rate-limit its own gateway address
+# (measured ~100 queries, 0 loss, 11-16ms vs ~120ms mean recursion via Quad9),
+# and WG already encrypts the path, so DoT's encryption argument is redundant.
+#
+# Single upstream by design: adding a public resolver as a fallback would
+# silently disable NetShield filtering the moment the primary hiccups, which
+# defeats the point. serve-expired above plus rotate-dns.sh cover short outages.
 forward-zone:
     name: "."
     forward-first: no

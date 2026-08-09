@@ -45,8 +45,8 @@ screen_welcome() {
     proteus_banner
     box "What this is" \
         "A transparent gateway that rotates every client's traffic across" \
-        "several ${TEAL}Proton WireGuard${RESET} exits — so each activity leaves from a" \
-        "different IP, and a dud exit is swapped out before you notice." \
+        "several ${TEAL}Proton WireGuard${RESET} exits — each device is pinned to its" \
+        "own exit IP, and a dud exit is swapped out before you notice." \
         "" \
         "${DIM}per-slot network namespaces · kill-switch · reputation + speed gates${RESET}"
     echo
@@ -102,6 +102,9 @@ CLIENT_VLAN_CIDR=$client_cidr
 CLIENT_GW_IP=$gw
 SLOT_COUNT=$slots
 DNS_UPSTREAMS="9.9.9.9 9.9.9.10 149.112.112.10"
+# Gateway resolver forwards here; 10.2.0.1 is Proton's in-tunnel NetShield
+# resolver, reachable inside every Proton tunnel. See proteus.conf.example.
+UNBOUND_UPSTREAM=10.2.0.1
 PROTON_COUNTRY=US
 STREAMING_MIN_MBPS=25
 CFG
@@ -109,7 +112,8 @@ CFG
     box "Configuration" \
         "$(printf '%-14s %s' 'mgmt'    "$mgmt_if  ($mgmt_cidr)")" \
         "$(printf '%-14s %s' 'client'  "$client_if  ($client_cidr, gw $gw)")" \
-        "$(printf '%-14s %s' 'exits'   "$slots rotating Proton tunnels + a dedicated DNS tunnel")"
+        "$(printf '%-14s %s' 'exits'   "$slots rotating Proton tunnels + a dedicated DNS tunnel")" \
+        "$(printf '%-14s %s' 'dns'     "clients resolve via Proton NetShield (10.2.0.1)")"
     echo
     [[ $DEMO == 1 ]] && beat 1.4 || { confirm "Looks right?" Y || { warn "edit $CONF and re-run"; exit 1; }; }
 }
@@ -214,6 +218,31 @@ screen_confirm() {
     [[ $DEMO == 1 ]] && beat 1
 }
 
+# ---- 4.5. web UI passphrase ---------------------------------------------------
+# Real mode only — the daemon needs a passphrase before it will start (no
+# plaintext fallback). Demo mode changes nothing on the machine, so skip it.
+screen_ui_passphrase() {
+    [[ $DEMO == 1 ]] && return 0
+    step "Set the web UI passphrase"
+    note "https://<mgmt-ip>:${UI_PORT:-8443} won't start until this is set."
+    echo
+    local p1 p2
+    while true; do
+        p1=$(ask_secret "new UI passphrase (12+ chars)")
+        p2=$(ask_secret "repeat")
+        if [[ "$p1" != "$p2" ]]; then warn "passphrases didn't match — try again"; continue; fi
+        if (( ${#p1} < 12 )); then warn "must be at least 12 characters — try again"; continue; fi
+        break
+    done
+    if printf '%s\n' "$p1" | /etc/proteus/bin/proteus-ui-passwd --stdin >/dev/null 2>&1; then
+        systemctl start proteus-ui.service 2>/dev/null || true
+        ok "passphrase set — web UI is live on :${UI_PORT:-8443}"
+    else
+        warn "could not set the UI passphrase — run 'sudo /etc/proteus/bin/proteus-ui-passwd' later, then 'systemctl start proteus-ui'"
+    fi
+    unset p1 p2
+}
+
 # ---- 5. the payoff: a new face for every device ------------------------------
 screen_rotation() {
     [[ $DEMO == 1 ]] || return 0
@@ -234,7 +263,7 @@ screen_rotation() {
             "$VIOL" "$RESET" "$what" "$DIM" "$RESET" "$AQUA$BOLD" "$ip" "$RESET" "$DIM" "$where" "$RESET"
         beat .5
     done
-    echo; ok "four activities, four different IPs — no clicks, no config."
+    echo; ok "four devices, four different IPs — no clicks, no config."
     beat 1
 }
 
@@ -243,7 +272,7 @@ screen_done() {
     box "$(mark) is live" \
         "Clients on the VLAN now egress through rotating Proton exits." \
         "" \
-        "$(printf '%s%-22s%s %s' "$INK" 'watch it work'   "$RESET" 'sudo proteus-slot-rank')" \
+        "$(printf '%s%-22s%s %s' "$INK" 'watch it work'   "$RESET" 'sudo /etc/proteus/bin/slot-rank')" \
         "$(printf '%s%-22s%s %s' "$INK" 'force a rotation' "$RESET" 'sudo systemctl start proteus-rotate-slot@proton-1')" \
         "$(printf '%s%-22s%s %s' "$INK" 'live logs'        "$RESET" 'journalctl -t slot-warmup -f')"
     echo
@@ -258,12 +287,15 @@ main() {
         info "just looking? try the walkthrough: ${BOLD}$0 --demo${RESET}"
         exit 1
     fi
+    # 6 in both modes: seven screens call step(), but exactly one is skipped per
+    # mode — the passphrase screen is real-only, the payoff screen demo-only.
     steps_total 6
     screen_welcome
     screen_config
     screen_doctor
     screen_apply
     screen_confirm
+    screen_ui_passphrase
     screen_rotation
     screen_done
 }

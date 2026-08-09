@@ -15,7 +15,9 @@ chain output_route {
 }
 ```
 
-Mangle fires — diagnostic counter on the rule shows skuid match and mark set. But the routing decision is **not** re-evaluated after the mark lands: packets still egress the main-table default (ens18). `ip route get 9.9.9.9 mark 0x6` correctly returns `via 172.31.6.2 dev v-dns-6 table 106` at the CLI, so the rule/table are fine — the reroute just doesn't happen inside netfilter's output path.
+Mangle fires — diagnostic counter on the rule shows skuid match and mark set. But the routing decision is **not** re-evaluated after the mark lands: packets still egress the main-table default (ens18). `ip route get 10.2.0.1 mark 0x6` correctly returns `via 172.31.6.2 dev v-dns-6 table 106` at the CLI, so the rule/table are fine — the reroute just doesn't happen inside netfilter's output path.
+
+That address is no longer just a convenient example. Since the resolver forwards to `10.2.0.1` (in-tunnel NetShield), the upstream is RFC1918, so a routing fallback out ens18 matches the kill-switch's private-networks accept instead of hitting the default drop — a cleartext query on the mgmt LAN rather than a dropped packet. `chain output` therefore carries an explicit `unbound-dns-killswitch` rule (uid `unbound`, daddr `10.2.0.1`, `oifname != "v-dns-6"` → log + drop) placed above the ct-established accept. Don't reorder it below, and don't delete it if you change upstreams.
 
 **Workaround:** deterministic source-IP rule. Unbound's `outgoing-interface: 172.31.6.1` binds the source address to the main-ns side of v-dns-6. `ip rule from 172.31.6.1 lookup 106 priority 406` (installed by `vpnns-up.sh` for every slot, not just dns-6) routes any packet with that source via the right table. Works first try.
 
@@ -40,13 +42,15 @@ Any `nft -f /etc/nftables.conf` flushes @wg_peers and @proton_api. The ruleset *
 - `repopulate-wg-peers.sh` (scans `/etc/proteus/state/*.state`)
 - `proteus-proton-api-whitelist.service` (resolves `vpn-api.proton.me` + siblings)
 
-**After any nft reload**, run both. The deploy script for DNS (`/tmp/deploy-dns.sh`) does this in order: reload → repopulate → restart dependent services. If you skip it: all WG handshakes start failing silently within a keepalive interval because the kill-switch no longer permits them.
+**After any nft reload**, run both, in this order: reload → repopulate → restart dependent services. `operations.md` → "Deploy a config change to nftables safely" has the full sequence. If you skip it: all WG handshakes start failing silently within a keepalive interval because the kill-switch no longer permits them.
 
 ## The netns default resolver would leak, so we bind-mount
 
 Main ns's `/etc/resolv.conf` points at the lab's AdGuard resolver (`10.0.0.22`), which is unreachable from inside a tunnel ns (the kill-switch would drop it, and even if it didn't, using the LAN's resolver for client traffic would be a DNS leak).
 
-`ip netns exec <ns>` consults `/etc/netns/<ns>/resolv.conf` if present and bind-mounts it over `/etc/resolv.conf` for spawned processes. `vpnns-up.sh` writes Quad9 into that file for every netns it creates. Removing this file (or relying on systemd-resolved's stub) reintroduces the leak.
+`ip netns exec <ns>` consults `/etc/netns/<ns>/resolv.conf` if present and bind-mounts it over `/etc/resolv.conf` for spawned processes. `vpnns-up.sh` writes `DNS_UPSTREAMS` (Quad9) into that file for every netns it creates. Removing this file (or relying on systemd-resolved's stub) reintroduces the leak.
+
+This is the *probe* path, not the gateway resolver. Unbound forwards clients to `10.2.0.1` (`UNBOUND_UPSTREAM`, in-tunnel NetShield); the namespaces stay on a public unfiltered resolver on purpose. Repointing `DNS_UPSTREAMS` at NetShield would couple exit health-checking to an ad blocklist — add an ad domain to the custom check list and every exit fails its probes, wedging rotation. Keep the two variables separate.
 
 ## Fresh tunnels throw transient TLS "unexpected eof"
 
@@ -60,7 +64,9 @@ Use real TLDs for smoke tests (`cloudflare.com`, `debian.org`, …) or check `di
 
 ## Unbound UDP retry budget is tight on first queries
 
-Cold-cache first query to a zone that Quad9 hasn't cached nearby can exceed unbound's initial UDP timeout (376ms). Round-trip budget on our path is ~150-200ms for `tunnel RTT + Quad9 RTT`, so anything >200ms at Quad9 side can retry — and if that retry also needs TCP for a big DNSSEC chain, you might exceed `dig`'s `+time=3`. Use `+time=5 +tries=2` for hand-tests. ~95% pass rate at `+time=3`, ~100% at `+time=5`. Not worth tuning — just set client timeouts reasonably.
+A cold-cache name still costs several sequential upstream queries because of qname-minimisation, and any one lost UDP datagram burns unbound's initial timeout (376ms) before the retry. That is enough to blow past `dig`'s `+time=3` even though the hop to `10.2.0.1` is only 11-16ms. Use `+time=5 +tries=2` for hand-tests. ~95% pass rate at `+time=3`, ~100% at `+time=5`. Not worth tuning — just set client timeouts reasonably.
+
+The old form of this entry blamed `tunnel RTT + Quad9 RTT` (~150-200ms) plus TCP fallback for a large DNSSEC chain. Both halves are gone: the upstream is in-tunnel and the validator is off (`module-config: "iterator"`), so there is no chain to fetch. If you ever point `UNBOUND_UPSTREAM` back at a public resolver, the validator comes back with it and so does that failure mode.
 
 ## SIGHUP to the dispatcher re-reads state, not code
 
@@ -68,7 +74,7 @@ Cold-cache first query to a zone that Quad9 hasn't cached nearby can exceed unbo
 
 ## Don't query AbuseIPDB / Scamalytics from the mgmt IP
 
-The user explicitly rejected this path. Querying from `10.0.0.121` correlates "mgmt IP just asked about exit IP X" on a non-privacy-centric vendor's logs — exactly the correlation Proton's privacy model is designed to avoid. Empirical probes from *inside* the staging netns test what actually matters (does the exit behave normally) without creating that correlation.
+This path is deliberately closed. Querying from the mgmt IP (`10.0.0.121`) correlates "mgmt IP just asked about exit IP X" on a non-privacy-centric vendor's logs — exactly the correlation Proton's privacy model is designed to avoid. Empirical probes from *inside* the staging netns test what actually matters (does the exit behave normally) without creating that correlation.
 
 AbuseIPDB is kept as a documented fallback if empirical probes later prove insufficient, but the default path is always in-tunnel probes first. If you add a new reputation signal, it also runs inside the netns.
 
@@ -80,9 +86,9 @@ Keep it advisory (reports "ADVISORY BLOCK: reddit" in the log but doesn't fail t
 
 ## The UniFi IPS sometimes drops SSH to the VM
 
-This is **not** the VM's kill-switch. If SSH times out and you see no output-chain drops on the VM side (via console) and the SSH counters look normal, it's the upstream IPS rule. The user has a toggle for it.
+This is **not** the VM's kill-switch. If SSH times out and you see no output-chain drops on the VM side (via console) and the SSH counters look normal, suspect the upstream IPS rule before the kill-switch — the fix is at the router, which has a toggle for it.
 
-**Rule**: do not poll/retry on SSH timeout. Tell the user and wait. Don't dig into the VM firewall without first verifying the VM is actually receiving the TCP SYN.
+**Rule**: don't sit in a reconnect loop on an SSH timeout. Get on the console and confirm the VM is actually receiving the TCP SYN before you touch the VM firewall.
 
 ## Verify live SSH source before narrowing inbound rules
 
@@ -92,7 +98,7 @@ Before any change that tightens `input` on `ens18`, run:
 ss -tnp | grep :22
 ```
 
-Confirm the source IP of your own session and that the `ssh-mgmt` rule accepts that address. Past incident: the user was locked out when an inbound rule was narrowed based on a stale assumption about their source IP. The `systemd-run --on-active=900` revert-timer pattern in `/tmp/deploy-*.sh` scripts exists *because* of this.
+Confirm the source IP of your own session and that the `ssh-mgmt` rule accepts that address. Past incident: SSH was locked out when an inbound rule was narrowed on a stale assumption about the admin source IP, and recovery needed console access. The `systemd-run --on-active=900` revert timer in `operations.md` → "Deploy a config change to nftables safely" exists *because* of this.
 
 ## `type route` and `type filter` on the same hook coexist
 
@@ -110,11 +116,30 @@ Flushing the ruleset doesn't wipe conntrack. If you change how marking works mid
 
 Unbound binds a UDP source socket to `172.31.6.1` (the main-ns side of v-dns-6) via `outgoing-interface:`. When `rotate-dns.sh` does `vpnns-down.sh dns-6 && vpnns-up.sh dns-6 <new-conf>`, the veth is destroyed and recreated with the same IP — but unbound's existing socket is now bound to a dead interface and all queries silently vanish (no `SERVFAIL`, no log — `dig` just times out).
 
-**Symptom:** dns-6 handshake fresh, ping from inside ns-dns-6 to 9.9.9.9 works, but `dig @172.16.1.5` hangs.
+**Symptom:** dns-6 handshake fresh, `ip netns exec ns-dns-6 dig @10.2.0.1 . NS` answers, but `dig @172.16.1.5` hangs.
 
 **Fix:** `systemctl restart unbound` at the end of `rotate-dns.sh` (adds ~1-2s DNS gap to the swap). `unbound-control flush_infra all` is *not* sufficient — it clears RTT data but doesn't rebind the socket.
 
 If you add another caller that recreates v-dns-6 (e.g., a future staged rotation), include the unbound restart.
+
+## `unbound-checkconf` on the drop-in alone green-lights configs that kill unbound
+
+Cost us client DNS on 2026-08-06. `unbound-checkconf /etc/unbound/unbound.conf.d/proteus-dns.conf` exits 0 on a config that aborts the daemon at startup, because in isolation the drop-in has nothing to collide with — the distro's other drop-ins aren't parsed. Always check the merged tree:
+
+```bash
+sudo unbound-checkconf            # no arguments — reads /etc/unbound/unbound.conf and its includes
+sudo systemctl restart unbound && sudo systemctl is-active unbound
+dig +short @172.16.1.5 cloudflare.com A
+```
+
+**What the drop-in-only check missed:** `domain-insecure: "."`. It registers a *static* root trust anchor, which collides with Debian's autotrust anchor in `unbound.conf.d/root-auto-trust-anchor-file.conf` — a package file this repo does not manage, and therefore not part of a single-file check. Result: `trust anchor for '.' presented twice` → `validator: could not apply configuration settings` → `fatal error: failed to init modules`. It was never needed either: `module-config: "iterator"` already drops the validator, which makes everything insecure and leaves the autotrust anchor harmlessly unread. Don't add it back.
+
+**Two more that even a full checkconf won't catch, because they're runtime:**
+
+- **AppArmor.** Unbound runs under an **enforce**-mode profile (`/etc/apparmor.d/usr.sbin.unbound`), which grants `/etc/unbound/**`, `/var/lib/unbound/**`, `/usr/share/dns/root.*` and `/run/unbound.{pid,ctl}` on top of the `abstractions/base`, `nameservice` and `openssl` includes. Point a directive at a path outside all of that — a key file, a hints file — and it parses fine, then dies at startup with `Permission denied`. Read the profile rather than guessing which paths are covered: the `openssl` abstraction is why `tls-cert-bundle: /etc/ssl/certs/ca-certificates.crt` works despite being outside the explicit list. Confirm a suspected denial with `journalctl -k | grep apparmor.*unbound`.
+- **Backups left in `unbound.conf.d/`.** They're inert *only* because the include glob is `*.conf`. Save one as `proteus-dns-old.conf` and it gets parsed too: a duplicate `interface:` (bind conflict) plus a second `forward-zone "."`. Suffix backups `.bak` or `.YYYYMMDD`, or park them outside the directory.
+
+**Restart inside the deploy window, not later:** `rotate-dns.sh` runs `systemctl restart unbound` on every DNS-tunnel rotation. Anything that survives checkconf but dies on restart won't surface when you deploy — it takes DNS down at the next unattended rotation, hours later, with nobody watching. Restart and verify resolution *inside* your deploy window, every time.
 
 ## Stable `proton-N.conf` symlink must be kept in sync with promoted config
 
@@ -136,7 +161,7 @@ WireGuard PersistentKeepalive=25 keeps the encrypted transport alive, and `wg sh
 
 **Don't "fix" this by dropping the timer cadence under 5s.** The curl requests hit proton.me — being overly aggressive is a bad-neighbor pattern and offers diminishing returns anyway.
 
-**dns-6 is warmed the same way (landed 2026-07-12).** The dedicated DNS tunnel isn't in the rotating pool, so it used to cold-catch after idle — under light DNS load the first query after a >30s gap timed out before a retry warmed it. `slot-warmup.sh` now also fires a neutral `dig @9.9.9.9 . NS` (root NS, cached) through `ns-dns-6` every pass. Verified: a query after a 40s idle gap returns in ~24ms instead of timing out.
+**dns-6 is warmed the same way (landed 2026-07-12).** The dedicated DNS tunnel isn't in the rotating pool, so it used to cold-catch after idle — under light DNS load the first query after a >30s gap timed out before a retry warmed it. `slot-warmup.sh` now also fires a neutral `dig @10.2.0.1 . NS` (root NS, cached) over UDP through `ns-dns-6` every pass — same address unbound forwards to, so the warmed path is the one clients use. Verified: a query after a 40s idle gap returns in ~24ms instead of timing out.
 
 ## Forward-chain: `client-to-private` must precede `ct state invalid drop`
 
@@ -356,3 +381,39 @@ cosmetic. (`wg-${INSTANCE}` must stay ≤15 chars; the script sanity-checks it.)
 If `rotate-slot.sh` dies between `vpnns-up.sh ...-s` and the promote-or-cleanup branch, the staging netns stays behind. Symptom: `ip netns list` shows `ns-proton-N-s`, and `ip rule` shows `from 172.31.N.1 lookup 10N` / `fwmark 0x65+N lookup 20N` for the orphan.
 
 Cleanup: `vpnns-down.sh proton-N-s` handles the netns + state file + standard rules. Verify `ip rule` is clean afterward.
+
+## Per-slot persistent WG keys (not one shared session key)
+
+**Root cause of the 2026-08 "flaky TLS" reports (worst on clients hitting a
+single-origin API host):** every tunnel (proton-1..N + dns-6) shared ONE
+Proton WireGuard identity. `proton-mint` reused the account's single
+session-mode key (`vpn_credentials.pubkey_credentials.wg_private_key`) for every
+slot — its old docstring claimed "a fresh keypair per mint" but the code did the
+opposite. Proton's session model is one key = one active tunnel; fanning that
+key across 5+1 concurrent servers makes Proton's control plane roll the key's
+authorized session between servers, so each slot goes dark for ~13-18s every
+30-70s (synchronized across slots, underlay clean, each window ended by a forced
+re-handshake). A client that reuses one long-lived connection (e.g. to an AWS
+Global Accelerator anycast IP) rides through it; a client that opens a fresh
+TCP+TLS per request to a single-origin host eats a TLS-EOF or connect-timeout
+whenever a request lands in a blackout. Proven by A/B: a slot moved to its own
+key went 50/50 clean while shared-key slots failed 20-30%.
+
+**Fix (2026-08):** `proton-mint` now registers a **persistent** certificate
+(`Mode: "persistent"` + a unique `DeviceName` on the `/vpn/v1/certificate` POST
+— the shipped `proton-vpn-core` omits both, which is why an earlier fresh-key
+attempt "failed the handshake": session-mode keys don't coexist). Each slot owns
+one persistent key in `/etc/proteus/wg/proton/keys/<slot>.ed25519`, registered
+ONCE (Proton 409s a re-registered key: "ClientPublicKey fingerprint conflict"),
+and the keyfile is written only on a successful POST so its presence means
+"registered". Rotation reuses the key and changes only the server. Persistent
+keys coexist, each counts as one concurrent connection against the account cap,
+and work on any server with no re-POST. Certs are minted for 365 days; refresh
+by regenerating the key (`proton-mint --slot X --force-new-key`) since an
+existing key can't be re-certified.
+
+**Gotchas:** (1) persistent device entries are prunable ONLY via
+account.protonvpn.com (DELETE needs full web-login scope) — don't churn a new
+key per rotation or the dashboard fills with dead devices. (2) `--force-new-key`
+leaves the old device behind until its cert expires. (3) Inventory with
+`proton-mint --list`.

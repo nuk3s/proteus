@@ -235,3 +235,47 @@ def test_is_pinnable_source() -> None:
     assert is_pinnable_source("172.16.1.255") is False   # broadcast address
     assert is_pinnable_source("10.0.0.5") is False        # off-VLAN (mgmt)
     assert is_pinnable_source("not-an-ip") is False
+
+
+def test_status_snapshot():
+    from dispatcher_logic import build_status_snapshot
+    pins = {"10.0.0.23": ("proton-1", 1754300100.0)}   # src -> (slot, expiry)
+    counters = {"proton-1": 41, "proton-2": 7}
+    snap = build_status_snapshot(pins, counters, now=1754300000.0)
+    assert snap["pins"] == [{"ip": "10.0.0.23", "slot": "proton-1", "ttl_s": 100}]
+    assert snap["flow_counts"] == {"proton-1": 41, "proton-2": 7}
+    expired = build_status_snapshot({"10.0.0.9": ("proton-1", 100.0)}, {}, now=200.0)
+    assert expired["pins"] == []
+
+
+from dispatcher_logic import parse_source_pin_elements_with_ttl
+
+
+def test_parse_source_pin_elements_with_ttl_wrapped_key() -> None:
+    """nft -j on a timeout-flagged map wraps the key with a remaining-seconds
+    'expires' field (verified live: insert with timeout 30s -> expires: 29,
+    5s later -> expires: 24 — it counts down, it is not an absolute epoch)."""
+    elems = [[{"elem": {"val": "172.16.1.254", "expires": 21202}}, 1]]
+    assert parse_source_pin_elements_with_ttl(elems) == [("172.16.1.254", 1, 21202)]
+
+
+def test_parse_source_pin_elements_with_ttl_bare_has_no_ttl() -> None:
+    """Bare [ip, mark] entries (no timeout info in the JSON) yield ttl=None —
+    caller must treat this as 'unknown', not guess an expiry."""
+    elems = [["172.16.1.10", 1]]
+    assert parse_source_pin_elements_with_ttl(elems) == [("172.16.1.10", 1, None)]
+
+
+def test_parse_source_pin_elements_with_ttl_empty() -> None:
+    assert parse_source_pin_elements_with_ttl([]) == []
+    assert parse_source_pin_elements_with_ttl(None) == []
+
+
+def test_parse_source_pin_elements_with_ttl_skips_malformed() -> None:
+    elems = [
+        [],
+        ["172.16.1.10"],
+        ["172.16.1.10", 1],
+        ["not-an-ip", "not-a-mark"],
+    ]
+    assert parse_source_pin_elements_with_ttl(elems) == [("172.16.1.10", 1, None)]

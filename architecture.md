@@ -35,6 +35,8 @@ Return traffic follows the ct state established,related accept on the forward ch
 
 Anything else is counter-logged (`nft-output-dropped`) and dropped. Packets generated *inside* a VPN netns traverse that ns's own output chain (policy accept), not this one.
 
+Two explicit drops sit **above** those accepts, because the DNS upstream (`10.2.0.1`) is RFC1918 and would otherwise be covered by the `$RFC1918` accept: `unbound-dns-killswitch` (uid `unbound`, daddr `10.2.0.1`, leaving anything but `v-dns-6`) and `unbound-upstream-tunnel-only` (uid `unbound`, dport 53/853 off `v-dns-6` — keyed on destination port so replies to clients are untouched, and upstream-agnostic if the forwarder ever changes). They precede `ct state established,related accept` because conntrack keys on the 5-tuple: a flow that established over the tunnel would stay ESTABLISHED after a route flip.
+
 ## Reputation gating (rotation)
 
 **Design:** run empirical probes from inside the staging netns. This tests the thing that actually matters — "does this exit IP behave like a normal user" — without leaking the correlation "mgmt IP queried reputation service about exit X" to any third party.
@@ -81,7 +83,13 @@ The rotation itself is the same code path as the daily timer — mint, stage, pr
 
 ## DNS — dedicated tunnel
 
-Separate `dns-6` Proton tunnel carrying DNS traffic only. Local unbound listens on `127.0.0.1` + `172.16.1.5` and forwards `.` to Quad9 (`9.9.9.9` + `149.112.112.112` — no Cloudflare per user preference).
+Separate `dns-6` Proton tunnel carrying DNS traffic only. Local unbound listens on `127.0.0.1` + `172.16.1.5` and forwards `.` to `10.2.0.1` (`UNBOUND_UPSTREAM`) over plain UDP — Proton's in-tunnel NetShield resolver. `10.2.0.1` is the gateway address inside *every* Proton WireGuard tunnel, so it survives a dns-6 rotation without any config rewrite. NetShield (level from `PROTEUS_NETSHIELD_LEVEL`, baked into the tunnel certificate at key registration) filters ads/trackers/malware; because client port-53 traffic is redirected to unbound, this is the layer that actually reaches clients.
+
+DNSSEC validation is off: the drop-in sets `module-config: "iterator"`. NetShield answers a blocked name with a bare unsigned NXDOMAIN and NXDOMAINs the DS query for it too, so a validating resolver can't prove insecure delegation and returns SERVFAIL for every blocked ad domain instead of a clean NXDOMAIN. `10.2.0.1` validates upstream itself, so the loss is last-hop only and that hop is inside WireGuard. Anyone pointing `UNBOUND_UPSTREAM` back at a public resolver must restore both the validator and `forward-tls-upstream`. `UNBOUND_MODULE_CONFIG` picks the line automatically: `iterator` for an upstream in `10.2.0.0/16`, `validator iterator` otherwise.
+
+Single upstream by design. A public fallback resolver would silently disable NetShield filtering the moment `10.2.0.1` hiccups, which defeats the point; `serve-expired` plus `rotate-dns.sh` cover short outages instead.
+
+Because the upstream is now RFC1918, a routing fallback is a privacy leak rather than a firewall drop, so `chain output` carries a dedicated kill-switch (`unbound-dns-killswitch`): any packet from uid `unbound` to `10.2.0.1` leaving on anything other than `v-dns-6` is logged and dropped, above the ct-established accept.
 
 Two mechanisms steer unbound's upstream queries into the dns-6 tunnel:
 
@@ -92,9 +100,9 @@ Two mechanisms steer unbound's upstream queries into the dns-6 tunnel:
 
 `dns-6` is not part of the client-traffic rotation pool — the dispatcher's `_load_instances()` filters on `^proton-\d+$`. DNS survives slot rotation cleanly because it rides its own independent tunnel.
 
-`dns-6` has its own separate rotation trigger: `proteus-dns-latency.timer` fires every 15 min, measures `ns-dns-6 → 9.9.9.9` RTT, and calls `rotate-dns.sh` if latency exceeds 120ms. The cooldown in `rotate-dns.sh` (1h) prevents thrashing when no available exit has a good Quad9 path. The cold-DNS experience is dominated by tunnel RTT × qname-minimisation steps, so a faster exit directly shortens first-hit latency for users.
+`dns-6` has its own separate rotation trigger: `proteus-dns-latency.timer` fires every 15 min, measures a UDP `. NS` query from `ns-dns-6` to `10.2.0.1`, and calls `rotate-dns.sh` if the query time exceeds 150ms. The cooldown in `rotate-dns.sh` (1h) prevents thrashing when no available exit has a good path. The threshold is sized to the target: the old 300ms figure assumed a TCP transaction over a ~220ms Quad9 path and could never fire against an 11-16ms in-tunnel resolver, which would have retired health-driven DNS rotation without anyone noticing. Worst measured exit was 71ms, so 150 leaves roughly 2x headroom. The cold-DNS experience is dominated by tunnel RTT × qname-minimisation steps, so a faster exit directly shortens first-hit latency for users.
 
-Per-netns resolv.conf files (`/etc/netns/ns-proton-N/resolv.conf`) also point at Quad9, so `ip netns exec` bind-mounts that over `/etc/resolv.conf` for reputation probes and anything else run inside a rotating netns — no leak to the mgmt network's resolver (which the kill-switch doesn't permit anyway).
+Per-netns resolv.conf files (`/etc/netns/ns-proton-N/resolv.conf`) still point at Quad9 (`DNS_UPSTREAMS`), so `ip netns exec` bind-mounts that over `/etc/resolv.conf` for reputation probes and anything else run inside a rotating netns — no leak to the mgmt network's resolver (which the kill-switch doesn't permit anyway). The split from the gateway resolver is deliberate: clients get NetShield filtering via unbound, while the probe namespaces stay on an unfiltered public resolver so exit health-checking is never coupled to an ad blocklist. Point the probes at NetShield and a user who adds an ad domain to their custom check list makes every exit look broken, wedging rotation.
 
 ## Rotation lifecycle
 
@@ -148,9 +156,41 @@ The sticky map `@vpn_dispatch` maps `daddr → mark`, not `daddr → endpoint`. 
 
 Conntrack provides the mid-stream safety: if a long-lived flow exists when the map entry expires, `meta mark set ct mark` in `prerouting_mangle` restores the mark from the flow's own ct state.
 
+## Web UI
+
+`proteus-ui.service` is an unprivileged Python-stdlib TLS daemon (`ThreadingHTTPServer` wrapped in
+an `ssl.SSLContext`) listening on `UI_PORT` (default 8443), reachable only from the mgmt LAN and
+the client VLAN. It runs as system user `proteus-ui` with an empty `CapabilityBoundingSet` and
+`NoNewPrivileges=yes`, and never writes production state directly: it reads the per-slot
+`.state`/`.meta` files, the slot-health files, and the `/run/proteus` snapshots
+(`dispatcher-status.json`, `rotation-history.jsonl`) through group membership, and reads timer
+schedules via unprivileged `systemctl show`. Every mutation (set a knob, force a rotation,
+pause/resume auto-rotation, restart the dispatcher) goes out as one JSON line to
+`proteus-ui-apply`'s unix socket; the daemon itself has no path to root.
+
+`proteus-ui-apply.socket` / `.service` is the privileged broker on the other side of that socket,
+`/run/proteus/apply.sock` (mode 0660, group `proteus-ui`), socket-activated so root code only
+runs on demand. It's the sole writer of `/etc/proteus/proteus-local.env`, the rotation-paused flag
+file, the `proteus-rotate-slot@.timer` drop-in, and the manual-rotation trigger files under
+`/run/proteus`. It validates every command against a fixed schema (ranges, not just types) and
+builds argv arrays directly, no shell on any input path, so the unprivileged daemon is untrusted
+from the broker's point of view. It's the same trust boundary sudo would give, without a sudoers
+file.
+
+`/run/proteus` (tmpfiles.d) and `/etc/proteus/state` are SETGID group `proteus-ui` (mode 2750), so
+files written by the root-run dispatcher and rotation scripts inherit the group automatically;
+no `CAP_CHOWN` needed on either side.
+
 ## Boot ordering
 
 `nftables.service` loads ruleset → `proteus-dns-tunnel.service` brings up dns-6 → `unbound.service` starts (Before relationship) → `proteus-proton@proton-{1..5}.service` bring up the rotating slots (each `ExecStart=vpnns-up.sh %i /etc/proteus/wg/proton/auto/%i.conf`, Before=`proteus-dispatcher.service`) → `proteus-dispatcher.service` binds NFQUEUE 0 with the 5-slot pool loaded. `proteus-proton-api-whitelist.service` and `repopulate-wg-peers.sh` refresh the sets that `flush ruleset` empties. `proteus-slot-warmup.timer` starts 45s after boot (once the pool is up) and fires every 10s to keep Proton's exit-side flow state warm.
+
+`proteus-ui-apply.socket` is `WantedBy=sockets.target`, independent of the dispatch chain above:
+it just listens, so it's always ready even before the broker service itself has run once.
+`proteus-ui.service` (`After=`/`Wants=proteus-ui-apply.socket`) starts in parallel with the rest of
+boot; the installer enables it but the service itself refuses to start until a passphrase has been
+set (see `operations.md`), so on a freshly installed or freshly rebooted box it's expected to sit
+in `systemctl --failed` until `proteus-ui-passwd` runs.
 
 The `proton-N.conf` stable symlink is what `proteus-proton@.service` reads — `rotate-slot.sh` updates it on every successful promotion, so the next boot always picks up the most recently promoted config for each slot.
 

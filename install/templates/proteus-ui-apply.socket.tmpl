@@ -1,0 +1,11 @@
+[Unit]
+Description=Proteus UI privileged broker socket
+
+[Socket]
+ListenStream=/run/proteus/apply.sock
+SocketMode=0660
+SocketUser=root
+SocketGroup=proteus-ui
+
+[Install]
+WantedBy=sockets.target

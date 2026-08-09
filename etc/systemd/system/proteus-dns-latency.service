@@ -1,5 +1,5 @@
 [Unit]
-Description=Check dns-6 tunnel latency to Quad9 and rotate if degraded
+Description=Check dns-6 tunnel latency to the in-tunnel resolver and rotate if degraded
 After=proteus-dns-tunnel.service unbound.service
 
 [Service]

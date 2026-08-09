@@ -1,33 +1,48 @@
 #!/usr/bin/env python3
 """
-proteus-proton-mint — unattended WireGuard config minter for Proton VPN.
+proteus-proton-mint — WireGuard config minter for Proton VPN (persistent, fixed
+per-slot key pool).
 
-Reuses the session persisted by proton-bootstrap. Picks a streaming-capable
-US server, generates a fresh Ed25519/X25519 keypair, asks Proton to register
-the public key by signing a client certificate, and writes a complete wg-quick
-config to <out-dir>/<slot>-<server>-<timestamp>.conf.
+Each slot (proton-1..N, dns-6) owns ONE persistent WireGuard key, registered
+with Proton exactly once and stored under KEYS_DIR/<slot>.ed25519. Rotation
+changes only the SERVER: we reuse the slot's key and write a fresh config
+pointing at a newly-picked exit. We never re-POST an already-registered key —
+Proton rejects that with HTTP 409 "fingerprint conflict".
 
-Each mint uses a brand-new keypair, so the identity is unlinkable from the
-previous rotation on that slot.
+Why persistent, not session mode: Proton's default (session) certificate binds
+ONE active key per login session. proteus runs 5+1 concurrent tunnels; sharing
+that single session key across many exits makes Proton's control plane de-auth
+the key across servers, producing ~15s rolling WireGuard session blackouts on
+every slot (root cause of the 2026-08 open-meteo flakiness). A persistent
+certificate (Mode=persistent + a unique DeviceName) registers an independent,
+edge-accepted device key that coexists with the others; each still counts as
+one concurrent connection against the account limit. Distinct keys => no
+cross-server de-auth. Persistent device entries are prunable only via
+account.protonvpn.com (DELETE needs full web-login scope).
+
+The keyfile is written only AFTER a successful registration, so "keyfile
+exists" is authoritative for "this slot's key is registered" — a mint whose
+POST failed leaves no keyfile and is retried next run.
 
 Usage:
-  proton-mint --slot proton-1
-              [--country US] [--streaming | --no-streaming]
+  proton-mint --slot proton-1 [--country US] [--streaming|--no-streaming]
               [--out-dir /etc/proteus/wg/proton/auto]
+  proton-mint --slot proton-1 --force-new-key   # regenerate + re-register
+  proton-mint --list                            # list persistent devices
 
 Exit codes:
-  0  success, config path printed on stdout
-  1  session not authenticated — run proton-bootstrap
-  2  no suitable server found
-  3  cert mint failed
-  4  could not acquire the mint lock (another mint is stuck)
+  0 success (config path on stdout)   1 not authenticated (run proton-bootstrap)
+  2 no suitable server                3 register/cert failed
+  4 mint lock timeout
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import datetime
 import fcntl
+import json
 import os
 import random
 import sys
@@ -36,24 +51,20 @@ from pathlib import Path
 
 from serverlist_cache import repair as repair_serverlist_cache
 
-# System-wide mint lock. proton-vpn-core persists a shared cache
-# (/var/cache/Proton/VPN/serverlist.json, ~23 MB). Two proton-mint processes
-# fetching concurrently race on that write and leave a corrupt file with a
-# stray trailing byte — which then blocks session deserialization on EVERY
-# subsequent mint, so no rotation can self-heal (observed 2026-05-09 and again
-# 2026-07-12; see gotchas.md). Multiple rotate-slot@ / rotate-dns timers can
-# fire in the same second, so we serialize all mints on one flock. The lock is
-# advisory and tied to the open fd — it releases automatically if the process
-# dies, so a crash can't deadlock future mints.
 MINT_LOCK_PATH = "/run/proteus-mint.lock"
 MINT_LOCK_TIMEOUT_S = 120
+KEYS_DIR = "/etc/proteus/wg/proton/keys"
+# Persistent certificate lifetime. Proton allows up to 365 days for persistent
+# devices; we mint at the max so cert refresh is a once-a-year concern handled
+# by --force-new-key (which registers a fresh key — the only way, since an
+# already-registered key can't be re-certified: HTTP 409).
+CERT_DURATION_MIN = 525600  # 365 days
 
 
 def acquire_mint_lock(path: str = MINT_LOCK_PATH, timeout_s: int = MINT_LOCK_TIMEOUT_S):
     """Block until we hold an exclusive lock on `path`, or raise on timeout.
-
-    Returns the held file object; keep it alive for the process lifetime.
-    """
+    Serializes all mints — proton-vpn-core shares a ~23 MB serverlist cache and
+    two concurrent fetchers corrupt it (see gotchas.md)."""
     f = open(path, "w")
     deadline = time.monotonic() + timeout_s
     while True:
@@ -63,12 +74,11 @@ def acquire_mint_lock(path: str = MINT_LOCK_PATH, timeout_s: int = MINT_LOCK_TIM
         except BlockingIOError:
             if time.monotonic() >= deadline:
                 f.close()
-                raise TimeoutError(
-                    f"could not acquire mint lock {path} within {timeout_s}s"
-                )
+                raise TimeoutError(f"could not acquire mint lock {path} within {timeout_s}s")
             time.sleep(0.5)
 
-# Force proton-sso onto the JsonFiles keyring (see proton-bootstrap comment).
+
+# Force proton-sso onto the JsonFiles keyring (headless: no DBus/SecretService).
 from proton.sso import ProtonSSO
 _sso_orig_init = ProtonSSO.__init__
 def _sso_init_json(self, *args, **kwargs):
@@ -79,24 +89,17 @@ ProtonSSO.__init__ = _sso_init_json
 from proton.vpn.core.api import ProtonVPNAPI
 from proton.vpn.core.session_holder import ClientTypeMetadata, SessionHolder
 from proton.vpn.session.servers import ServerFeatureEnum
+from proton.vpn.session.key_mgr import KeyHandler
+from proton.vpn.session.utils import rest_api_request
 
-# Impersonate the official Proton VPN Linux GUI app; see proton-bootstrap.
-SessionHolder._get_app_version_header_value = staticmethod(
-    lambda _meta: "linux-vpn@4.8.0"
-)
+# Impersonate the official Proton VPN Linux GUI app (version gate, see bootstrap).
+SessionHolder._get_app_version_header_value = staticmethod(lambda _meta: "linux-vpn@4.8.0")
 
-CLIENT_METADATA = ClientTypeMetadata(
-    type="gtk",
-    version="4.8.0",
-    architecture="x86_64",
-)
+CLIENT_METADATA = ClientTypeMetadata(type="gtk", version="4.8.0", architecture="x86_64")
 
-# Proton WG inner addressing is fixed per-account — the cert registers our
-# pubkey against the account, no IP is assigned in the response.
 WG_CLIENT_ADDRESS = "10.2.0.2/32"
 WG_DNS = "10.2.0.1"
 WG_PORT = 51820
-CERT_DURATION_MIN = 1440  # 24h — matches our daily rotation cadence
 
 
 def pick_server(server_list, country: str, require_streaming: bool, user_tier: int):
@@ -116,16 +119,13 @@ def pick_server(server_list, country: str, require_streaming: bool, user_tier: i
         if not physicals:
             continue
         candidates.append((logical, physicals))
-
     if not candidates:
         return None
-
     candidates.sort(key=lambda c: (c[0].load if c[0].load is not None else 100,
                                     c[0].score if c[0].score is not None else 999))
     top = candidates[: max(5, len(candidates) // 10)]
     logical, physicals = random.choice(top)
-    physical = random.choice(physicals)
-    return logical, physical
+    return logical, random.choice(physicals)
 
 
 def render_wg_conf(*, private_key: str, server_pk: str, endpoint_ip: str) -> str:
@@ -143,13 +143,86 @@ def render_wg_conf(*, private_key: str, server_pk: str, endpoint_ip: str) -> str
     )
 
 
+def _keyfile(slot: str) -> Path:
+    return Path(KEYS_DIR) / f"{slot}.ed25519"
+
+
+def _markerfile(slot: str) -> Path:
+    return Path(KEYS_DIR) / f"{slot}.registered"
+
+
+async def do_list(session) -> int:
+    """Print a summary of the account's persistent devices."""
+    try:
+        resp = await rest_api_request(session, "/vpn/v1/certificate/all?Mode=persistent")
+    except Exception as e:
+        print(f"list failed: {e}", file=sys.stderr)
+        return 3
+    certs = resp.get("Certificates", []) if isinstance(resp, dict) else []
+    print(f"persistent devices: {len(certs)}")
+    for c in certs:
+        exp = c.get("ExpirationTime")
+        exp_h = datetime.datetime.utcfromtimestamp(exp).strftime("%Y-%m-%d") if exp else "?"
+        print(f"  {c.get('DeviceName','?'):24s} serial={c.get('SerialNumber','?'):14s} expires={exp_h}")
+    return 0
+
+
+def netshield_level() -> int:
+    """Configurable NetShield level (0=off, 1=malware, 2=malware+ads+trackers).
+    Read from the environment, then the UI overlay, then proteus.env; default 2.
+
+    NOTE: NetShield filters at Proton's in-tunnel DNS (10.2.0.1), and proteus'
+    unbound now forwards "." there over the dns-6 tunnel, so this level applies to
+    EVERY client lookup rather than only to traffic that happens to resolve via a
+    Proton tunnel. In particular the dns-6 slot's certificate is what decides what
+    clients can resolve at all. It's baked into the certificate at KEY
+    REGISTRATION, so an already-registered slot needs a fresh key
+    (--force-new-key) to pick up a changed level."""
+    v = os.environ.get("PROTEUS_NETSHIELD_LEVEL")
+    if v is None:
+        for f in ("/etc/proteus/proteus.env", "/etc/proteus/proteus-local.env"):
+            try:
+                with open(f) as fh:
+                    for line in fh:
+                        if line.startswith("PROTEUS_NETSHIELD_LEVEL="):
+                            v = line.split("=", 1)[1].strip().strip('"')
+            except OSError:
+                pass
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        n = 2
+    return n if n in (0, 1, 2) else 2
+
+
+async def register_persistent(session, kh: KeyHandler, device_name: str,
+                              netshield: int = 2) -> dict:
+    """POST a persistent certificate for a fresh key. Raises on failure."""
+    body = {
+        "ClientPublicKey": kh.ed25519_pk_pem,
+        "ClientPublicKeyMode": "EC",
+        "Mode": "persistent",
+        "DeviceName": device_name,
+        "Duration": f"{CERT_DURATION_MIN} min",
+        "Features": {"NetShieldLevel": netshield, "RandomNAT": False,
+                     "PortForwarding": False, "SplitTCP": True},
+    }
+    return await rest_api_request(session, "/vpn/v1/certificate", jsondata=body)
+
+
 async def run(args: argparse.Namespace) -> int:
     api = ProtonVPNAPI(client_type_metadata=CLIENT_METADATA)
     if not api.is_user_logged_in():
         print("not logged in — run proton-bootstrap first", file=sys.stderr)
         return 1
+    session = api._session_holder.session
 
-    session = api._session_holder.session  # noqa: SLF001
+    if args.list:
+        return await do_list(session)
+
+    if not args.slot:
+        print("--slot is required (or use --list)", file=sys.stderr)
+        return 2
 
     try:
         sl = await session.fetch_server_list()
@@ -165,20 +238,44 @@ async def run(args: argparse.Namespace) -> int:
         return 2
     logical, physical = pick
 
-    # Refresh the account certificate so the registered key stays warm on
-    # Proton's edge — POSTing a different pubkey to /vpn/v1/certificate
-    # returns a valid cert but does NOT re-register the WG-edge key (proven
-    # by handshake failing with a freshly-minted key). So we reuse the
-    # session's registered wg key for every mint; only the server rotates.
-    try:
-        cert = await session.fetch_certificate()
-    except Exception as e:
-        print(f"cert refresh failed: {e}", file=sys.stderr)
-        return 3
+    Path(KEYS_DIR).mkdir(parents=True, exist_ok=True)
+    os.chmod(KEYS_DIR, 0o700)
+    keyfile = _keyfile(args.slot)
+    device_name = args.device_name or f"proteus-{args.slot}"
 
-    pubkey_creds = session.vpn_account.vpn_credentials.pubkey_credentials
+    # keyfile present (and no --force-new-key) == key already registered: reuse,
+    # rotate server only, NO re-POST (Proton 409s a re-registered key).
+    marker = None
+    if keyfile.exists() and not args.force_new_key:
+        kh = KeyHandler(base64.b64decode(keyfile.read_text().strip()))
+    else:
+        # Fresh key: register it persistently, and only persist the keyfile on
+        # success so a failed POST leaves nothing and is retried next run.
+        kh = KeyHandler()
+        try:
+            resp = await register_persistent(session, kh, device_name, args.netshield)
+        except Exception as e:
+            print(f"persistent register failed for {args.slot}: {e}", file=sys.stderr)
+            return 3
+        if resp.get("Mode") != "persistent":
+            print(f"register for {args.slot}: expected Mode=persistent, got {resp.get('Mode')}",
+                  file=sys.stderr)
+            return 3
+        marker = {
+            "device_name": resp.get("DeviceName"),
+            "serial": resp.get("SerialNumber"),
+            "expiration": resp.get("ExpirationTime"),
+            "registered_at": int(time.time()),
+        }
+        keyfile.write_text(kh.ed25519_sk_str + "\n")
+        os.chmod(keyfile, 0o600)
+        _markerfile(args.slot).write_text(json.dumps(marker) + "\n")
+        os.chmod(_markerfile(args.slot), 0o600)
+        print(f"# registered persistent device {device_name} "
+              f"serial={marker['serial']} expires={marker['expiration']}", file=sys.stderr)
+
     conf = render_wg_conf(
-        private_key=pubkey_creds.wg_private_key,
+        private_key=kh.x25519_sk_str,
         server_pk=physical.x25519_pk,
         endpoint_ip=physical.entry_ip,
     )
@@ -189,16 +286,14 @@ async def run(args: argparse.Namespace) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     os.chmod(out_dir, 0o700)
     out_path = out_dir / f"{args.slot}-{safe_name}-{ts}.conf"
-
     header = (
-        f"# proton-mint generated {ts}\n"
+        f"# proton-mint (persistent) {ts}\n"
         f"# slot={args.slot}\n"
+        f"# device={device_name}\n"
         f"# logical={logical.name}\n"
         f"# exit_country={logical.exit_country}\n"
         f"# physical_domain={physical.domain}\n"
-        f"# features={','.join(f.name for f in logical.features) or 'none'}\n"
-        f"# cert_serial={cert.SerialNumber}\n"
-        f"# cert_expires={cert.ExpirationTime}\n"
+        f"# key_registered={'this-run' if marker else 'reused'}\n"
     )
     out_path.write_text(header + conf)
     os.chmod(out_path, 0o600)
@@ -211,24 +306,24 @@ def main() -> int:
         print("run as root", file=sys.stderr)
         return 2
     p = argparse.ArgumentParser()
-    p.add_argument("--slot", required=True, help="e.g. proton-1")
+    p.add_argument("--slot", help="e.g. proton-1 (required unless --list)")
     p.add_argument("--country", default="US")
     p.add_argument("--streaming", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--netshield", type=int, choices=(0, 1, 2), default=netshield_level(),
+                   help="0=off 1=malware 2=malware+ads+trackers (default from PROTEUS_NETSHIELD_LEVEL)")
     p.add_argument("--out-dir", default="/etc/proteus/wg/proton/auto")
+    p.add_argument("--device-name", default=None)
+    p.add_argument("--force-new-key", action="store_true",
+                   help="regenerate + re-register this slot's key (cert refresh)")
+    p.add_argument("--list", action="store_true", help="list persistent devices and exit")
     args = p.parse_args()
 
-    # Serialize before touching proton-vpn-core (its constructor reads the
-    # shared cache). Held until this process exits.
     try:
         _mint_lock = acquire_mint_lock()  # noqa: F841 — held for process lifetime
     except TimeoutError as e:
         print(str(e), file=sys.stderr)
         return 4
 
-    # Repair a corrupt/absent server-list cache while holding the lock, before
-    # proton-vpn-core reads it. A corrupt cache is self-perpetuating (it blocks
-    # the fetch that would replace it), so without this a reboot/kill mid-write
-    # wedges every future mint.
     action = repair_serverlist_cache()
     if action != "valid":
         print(f"serverlist cache: {action}", file=sys.stderr)

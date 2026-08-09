@@ -7,6 +7,8 @@ ConditionPathIsDirectory=/etc/proteus/state
 
 [Service]
 Type=simple
+EnvironmentFile=/etc/proteus/proteus.env
+EnvironmentFile=-/etc/proteus/proteus-local.env
 ExecStart=/etc/proteus/bin/dispatcher.py
 Restart=on-failure
 RestartSec=5s
@@ -17,7 +19,7 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 ReadWritePaths=/var/log/proteus /run/proteus
-RuntimeDirectory=proteus
+# /run/proteus is provisioned by tmpfiles.d (root:proteus-ui 0750) so the UI group can read the snapshot
 # NFQUEUE needs CAP_NET_ADMIN; shelling out to nft needs root
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE

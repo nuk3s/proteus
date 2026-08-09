@@ -150,6 +150,13 @@ ask() {  # ask "Question" "default" -> echoes answer (default on empty)
     read -r ans || true
     echo "${ans:-$def}"
 }
+ask_secret() {  # ask_secret "Question" -> echoes answer; input not echoed to the terminal
+    local q=$1 ans
+    printf '   %s?%s %s ' "$VIOL" "$RESET" "$q" >&2
+    read -rs ans || true
+    printf '\n' >&2
+    echo "$ans"
+}
 confirm() {  # confirm "Question" [Y|N default] -> 0 yes / 1 no
     local q=$1 def=${2:-Y} ans hint
     [[ $def == Y ]] && hint="${BOLD}Y${RESET}${DIM}/n" || hint="${DIM}y/${BOLD}N"

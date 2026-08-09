@@ -6,6 +6,9 @@ etc/proteus/state/
 # Proton SSO refresh token
 etc/Proton/
 
+# Brainstorm session artifacts (visual companion)
+.superpowers/
+
 # Backups / editor noise
 *.bak
 *.bak-*
@@ -14,3 +17,6 @@ __pycache__/
 *.pyc
 install/proteus.conf
 install/.staging/
+
+# Runtime custom health-check list (operator URLs)
+etc/proteus/checks.json

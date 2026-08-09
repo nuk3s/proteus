@@ -5,6 +5,16 @@ flush ruleset
 define LAN_MGMT = ${MGMT_CIDR}
 define CLIENT_VLAN = ${CLIENT_VLAN_CIDR}
 define RFC1918 = { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 }
+# Extra source CIDR allowed to reach the web UI on the mgmt iface (default: loopback = no extra).
+define UI_MGMT_EXTRA = ${UI_MGMT_EXTRA}
+# unbound's only upstream, rendered from UNBOUND_UPSTREAM so the kill-switch
+# below always names the resolver unbound actually queries. Defaults to Proton's
+# in-tunnel NetShield resolver (10.2.0.1), which is reachable solely inside a
+# Proton WG namespace yet lives in 10.0.0.0/8 — so it is covered by the broad
+# $RFC1918 accept in chain output and needs an explicit drop to stay fail-closed.
+# Pointing UNBOUND_UPSTREAM at a public resolver makes this rule redundant
+# (public destinations never match the RFC1918 accept) but never wrong.
+define PROTON_DNS = ${UNBOUND_UPSTREAM}
 
 table inet filter {
     # Destination -> fwmark lookup. Populated by the NFQUEUE dispatcher.
@@ -41,6 +51,21 @@ table inet filter {
         size 32
     }
 
+    # Client LAN-pivot gate. When this set holds the client VLAN, clients may
+    # transit to other private (RFC1918) LAN hosts through the gateway ("open");
+    # when empty, that transit is dropped and clients reach only the public
+    # internet via the VPN tunnels ("isolated"). proteus-client-isolation.service
+    # (the PROTEUS_CLIENT_ISOLATION knob) sets membership at runtime.
+    #
+    # Deliberately NOT seeded here: the boot-time contents come from the seed
+    # file pulled in by the include at the end of this file, so the fail
+    # direction (what applies before/without the toggle service) is itself a
+    # user-visible setting — PROTEUS_CLIENT_ISOLATION_FAILSAFE.
+    set client_pivot {
+        type ipv4_addr
+        flags interval
+    }
+
     chain input {
         type filter hook input priority filter; policy drop;
 
@@ -52,6 +77,14 @@ table inet filter {
         ip6 nexthdr icmpv6 icmpv6 type { echo-request, destination-unreachable, time-exceeded, parameter-problem, packet-too-big, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept
 
         iifname "${MGMT_IFACE}" tcp dport 22 ip saddr $RFC1918 counter accept comment "ssh-mgmt"
+
+        # Proteus web UI (HTTPS). Both rules reach the SAME full-privilege UI:
+        # auth is the bearer token alone, with no source-based restriction, so a
+        # client-VLAN device that has the passphrase can rotate slots, write
+        # knobs and drive the privileged broker exactly like mgmt can. Delete
+        # the "proteus-ui-client" rule to keep the UI on the mgmt LAN.
+        iifname "${MGMT_IFACE}"   ip saddr { $LAN_MGMT, $UI_MGMT_EXTRA } tcp dport ${UI_PORT} counter accept comment "proteus-ui-mgmt"
+        iifname "${CLIENT_IFACE}" ip saddr $CLIENT_VLAN tcp dport ${UI_PORT} counter accept comment "proteus-ui-client"
 
         # Local resolver: clients on the client VLAN may query unbound on 172.16.1.5.
         iifname "${CLIENT_IFACE}" ip saddr $CLIENT_VLAN udp dport 53 counter accept comment "client-dns"
@@ -125,7 +158,8 @@ table inet filter {
         # Ordered before ct-state-invalid drop: UniFi routes mgmt->VLAN directly,
         # so we see only the return half (SYN-ACK with no SYN in our conntrack =
         # invalid). Accept legit client-VLAN->private transit first, then drop.
-        iifname "${CLIENT_IFACE}" ip saddr $CLIENT_VLAN ip daddr $RFC1918 oifname "${MGMT_IFACE}" counter accept comment "client-to-private"
+        # Gated on @client_pivot (see the set above): full = open, empty = isolated.
+        iifname "${CLIENT_IFACE}" ip saddr @client_pivot ip daddr $RFC1918 oifname "${MGMT_IFACE}" counter accept comment "client-to-private"
 
         ct state invalid counter drop
         ct state established,related accept
@@ -154,6 +188,49 @@ table inet filter {
         type filter hook output priority filter; policy drop;
 
         oif lo accept
+
+        # DNS kill-switch. MUST stay above BOTH `ct state established,related
+        # accept` and the broad `ip daddr $RFC1918 accept` below.
+        #
+        # unbound's upstream ($PROTON_DNS) is an RFC1918 address, so the generic
+        # RFC1918 accept would happily let a query leave in cleartext over the
+        # mgmt LAN. That is not hypothetical: vpnns-up.sh deletes the fwmark rule
+        # and flushes the DNS route table on every rotation, and re-adds the
+        # transit IP to the veth before it re-adds the route, so unbound can bind
+        # and send while the mark lookup falls through to `main` (-> default via
+        # the mgmt iface). Observed twice in 30 days on the reference gateway,
+        # harmless only because the old upstream was public and hit this chain's
+        # default drop. With an RFC1918 upstream that safety disappears.
+        #
+        # Above ct-established because conntrack keys on the 5-tuple: a flow that
+        # established over the tunnel stays ESTABLISHED after the route flips.
+        # `oifname` (string) not `oif` (ifindex) so the rule still loads when the
+        # veth does not exist yet — with `oif` the whole ruleset fails at boot.
+        meta skuid "unbound" ip daddr $PROTON_DNS oifname != "v-${DNS_INSTANCE}" \
+            counter log prefix "nft-dns-killswitch " level warn drop comment "unbound-dns-killswitch"
+        # Upstream-agnostic belt: unbound may only reach a resolver PORT through
+        # the DNS tunnel. Survives any future change of upstream address.
+        #
+        # `ct direction original` is what stops this eating REPLIES. Keying on
+        # dport alone is not enough: a downstream forwarder that queries from
+        # source port 53 (dnsmasq `query-port=53`, BIND `query-source port 53`,
+        # and plenty of consumer routers) makes our reply to it carry dport 53,
+        # which would match and be silently blackholed. A reply belongs to a flow
+        # the client originated, so it is direction=reply and skips this rule.
+        meta skuid "unbound" ct direction original meta l4proto { tcp, udp } th dport { 53, 853 } \
+            oifname != "v-${DNS_INSTANCE}" \
+            counter log prefix "nft-dns-belt " level warn drop comment "unbound-upstream-tunnel-only"
+
+        # unbound resolver egress via the dedicated DNS tunnel, scoped by
+        # uid+mark+interface so no other process can ride it. Deliberately placed
+        # HERE, above the broad `ip daddr $RFC1918 accept` below: with an RFC1918
+        # upstream (the default), leaving this rule further down would let the
+        # generic accept admit unbound's queries first, making this rule dead and
+        # its counter permanently zero. The veth derives from DNS_INSTANCE
+        # (vpnns-up.sh builds the veth as v-<instance>) so it stays in lockstep
+        # with the two kill-switch drops above.
+        meta skuid "unbound" meta mark ${DNS_FWMARK_HEX} oifname "v-${DNS_INSTANCE}" counter accept comment "unbound-dns-egress"
+
         ct state established,related accept
         ct state invalid counter drop
 
@@ -179,10 +256,25 @@ table inet filter {
         # Proton VPN control-plane API (bootstrap + cert mints).
         oifname "${MGMT_IFACE}" tcp dport 443 ip daddr @proton_api counter accept comment "proton-api"
 
-        # unbound resolver egress via the dedicated dns-6 tunnel.
-        # Scoped by uid+mark so no other process can ride this rule.
-        meta skuid "unbound" meta mark ${DNS_FWMARK_HEX} oifname "v-dns" counter accept comment "unbound-dns-egress"
-
         counter log prefix "nft-output-dropped " level debug comment "output-dropped"
     }
 }
+
+# Boot-time seed for @client_pivot, regenerated by proteus-client-isolation.sh
+# from PROTEUS_CLIENT_ISOLATION_FAILSAFE. It decides what applies in the window
+# before proteus-client-isolation.service runs, and if that service never runs:
+#   failsafe=open   -> file grants the pivot   -> clients keep LAN access
+#   failsafe=closed -> file is comment-only    -> clients are isolated
+#
+# MUST be the LAST statement and MUST come after the table block: an include
+# placed before it fails with "No such file or directory; did you mean table
+# 'filter'" — an error that reads like a missing FILE but means a missing TABLE.
+#
+# The `[.]` is a bracket glob, not a literal dot, and that is load-bearing. nft
+# treats a GLOB that matches nothing as a silent no-op (exit 0), while a LITERAL
+# include of a missing file is a hard parse error — and because this file starts
+# with `flush ruleset`, that would leave the box with NO ruleset at all: no
+# policy drops, no kill-switch, no client DNS redirect. The bracket form still
+# matches only the one canonical filename, so a stray file in that directory can
+# neither be silently merged in nor brick the load (a wide `*` glob does both).
+include "/etc/proteus/nft/client-pivot-seed[.]nft"

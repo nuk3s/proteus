@@ -12,10 +12,14 @@ AUTO_DIR=/etc/proteus/wg/proton/auto
 # DNS instance/index come from the installer-rendered env; fall back to the
 # historical production values (dns-6 / index 6) so an un-migrated box works.
 [[ -r /etc/proteus/proteus.env ]] && source /etc/proteus/proteus.env
+# UI-set overrides survive installer re-runs
+[ -f /etc/proteus/proteus-local.env ] && . /etc/proteus/proteus-local.env
+# shellcheck source=/dev/null
+. /etc/proteus/bin/history.sh
 SLOT="${PROTEUS_DNS_INSTANCE:-dns-6}"
 DNS_IDX="${PROTEUS_DNS_INDEX:-6}"
 STATE_MARK="/etc/proteus/state/${SLOT}-rotate.last"
-COOLDOWN=3600
+COOLDOWN="${PROTEUS_DNS_ROTATE_COOLDOWN:-3600}"
 
 log() { printf "[%(%FT%T%z)T] rotate-dns: %s\n" -1 "$*" >&2; }
 
@@ -30,6 +34,9 @@ if [[ $FORCE -eq 0 && -f $STATE_MARK ]]; then
 fi
 
 log "rotating $SLOT (FORCE=$FORCE)"
+
+# Read before this rotation overwrites it, for the history row below.
+OLD_LOGICAL=$(grep -s '^LOGICAL_NAME=' "/etc/proteus/state/$SLOT.meta" | cut -d= -f2- || true)
 
 if ! /etc/proteus/bin/proton-mint --slot $SLOT --out-dir $AUTO_DIR >/dev/null; then
     log "ERR: mint failed"
@@ -47,6 +54,27 @@ unbound-control dump_cache > "$CACHE_DUMP" 2>/dev/null || true
 /etc/proteus/bin/vpnns-down.sh $SLOT || true
 /etc/proteus/bin/vpnns-up.sh "$SLOT" "$new_conf" "$DNS_IDX"
 ln -sfn "$new_conf" "$AUTO_DIR/$SLOT.conf"
+
+# Display metadata: $new_conf was minted by the same proton-mint used for the
+# proton-N slots, so it carries the same "# logical=" / "# exit_country="
+# header comments — parse those for the history row and the .meta sidecar.
+# SECURITY: same rule as rotate-slot.sh — this is third-party (Proton) data,
+# so it goes ONLY into the .meta sidecar, never the .state file (.state is
+# dot-sourced as root by repopulate-wg-peers.sh/vpnns-down.sh). Strip control
+# chars as defense in depth.
+NEW_LOGICAL=$(sed -n 's/^# logical=//p' "$new_conf" | head -n1)
+new_country=$(sed -n 's/^# exit_country=//p' "$new_conf" | head -n1)
+logical_clean=$(printf '%s' "$NEW_LOGICAL" | tr -d '\000-\037')
+country_clean=$(printf '%s' "$new_country" | tr -d '\000-\037')
+meta="/etc/proteus/state/$SLOT.meta"
+{
+    echo "LOGICAL_NAME=$logical_clean"
+    echo "EXIT_COUNTRY=$country_clean"
+    echo "MINTED_AT=$(date -Is)"
+} > "$meta"
+chgrp proteus-ui "$meta" 2>/dev/null || true
+chmod 640 "$meta" 2>/dev/null || true
+history_append "$SLOT" "${OLD_LOGICAL:-?}" "${logical_clean:-?}" "dns-latency" "promoted" "1"
 
 /etc/proteus/bin/repopulate-wg-peers.sh
 

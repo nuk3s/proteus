@@ -39,9 +39,18 @@ grep -q "outgoing-interface: 172.31.99.1" "$STAGE/unbound-proteus-dns.conf" && r
 assert_eq "$r" ok "unbound outgoing-interface uses dns index 99"
 
 echo "render: key systemd units are produced"
-for u in proteus-dispatcher.service proteus-proton@.service proteus-dns-tunnel.service proteus-rotate-slot@.timer; do
+for u in proteus-dispatcher.service proteus-proton@.service proteus-dns-tunnel.service proteus-rotate-slot@.timer \
+         proteus-ui.service proteus-ui-apply.service proteus-ui-apply.socket; do
     [[ -f "$STAGE/$u" ]] && r=ok || r=fail
     assert_eq "$r" ok "$u rendered"
 done
+
+echo "render: nftables carries the UI_PORT firewall rule"
+grep -q '8443' "$STAGE/nftables.conf" && r=ok || r=fail
+assert_eq "$r" ok "8443 present in rendered nftables.conf"
+
+echo "render: proteus.env carries PROTEUS_UI_PORT"
+grep -q '^PROTEUS_UI_PORT=8443$' "$STAGE/proteus.env" && r=ok || r=fail
+assert_eq "$r" ok "PROTEUS_UI_PORT rendered"
 
 rm -rf "$STAGE"; summary

@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+# etc/proteus/bin/proteus-ui-passwd
+"""Set the proteus web UI passphrase. Run as root. --stdin for scripted use."""
+from __future__ import annotations
+import getpass, os, pwd, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ui_logic
+
+DEST = "/etc/proteus/ui/secrets/passwd"
+
+if os.geteuid() != 0:
+    sys.exit("run as root")
+if "--stdin" in sys.argv:
+    p1 = sys.stdin.readline().rstrip("\n")
+else:
+    p1 = getpass.getpass("New UI passphrase: ")
+    if getpass.getpass("Repeat: ") != p1:
+        sys.exit("mismatch")
+if len(p1) < 12:
+    sys.exit("refusing passphrase shorter than 12 characters")
+os.makedirs(os.path.dirname(DEST), mode=0o700, exist_ok=True)
+tmp = DEST + ".tmp"
+with open(tmp, "w") as f:
+    f.write(ui_logic.hash_passphrase(p1) + "\n")
+u = pwd.getpwnam("proteus-ui")
+os.chown(tmp, u.pw_uid, u.pw_gid)
+os.chmod(tmp, 0o600)
+os.rename(tmp, DEST)
+print("passphrase updated")

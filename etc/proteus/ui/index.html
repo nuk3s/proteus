@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>proteus</title>
+<style>
+:root{--ground:#1B1815;--panel:#201D17;--card:#232019;--card2:#26221a;--hair:#332e26;
+--border:#4A4436;--amber:#E0883C;--amber2:#D7A55F;--moss:#7E7A46;--mossL:#B7C08A;
+--bone:#D8CBB4;--hd:#E8E0CF;--mut:#8f8a7a;--dim:#6b6455;--ok:#87AF87;--warn:#D7A55F;--bad:#D75F5F}
+*{box-sizing:border-box;border-radius:0!important}
+body{background:var(--ground);color:var(--bone);margin:0;
+font:13px/1.55 "DejaVu Sans Mono","Courier New",monospace;
+background-image:radial-gradient(circle at 50% -20%,rgba(224,136,60,.05),transparent 60%)}
+.wrap{max-width:1120px;margin:0 auto;padding:18px 20px 60px}
+.mut{color:var(--mut)}.dim{color:var(--dim)}.ok{color:var(--ok)}.bad{color:var(--bad)}
+.warn{color:var(--warn)}.moss{color:var(--mossL)}.amber{color:var(--amber)}.hd{color:var(--hd)}
+.hidden{display:none!important}
+/* header */
+header{display:flex;align-items:center;gap:18px;border-bottom:1px solid var(--hair);
+padding-bottom:12px;margin-bottom:4px;flex-wrap:wrap}
+.word{color:var(--amber);font-weight:bold;letter-spacing:4px;font-size:16px}
+.tabs{display:flex;gap:4px}
+.tab{border:1px solid var(--hair);color:var(--mut);padding:3px 14px;cursor:pointer;
+letter-spacing:1px;text-transform:lowercase}
+.tab:hover{color:var(--bone)}
+.tab.on{border-color:var(--amber);color:var(--amber);background:var(--panel)}
+.spacer{flex:1}
+button{background:none;border:1px solid var(--border);color:var(--amber2);
+padding:3px 12px;cursor:pointer;font:inherit;letter-spacing:.5px}
+button:hover{border-color:var(--amber);color:var(--amber);background:var(--panel)}
+button:disabled{color:var(--dim);border-color:var(--hair);cursor:default;background:none}
+/* summary bar */
+.sumbar{display:flex;gap:22px;flex-wrap:wrap;align-items:center;
+background:var(--panel);border:1px solid var(--hair);padding:11px 16px;margin:16px 0}
+.sumbar .k{color:var(--dim);text-transform:uppercase;font-size:10px;letter-spacing:1px;
+margin-right:7px}
+.sumbar .stat{display:flex;flex-direction:column;gap:1px}
+.sumbar .big{font-size:15px;color:var(--hd)}
+.pill{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--hair);
+padding:2px 9px}
+.dot{width:8px;height:8px;display:inline-block;border-radius:50%!important;flex:0 0 auto}
+.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}
+.dot.idle{background:var(--dim)}
+/* section headings */
+.sec{color:var(--dim);text-transform:uppercase;letter-spacing:2px;font-size:11px;
+margin:26px 0 10px;display:flex;align-items:center;gap:10px}
+.sec::after{content:"";flex:1;height:1px;background:var(--hair)}
+/* exit cards */
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:12px}
+.exit{background:var(--card);border:1px solid var(--hair);padding:13px 15px;
+display:flex;flex-direction:column;gap:9px;transition:border-color .15s}
+.exit:hover{border-color:var(--border)}
+.exit.rot{border-color:var(--amber);background:var(--card2)}
+.exit .top{display:flex;align-items:center;gap:9px}
+.exit .name{color:var(--dim);letter-spacing:1px}
+.exit .score{margin-left:auto;color:var(--mut);font-size:11px}
+.exit .server{font-size:19px;color:var(--amber);letter-spacing:.5px;line-height:1.15}
+.exit .host{color:var(--mut);font-size:11px;word-break:break-all}
+.exit .host b{color:var(--mossL);font-weight:normal}
+.timeline{height:3px;background:var(--hair);position:relative;margin:3px 0 1px}
+.timeline i{position:absolute;left:0;top:0;bottom:0;background:var(--moss);opacity:.7}
+.exit .times{display:flex;justify-content:space-between;font-size:11px}
+.exit .metrics{display:flex;gap:16px;border-top:1px solid var(--hair);padding-top:8px;
+font-size:11px}
+.exit .metrics .m{display:flex;flex-direction:column}
+.exit .metrics .m .v{color:var(--hd);font-size:13px}
+.exit .metrics .m .l{color:var(--dim);font-size:9px;text-transform:uppercase;letter-spacing:.5px}
+.exit .act{margin-top:2px}
+/* dns + panels */
+.flat{background:var(--panel);border:1px solid var(--hair);padding:11px 15px}
+.panels{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:720px){.panels{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--hair);padding:11px 14px;
+max-height:260px;overflow-y:auto}
+.panel .hd{color:var(--dim);text-transform:uppercase;letter-spacing:1px;font-size:10px;
+margin-bottom:7px}
+.row{padding:3px 0;font-size:12px;border-bottom:1px solid var(--hair)}
+.row:last-child{border-bottom:0}
+/* knobs */
+.kgroup{margin-bottom:22px}
+.kgroup>.gh{color:var(--amber2);text-transform:uppercase;letter-spacing:2px;font-size:11px;
+border-bottom:1px solid var(--hair);padding-bottom:6px;margin-bottom:10px}
+.knob{display:grid;grid-template-columns:1fr auto;gap:4px 14px;align-items:baseline;
+padding:10px 0;border-bottom:1px solid var(--hair)}
+.knob:last-child{border-bottom:0}
+.knob .kl{color:var(--hd);font-size:13px}
+.knob .kh{color:var(--mut);font-size:11px;grid-column:1;max-width:52ch}
+.knob .kc{grid-column:2;grid-row:1/3;display:flex;align-items:center;gap:7px;align-self:center}
+.knob input{background:var(--ground);border:1px solid var(--border);color:var(--hd);
+padding:4px 7px;width:88px;font:inherit;text-align:right}
+.knob input:focus{outline:none;border-color:var(--amber)}
+.knob select{background:var(--ground);border:1px solid var(--border);color:var(--hd);
+padding:4px 7px;font:inherit}
+.knob select:focus{outline:none;border-color:var(--amber)}
+.knob .unit{color:var(--dim);font-size:11px;width:38px}
+.knob .def{color:var(--dim);font-size:10px;grid-column:1}
+.knob .warnk{color:var(--warn);font-size:10px}
+.msg{font-size:11px;margin-left:4px}
+/* health checks */
+.subh{color:var(--dim);text-transform:uppercase;letter-spacing:1px;font-size:10px;margin:12px 0 6px}
+.clist{display:flex;flex-direction:column;gap:5px}
+.crow{display:flex;align-items:center;gap:8px}
+.crow input{flex:1;background:var(--ground);border:1px solid var(--border);color:var(--hd);
+padding:4px 8px;font:inherit;min-width:0}
+.crow input:focus{outline:none;border-color:var(--amber)}
+.crow select{background:var(--ground);border:1px solid var(--border);color:var(--bone);
+padding:4px 6px;font:inherit}
+.crow.ro{color:var(--mut)}
+.crow input.bodyin{flex:0 1 30%;min-width:0;color:var(--mossL)}
+.bodynote{color:var(--dim);font-size:10px;white-space:nowrap;overflow:hidden;
+text-overflow:ellipsis;max-width:42%}
+.crow .curl{flex:1;color:var(--bone)}
+.tbadge{border:1px solid var(--hair);padding:1px 8px;font-size:10px;text-transform:uppercase;
+letter-spacing:.5px}
+.tbadge.mand{color:var(--warn);border-color:var(--warn)}
+.tbadge.adv{color:var(--mut)}
+.xbtn{color:var(--mut);border-color:var(--hair);padding:3px 8px}
+.xbtn:hover{color:var(--bad);border-color:var(--bad)}
+.ccontrols{display:flex;align-items:center;gap:8px;margin-top:9px}
+button.primary{border-color:var(--amber);color:var(--amber)}
+/* login */
+#login{position:fixed;inset:0;background:var(--ground);display:flex;
+align-items:center;justify-content:center;flex-direction:column;gap:14px;
+background-image:radial-gradient(circle at 50% 38%,rgba(224,136,60,.07),transparent 55%)}
+#login .word{font-size:26px}
+#login input{background:var(--card);border:1px solid var(--border);color:var(--hd);
+padding:8px 12px;font:inherit;width:280px;text-align:center}
+#login input:focus{outline:none;border-color:var(--amber)}
+#loginerr{min-height:16px;font-size:12px}
+.sub{color:var(--dim);font-size:11px}
+</style></head><body>
+
+<div id="login" class="hidden">
+  <div class="word">PROTEUS</div>
+  <div class="sub">private egress control</div>
+  <input id="pw" type="password" placeholder="passphrase" autofocus>
+  <button id="unlock">unlock</button>
+  <div id="loginerr" class="bad"></div>
+</div>
+
+<div id="app" class="hidden"><div class="wrap">
+  <header>
+    <span class="word">PROTEUS</span>
+    <div class="tabs">
+      <span class="tab on" data-tab="overview">overview</span>
+      <span class="tab" data-tab="settings">settings</span>
+    </div>
+    <span class="spacer"></span>
+    <button id="lock">lock</button>
+  </header>
+
+  <div id="overview">
+    <div class="sumbar" id="sumbar"></div>
+    <div class="sec">exit servers</div>
+    <div class="grid" id="exits"></div>
+    <div class="sec">dns tunnel</div>
+    <div class="flat" id="dns"></div>
+    <div class="panels" style="margin-top:22px">
+      <div class="panel"><div class="hd">recent changes</div><div id="hist"></div></div>
+      <div class="panel"><div class="hd">connected clients</div><div id="clients"></div></div>
+    </div>
+  </div>
+
+  <div id="settings" class="hidden"></div>
+</div></div>
+
+<script>
+"use strict";
+let S=null,timer=null,knobsDrawn=false;
+let TOKEN=localStorage.getItem("proteus_token")||"";
+const $=id=>document.getElementById(id);
+const el=(tag,cls,text)=>{const e=document.createElement(tag);
+  if(cls)e.className=cls;if(text!=null)e.textContent=text;return e};
+const api=(p,o={})=>fetch(p,{...o,headers:{"Content-Type":"application/json",
+  ...(TOKEN?{"Authorization":"Bearer "+TOKEN}:{}),...(o.headers||{})}});
+
+function setToken(t){TOKEN=t||"";if(t)localStorage.setItem("proteus_token",t);
+  else localStorage.removeItem("proteus_token");}
+function show(auth){$("login").classList.toggle("hidden",auth);
+  $("app").classList.toggle("hidden",!auth);if(!auth)knobsDrawn=false;}
+function loggedOut(){setToken("");show(false);}
+async function login(){
+  const r=await api("/api/login",{method:"POST",body:JSON.stringify({passphrase:$("pw").value})});
+  if(r.ok){const j=await r.json().catch(()=>({}));setToken(j.token);
+    $("pw").value="";show(true);poll();}
+  else $("loginerr").textContent=r.status===429?"locked out — wait a minute":"wrong passphrase";
+}
+function tab(t){document.querySelectorAll(".tab").forEach(e=>e.classList.toggle("on",e.dataset.tab===t));
+  $("overview").classList.toggle("hidden",t!=="overview");
+  $("settings").classList.toggle("hidden",t!=="settings");}
+
+/* time helpers */
+function dur(s){if(s==null||isNaN(s))return"—";s=Math.abs(s);
+  const d=~~(s/86400),h=~~(s%86400/3600),m=~~(s%3600/60);
+  if(d)return`${d}d ${h}h`;if(h)return`${h}h ${m}m`;if(m)return`${m}m`;return`${~~s}s`}
+const nowS=()=>Date.now()/1000;
+const secSince=iso=>iso?nowS()-new Date(iso).getTime()/1000:null;
+const ago=iso=>{const s=secSince(iso);return s==null?"unknown":dur(s)+" ago"};
+const inFut=ts=>ts==null?"—":(ts-nowS()<=0?"any moment":"in "+dur(ts-nowS()));
+const fmtTime=ts=>new Date(ts*1000).toLocaleString([], {month:"short",day:"numeric",
+  hour:"2-digit",minute:"2-digit"});
+
+function healthDot(s){
+  const st=s.rotating?"warn":(s.status==="ok"?"ok":(s.status==="down"?"bad":
+    (s.health&&s.health.stale?"warn":"idle")));
+  return el("span","dot "+st);
+}
+function serverName(s){ // "US-TX #97" from "US-TX#97"
+  if(!s.logical)return"(not yet known)";
+  return s.logical.replace("#"," #");
+}
+
+/* --- overview --- */
+function renderSummary(){
+  const sys=S.system,sb=$("sumbar");
+  const rot=S.slots.filter(s=>/^proton-[1-9]$/.test(s.name));
+  const healthy=rot.filter(s=>s.status==="ok").length;
+  const clients=(S.clients||[]).length;
+  const parts=[
+    ["exit servers", `${healthy}/${rot.length} healthy`, healthy===rot.length?"ok":"warn"],
+    ["exit country", (sys.exit_country||"?"), null],
+    ["auto-rotation", sys.paused?"PAUSED":"on", sys.paused?"warn":"ok"],
+    ["clients", clients?`${clients} pinned`:"none pinned", null],
+  ];
+  sb.replaceChildren();
+  parts.forEach(([k,v,tone],i)=>{
+    if(i)sb.append(el("span","dim","·"));
+    const st=el("span","stat");
+    st.append(el("span","k",k));
+    const val=el("span","big"+(tone?" "+tone:""),v);
+    st.append(val);
+    sb.append(st);
+  });
+}
+
+function metric(v,l){const m=el("div","m");m.append(el("span","v",v),el("span","l",l));return m;}
+
+function exitCard(s){
+  const c=el("div","exit"+(s.rotating?" rot":""));
+  const top=el("div","top");
+  top.append(healthDot(s),el("span","name",s.name));
+  if(s.health&&s.health.score!=null)top.append(el("span","score","health "+Math.round(+s.health.score)));
+  c.append(top);
+  // server
+  c.append(el("div","server",s.rotating?"rotating…":serverName(s)));
+  const host=el("div","host");
+  if(s.physical_domain){host.append(el("b",null,s.physical_domain));
+    if(s.exit_ip)host.append(document.createTextNode(" · "+s.exit_ip));}
+  else if(s.exit_ip)host.append(document.createTextNode(s.exit_ip));
+  else host.append(document.createTextNode("—"));
+  c.append(host);
+  // rotation timeline: minted -> next_rotation
+  const minted=s.minted_at?new Date(s.minted_at).getTime()/1000:null;
+  if(minted&&s.next_rotation&&s.next_rotation>minted){
+    const frac=Math.max(0,Math.min(1,(nowS()-minted)/(s.next_rotation-minted)));
+    const tl=el("div","timeline");const i=el("i");i.style.width=(frac*100).toFixed(1)+"%";
+    tl.append(i);c.append(tl);
+  }
+  const times=el("div","times");
+  times.append(el("span","mut","changed "+ago(s.minted_at||s.up_since)),
+               el("span","moss","rotates "+inFut(s.next_rotation)));
+  c.append(times);
+  // metrics
+  if(s.health&&s.health.latency_ms!=null){
+    const met=el("div","metrics");
+    met.append(metric((s.health.latency_ms??"—")+" ms","latency"),
+               metric((s.health.jitter_ms??"—")+" ms","jitter"),
+               metric((s.health.throughput_mbps??"—")+" Mbps","throughput"));
+    c.append(met);
+  }
+  // rotate action
+  const act=el("div","act");
+  const b=el("button",null,s.rotating?"rotating…":"rotate now");
+  b.disabled=!!s.rotating;
+  b.addEventListener("click",()=>act_rotate(s.name,b));
+  act.append(b);c.append(act);
+  return c;
+}
+
+function renderExits(){
+  const rot=S.slots.filter(s=>/^proton-[1-9]$/.test(s.name));
+  $("exits").replaceChildren(...rot.map(exitCard));
+}
+
+function renderDns(){
+  const d=S.slots.find(s=>!/^proton-[1-9]$/.test(s.name));
+  const box=$("dns");box.replaceChildren();
+  if(!d){box.append(el("span","dim","no dns tunnel"));return;}
+  // The DNS tunnel has no per-slot health prober (it rotates on resolver
+  // latency, not a score), so its backend status is "unknown" and healthDot
+  // would paint it idle-grey — making a working tunnel look broken next to the
+  // scored exit cards. Its honest health signal is simply "is it up": show it
+  // green when the tunnel has an exit, red only if it has none.
+  const up=!!(d.exit_ip||d.logical);
+  const line=el("div",null);
+  line.append(el("span","dot "+(up?"ok":"bad"))," ",el("span","name",d.name+"  "));
+  const srv=el("span","amber",serverName(d));srv.style.fontSize="15px";
+  line.append(srv);
+  if(d.physical_domain)line.append(el("span","mut","  "+d.physical_domain));
+  if(d.exit_ip)line.append(el("span","dim","  · "+d.exit_ip));
+  box.append(line);
+  box.append(el("div","sub","up "+dur(secSince(d.up_since))+
+    " · rotates only when resolver latency is high (not on a schedule)"));
+}
+
+function renderPanels(){
+  const h=(S.history||[]).map(e=>{
+    const r=el("div","row");
+    const o=(e.old_logical&&e.old_logical!=="?")?e.old_logical:"new";
+    r.append(el("span","dim",fmtTime(e.ts)+"  "),
+      el("span","amber",e.slot+" "),
+      document.createTextNode(o+" → "),
+      el("span","moss",e.new_logical+" "),
+      el("span",e.outcome==="promoted"?"mut":"bad",e.trigger+"/"+e.outcome));
+    return r;});
+  $("hist").replaceChildren(...(h.length?h:[el("div","dim","no changes recorded yet")]));
+  const cl=(S.clients||[]).map(c=>{
+    const r=el("div","row");
+    r.append(el("span","hd",c.ip),document.createTextNode(" → "),
+      el("span","amber",c.slot),el("span","dim","  expires in "+dur(c.ttl_s)));
+    return r;});
+  $("clients").replaceChildren(...(cl.length?cl:[el("div","dim",
+    "no clients pinned yet — a client gets pinned the first time it sends traffic")]));
+}
+
+function render(){
+  if(!S)return;
+  renderSummary();renderExits();renderDns();renderPanels();
+  if(!knobsDrawn){renderKnobs();knobsDrawn=true;}
+}
+
+/* --- settings / knobs --- */
+const GROUP_TITLES={rotation:"Rotation",gates:"Quality gates","proton-dns":"Exit & DNS",
+  network:"Client network",advanced:"Advanced tuning"};
+function renderKnobs(){
+  const k=S.knobs,root=el("div");
+  // pause/resume control up top
+  const pg=el("div","kgroup");
+  pg.append(el("div","gh","Auto-rotation"));
+  const prow=el("div","knob");
+  const pl=el("div","kl",S.system.paused?"Auto-rotation is PAUSED":"Auto-rotation is ON");
+  const ph=el("div","kh",S.system.paused
+    ?"Slots will not rotate on their own. Manual rotate still works."
+    :"Slots rotate on their daily schedule and when a server goes bad.");
+  const pc=el("div","kc");
+  const pb=el("button",null,S.system.paused?"resume":"pause");
+  pb.addEventListener("click",()=>{act_action(S.system.paused?"resume":"pause");knobsDrawn=false;});
+  pc.append(pb);prow.append(pl,pc,ph);pg.append(prow);root.append(pg);
+  renderChecks(root);
+  // grouped knobs
+  const groups={};k.schema.forEach(s=>{(groups[s.group]??=[]).push(s)});
+  for(const g of ["rotation","gates","proton-dns","network","advanced"]){
+    if(!groups[g])continue;
+    const gd=el("div","kgroup");gd.append(el("div","gh",GROUP_TITLES[g]||g));
+    for(const s of groups[g]){
+      const cur=k.values[s.key];
+      const hasChoices=s.choices&&s.choices.length;
+      const row=el("div","knob");
+      row.append(el("div","kl",s.label||s.key));
+      let inp;
+      if(hasChoices){
+        inp=el("select");
+        const sel=(cur!=null?cur:s.default);
+        s.choices.forEach(ch=>{const o=el("option",null,ch);o.value=ch;
+          if(ch===sel)o.selected=true;inp.append(o)});
+      }else{
+        inp=el("input");inp.value=(cur!=null?cur:"");
+        inp.placeholder=(s.default!==""?s.default:(s.lo!=null?s.lo+"–"+s.hi:""));
+      }
+      const err=el("span","msg");
+      const btn=el("button",null,"apply");
+      // Only dispatcher-kicking knobs drop client pins; others (e.g. the
+      // isolation toggle) apply instantly with no disruption — don't scare-warn.
+      const kicksDispatcher=!!(s.kick&&/dispatcher/.test(s.kick));
+      btn.addEventListener("click",()=>setKnob(s.key,kicksDispatcher,inp,err));
+      const kc=el("div","kc");
+      kc.append(inp);
+      if(s.unit)kc.append(el("span","unit",s.unit));
+      kc.append(btn,err);
+      row.append(kc);
+      if(s.help)row.append(el("div","kh",s.help));
+      const def=el("div","def");
+      const detail=hasChoices
+        ?`current ${cur!=null?cur:s.default+" (default)"} · options ${s.choices.join(" | ")} · applies ${s.applies}`
+        :`current ${cur!=null?cur:s.default+" (default)"} · range ${s.lo??"–"}–${s.hi??"–"} · applies ${s.applies}`;
+      def.append(document.createTextNode(detail));
+      if(kicksDispatcher)def.append(el("span","warnk","  ⚠ restarts the dispatcher — new connections fail for about a second"));
+      row.append(def);
+      gd.append(row);
+    }
+    root.append(gd);
+  }
+  $("settings").replaceChildren(root);
+}
+
+/* --- health checks editor --- */
+const hostOf=u=>{try{return new URL(u).host}catch(e){return String(u||"").replace(/^https?:\/\//,"").replace(/\/.*$/,"")}};
+function tierBadge(t){return el("span",t==="mandatory"?"tbadge mand":"tbadge adv",t)}
+function tierSelect(sel){
+  const s=el("select");
+  ["mandatory","advisory"].forEach(t=>{const o=el("option",null,t);o.value=t;if(t===sel)o.selected=true;s.append(o)});
+  return s;
+}
+function addCheckRow(list,url,tier,body){
+  const row=el("div","crow");
+  const inp=el("input");inp.value=url||"";inp.placeholder="e.g. netflix.com or a full url";inp.spellcheck=false;
+  const bd=el("input","bodyin");bd.value=body||"";bd.spellcheck=false;
+  bd.placeholder="optional: page must contain…";
+  bd.title="Leave blank to only check the status code. Streaming sites answer 200 "+
+    "even from an exit they won't serve video to, so a text match is the only way "+
+    "to tell a working exit from a blocked one.";
+  const ts=tierSelect(tier||"advisory");
+  const rm=el("button","xbtn","remove");
+  rm.addEventListener("click",()=>row.remove());
+  row.append(inp,bd,ts,rm);row.dataset.custom="1";
+  list.append(row);
+  return row;
+}
+function renderChecks(root){
+  const c=(S.checks||{builtin:[],custom:[]});
+  const g=el("div","kgroup");
+  g.append(el("div","gh","Health checks"));
+  g.append(el("div","kh","Sites that verify a newly-minted exit actually works before it goes "+
+    "live. They run in a throwaway tunnel during rotation — they don't create an ongoing link "+
+    "between your live exit and these sites. The optional \u201cmust contain\u201d text checks the page body, not just the status code \u2014 streaming sites answer 200 even from an exit they won\u2019t play video on."));
+  // built-in (read-only)
+  g.append(el("div","subh","Built-in (read-only)"));
+  const bl=el("div","clist");
+  (c.builtin||[]).forEach(x=>{
+    const r=el("div","crow ro");
+    r.append(el("span","curl",hostOf(x.url)));
+    if(x.body)r.append(el("span","bodynote","must contain: "+x.body));
+    r.append(tierBadge(x.tier));
+    bl.append(r);
+  });
+  g.append(bl);
+  // custom (editable)
+  g.append(el("div","subh","Your checks"));
+  const list=el("div","clist");
+  (c.custom||[]).forEach(x=>addCheckRow(list,x.url,x.tier,x.body));
+  g.append(list);
+  const controls=el("div","ccontrols");
+  const add=el("button",null,"+ add check");
+  add.addEventListener("click",()=>addCheckRow(list,"","advisory",""));
+  const save=el("button","primary","save checks");
+  const msg=el("span","msg");
+  save.addEventListener("click",()=>saveChecks(list,msg));
+  controls.append(add,save,msg);
+  g.append(controls);
+  g.append(el("div","warnk","⚠ Mandatory: a single block on that site rejects every exit "+
+    "attempt until you remove it or make it advisory. Use advisory unless you truly require the site."));
+  root.append(g);
+}
+async function saveChecks(list,msg){
+  const checks=[];
+  for(const row of list.querySelectorAll(".crow[data-custom]")){
+    const ins=row.querySelectorAll("input");
+    const raw=ins[0].value.trim();
+    const body=(ins[1]?ins[1].value:"").trim();
+    const tier=row.querySelector("select").value;
+    if(!raw)continue;
+    // accept a bare host and prepend the page's scheme (no literal in source)
+    const url=/^https?:\/\//.test(raw)?raw:location.protocol+"//"+raw;
+    const c={url,tier};
+    if(body)c.body=body;
+    checks.push(c);
+  }
+  const r=await api("/api/checks",{method:"POST",body:JSON.stringify({checks})});
+  if(r.status===401)return loggedOut();
+  const j=await r.json().catch(()=>({}));
+  if(r.ok){msg.textContent="✓ saved";msg.className="msg ok";knobsDrawn=false;}
+  else{msg.textContent="✗ "+(j.error??"error");msg.className="msg bad";}
+}
+async function setKnob(key,kicks,inp,err){
+  if(kicks&&!confirm("This restarts the dispatcher. Devices already connected keep their assigned exit — pins live in the kernel and survive. Brand-new connections may fail for about a second. Continue?"))return;
+  const r=await api("/api/knobs",{method:"POST",body:JSON.stringify({key,value:inp.value.trim()})});
+  if(r.status===401){loggedOut();return;}
+  const j=await r.json().catch(()=>({}));
+  err.textContent=r.ok?"✓ saved":("✗ "+(j.error??"error"));
+  err.className="msg "+(r.ok?"ok":"bad");
+}
+async function act_action(action){
+  const r=await api("/api/action",{method:"POST",body:JSON.stringify({action})});
+  if(r.status===401)loggedOut();else poll();
+}
+async function act_rotate(slot,btn){
+  if(btn){btn.disabled=true;btn.textContent="starting…";}
+  const r=await api("/api/action",{method:"POST",body:JSON.stringify({action:"rotate",slot})});
+  if(r.status===401)return loggedOut();
+  poll();
+}
+async function poll(){
+  clearTimeout(timer);
+  try{
+    const r=await api("/api/status");
+    if(r.status===401)return loggedOut();
+    S=await r.json();show(true);render();
+  }catch(e){/* transient; retry next tick */}
+  timer=setTimeout(poll,5000);
+}
+$("unlock").addEventListener("click",login);
+$("pw").addEventListener("keydown",e=>{if(e.key==="Enter")login();});
+$("lock").addEventListener("click",()=>{api("/api/logout",{method:"POST"});loggedOut();});
+document.querySelectorAll(".tab").forEach(e=>e.addEventListener("click",()=>tab(e.dataset.tab)));
+poll();
+</script></body></html>

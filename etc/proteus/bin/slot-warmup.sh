@@ -18,21 +18,23 @@ LOG_TAG=slot-warmup
 HEALTH_DIR=/run/proteus-slot-health
 # DNS netns name from the installer env; fall back to production's dns-6.
 [[ -r /etc/proteus/proteus.env ]] && source /etc/proteus/proteus.env
+# UI-set overrides survive installer re-runs
+[ -f /etc/proteus/proteus-local.env ] && . /etc/proteus/proteus-local.env
 DNS_NS="ns-${PROTEUS_DNS_INSTANCE:-dns-6}"
 # The slot probe is DNS-free: the netns resolvers are reached through the very
-# tunnel being probed, so an upstream resolver rate-limiting that slot's exit
-# IP (seen live 2026-07: Quad9 dropping UDP/53 from certain Proton exits)
-# turned into ALL_FAIL streaks that poisoned slot health while the data plane
-# was fine. The target is resolved once per pass via local unbound (which
+# tunnel being probed, so a resolver rate-limiting that slot's exit IP (seen
+# live 2026-07 with the public resolvers the netns files still point at: Quad9
+# dropping UDP/53 from certain Proton exits) turned into ALL_FAIL streaks that
+# poisoned slot health while the data plane was fine. The target is resolved once per pass via local unbound (which
 # egresses over the dedicated DNS tunnel, never the probed slot), cached under
 # HEALTH_DIR, with a pinned last-resort IP. curl --resolve keeps SNI/Host
 # correct, so the TLS hit is unchanged from the exit's point of view.
 WARMUP_HOST="${PROTEUS_WARMUP_HOST:-proton.me}"
 WARMUP_IP_FALLBACK="${PROTEUS_WARMUP_IP_FALLBACK:-185.70.42.45}"
 WARMUP_IP_CACHE="$HEALTH_DIR/.warmup-target-ip"
-DEGRADED_AFTER=2          # consecutive ALL_FAILs before a slot is DEGRADED
-ROT_THRESHOLD=5           # consecutive ALL_FAILs before auto-rotation fires
-ROT_COOLDOWN=300          # seconds between auto-rotation triggers per slot
+DEGRADED_AFTER="${PROTEUS_DEGRADED_AFTER:-2}"    # consecutive ALL_FAILs before a slot is DEGRADED
+ROT_THRESHOLD="${PROTEUS_ROT_THRESHOLD:-5}"      # consecutive ALL_FAILs before auto-rotation fires
+ROT_COOLDOWN="${PROTEUS_ROT_COOLDOWN:-300}"      # seconds between auto-rotation triggers per slot
 
 # --- composite scoring (see the design notes)
 JITTER_WINDOW_SAMPLES=15                                                   # ~5min @20s passes
@@ -147,9 +149,17 @@ EOF
     mv "$tmp" "$file"
 
     if (( triggered )); then
-        logger -t "$LOG_TAG" "$inst auto-rotation triggered (fail_streak=$fail_streak)"
-        systemctl start --no-block "proteus-rotate-slot@$inst.service" || \
-            logger -t "$LOG_TAG" "$inst auto-rotation failed to start"
+        if [[ -f /etc/proteus/state/rotation-paused ]]; then
+            logger -t "$LOG_TAG" "$inst tier-2 rotation suppressed (paused, fail_streak=$fail_streak)"
+        else
+            logger -t "$LOG_TAG" "$inst auto-rotation triggered (fail_streak=$fail_streak)"
+            # Filename matches proteus-ui-apply's trigger convention (bare
+            # slot name under /run/proteus, no "trigger-" prefix) so
+            # rotate-slot.sh's single trigger-file read path works for both.
+            mkdir -p /run/proteus && echo health > "/run/proteus/$inst"
+            systemctl start --no-block "proteus-rotate-slot@$inst.service" || \
+                logger -t "$LOG_TAG" "$inst auto-rotation failed to start"
+        fi
     fi
 }
 
@@ -239,15 +249,20 @@ warm_one() {
 # pool (no scoring/health state), but its Proton exit-side flow-state goes cold
 # after ~25-35s idle exactly like the slots — so under light DNS load the first
 # query after an idle gap hits the cold-catch and times out (SERVFAIL/no reply)
-# before a retry warms it. A cheap neutral query (root NS, cached at Quad9)
-# through the tunnel keeps that path warm. Best-effort: if dns-6 is mid-rotation
-# the netns is briefly gone and this no-ops.
+# before a retry warms it. A cheap neutral query (root NS, answered straight out
+# of the in-tunnel resolver's cache) through the tunnel keeps that path warm.
+# Best-effort: if dns-6 is mid-rotation the netns is briefly gone and this
+# no-ops.
 warm_dns6() {
-    # TCP, not UDP: unbound forwards over DoT (tcp/853), so TCP flow state is
-    # what needs warming — and the old every-pass UDP dig (~6,500 queries/day
-    # per exit) was itself the abuse signal that tripped Quad9's UDP limiter
-    # and blackholed the exit. One TCP transaction per pass is plenty.
-    ip netns exec "$DNS_NS" dig +tcp @9.9.9.9 +time=2 +tries=1 . NS \
+    # UDP, matching unbound's forward-zone to 10.2.0.1 — UDP flow state is what
+    # needs warming again. This was +tcp @9.9.9.9 for a real reason worth
+    # remembering: unbound used to forward over DoT (tcp/853), and the
+    # every-pass UDP dig (~6,500 queries/day per exit) was itself the abuse
+    # signal that tripped Quad9's UDP limiter and blackholed the exit. That
+    # hazard is gone for an in-tunnel resolver — Proton does not rate-limit its
+    # own gateway address and the query never leaves the tunnel — so if this
+    # ever forwards to a public resolver again, restore +tcp first.
+    ip netns exec "$DNS_NS" dig @10.2.0.1 +time=2 +tries=1 . NS \
         >/dev/null 2>&1 || true
 }
 

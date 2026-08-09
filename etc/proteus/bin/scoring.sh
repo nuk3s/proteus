@@ -8,16 +8,16 @@
 SCORE_BASE_HEALTHY=50
 SCORE_BASE_DEGRADED=-1000
 SCORE_LAT_MAX=30           # ms-term ceiling
-SCORE_LAT_COEF=0.1         # ms*coef subtracted from ceiling
+SCORE_LAT_COEF="${PROTEUS_SCORE_LAT_COEF:-0.1}"   # ms*coef subtracted from ceiling
 SCORE_JIT_MAX=20           # ms-term ceiling
-SCORE_JIT_COEF=0.5
+SCORE_JIT_COEF="${PROTEUS_SCORE_JIT_COEF:-0.5}"
 # Throughput term. Real exit capacity is ~44-289 Mbps (see
 # the design notes),
 # so the old ceiling of 30 Mbps saturated for every slot. Differentiate across
 # 0-100 Mbps (100+ is far past any streaming need) at a weight that keeps the
 # term's max (~30) comparable to the latency term rather than dominating.
 SCORE_TP_MAX=100           # Mbps-term ceiling
-SCORE_TP_WEIGHT=0.3        # multiplier on the throughput term (max term = 30)
+SCORE_TP_WEIGHT="${PROTEUS_SCORE_TP_WEIGHT:-0.3}" # multiplier on the throughput term (max term = 30)
 
 # compute_score <status> <mean_latency_ms> <jitter_ms> <throughput_mbps>
 # Empty / missing throughput is treated as 0. Status is "ok" or "degraded".

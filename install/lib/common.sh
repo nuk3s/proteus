@@ -6,15 +6,30 @@ log()  { printf '[install] %s\n' "$*"; }
 warn() { printf '[install] WARN: %s\n' "$*" >&2; }
 die()  { printf '[install] ERROR: %s\n' "$*" >&2; return 1; }
 
-REQUIRED_KEYS=(MGMT_IFACE CLIENT_IFACE MGMT_CIDR CLIENT_VLAN_CIDR CLIENT_GW_IP)
+REQUIRED_KEYS=(MGMT_IFACE CLIENT_IFACE MGMT_CIDR CLIENT_VLAN_CIDR CLIENT_GW_IP UI_PORT)
 
 # Defaults applied if the config omits them.
 _apply_defaults() {
     : "${SLOT_COUNT:=5}"
+    # Per-netns /etc/netns/*/resolv.conf only (reputation probes + anything run
+    # with `ip netns exec`). Deliberately NOT the gateway resolver's forwarder:
+    # pointing the probe namespaces at NetShield would couple exit health-checking
+    # to an ad blocklist, so a user who adds an ad domain to the custom check list
+    # would make every exit look broken and wedge rotation.
     : "${DNS_UPSTREAMS:=9.9.9.9 9.9.9.10 149.112.112.10}"
+    # The gateway resolver's forwarder (unbound's forward-zone) and only that.
+    # 10.2.0.1 is the gateway address inside EVERY Proton WireGuard tunnel, i.e.
+    # Proton's in-tunnel NetShield resolver, so it needs no rewrite when the DNS
+    # tunnel rotates to another exit and its ads/trackers/malware filtering
+    # actually reaches clients (client port-53 traffic is redirected to unbound).
+    # Measured ~12ms UDP, 0 loss over ~100 queries. Point this at a public
+    # resolver and render.sh puts the validator and DoT back automatically.
+    : "${UNBOUND_UPSTREAM:=10.2.0.1}"
     : "${PROTON_COUNTRY:=US}"
     : "${STREAMING_MIN_MBPS:=25}"
     : "${NFT_REVERT_SECONDS:=900}"
+    : "${UI_PORT:=8443}"
+    : "${UI_MGMT_EXTRA:=127.0.0.1/32}"
 }
 
 load_config() {
@@ -83,12 +98,19 @@ validate_config() {
     done
     valid_cidr "$MGMT_CIDR" && valid_cidr "$CLIENT_VLAN_CIDR" && valid_ipv4 "$CLIENT_GW_IP" \
         || { die "MGMT_CIDR/CLIENT_VLAN_CIDR must be IPv4 CIDRs (a.b.c.d/len) and CLIENT_GW_IP an IPv4 address"; return 1; }
+    # Bare address, no port and no CIDR: render.sh appends the DoT form
+    # (@853#authname) itself, and unbound rejects the whole forward-zone if the
+    # forward-addr it builds is malformed.
+    valid_ipv4 "$UNBOUND_UPSTREAM" \
+        || { die "UNBOUND_UPSTREAM must be a single bare IPv4 address (got '$UNBOUND_UPSTREAM')"; return 1; }
     ip_in_cidr "$CLIENT_GW_IP" "$CLIENT_VLAN_CIDR" \
         || { die "CLIENT_GW_IP ($CLIENT_GW_IP) must lie inside CLIENT_VLAN_CIDR ($CLIENT_VLAN_CIDR)"; return 1; }
     ! cidrs_overlap "$MGMT_CIDR" "$CLIENT_VLAN_CIDR" \
         || { die "MGMT_CIDR and CLIENT_VLAN_CIDR must not overlap"; return 1; }
     [[ "$SLOT_COUNT" =~ ^[0-9]+$ ]] && (( SLOT_COUNT >= 1 && SLOT_COUNT <= 9 )) \
         || { die "SLOT_COUNT must be an integer 1-9 (got '$SLOT_COUNT')"; return 1; }
+    [[ "$UI_PORT" =~ ^[0-9]+$ ]] && (( UI_PORT >= 1024 && UI_PORT <= 65535 )) \
+        || { die "UI_PORT must be an integer 1024-65535 (got '$UI_PORT')"; return 1; }
     return 0
 }
 

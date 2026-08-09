@@ -24,10 +24,30 @@ CLIENT_GW_IP=172.16.1.5
 # staged rotation, e.g. v-proton-10-s-ns is 16 chars).
 SLOT_COUNT=5
 
-# Space-separated upstream DNS resolvers used both by the dedicated DNS
-# tunnel (unbound forward-zone) and as the per-netns resolv.conf for each
-# rotating slot.
+# Space-separated resolvers written to the per-netns resolv.conf of each
+# rotating slot. Used by the reputation probes and anything else run with
+# `ip netns exec` — NOT by the gateway resolver clients talk to (see
+# UNBOUND_UPSTREAM below). Keep these unfiltered: point the probe namespaces at
+# an ad blocklist and a domain on your custom check list makes every exit look
+# broken, which wedges rotation.
 DNS_UPSTREAMS="9.9.9.9 9.9.9.10 149.112.112.10"
+
+# The single upstream unbound forwards "." to — the resolver every client on
+# the VLAN ends up using, since their port-53 traffic is redirected to unbound.
+# Default 10.2.0.1 is the gateway address inside every Proton WireGuard tunnel,
+# i.e. Proton's in-tunnel NetShield resolver: it filters ads/trackers/malware at
+# the level baked into your tunnel certificates, it is reached over the
+# dedicated DNS tunnel (~12ms), and it never needs changing when that tunnel
+# rotates to a different exit.
+#
+# Consequence worth knowing: with an in-tunnel resolver the installer renders
+# unbound WITHOUT DNSSEC validation, because NetShield NXDOMAINs the DS query
+# for a blocked name too and a validating resolver would turn every blocked ad
+# domain into a SERVFAIL instead of a clean NXDOMAIN. 10.2.0.1 validates
+# upstream itself and the last hop is inside WireGuard. Set this to a public
+# resolver (e.g. 9.9.9.9) and the installer puts both the validator and
+# DNS-over-TLS back automatically — but then clients get no NetShield.
+UNBOUND_UPSTREAM=10.2.0.1
 
 # Proton country code used when minting new WireGuard configs.
 PROTON_COUNTRY=US
@@ -39,3 +59,12 @@ STREAMING_MIN_MBPS=25
 # Seconds before the apply-phase nftables auto-revert fires if you never
 # run `install.sh --confirm`. This is the SSH-lockout safety net.
 NFT_REVERT_SECONDS=900
+
+# TCP port the web UI (proteus-ui) listens on, HTTPS only. Reachable from
+# MGMT_CIDR and CLIENT_VLAN_CIDR (see nftables rules).
+UI_PORT=8443
+
+# One extra source CIDR allowed to reach the web UI on the mgmt interface, on
+# top of MGMT_CIDR. Use this for an admin/workstation subnet that isn't the
+# proxy's own mgmt network. Default 127.0.0.1/32 means "no extra source".
+UI_MGMT_EXTRA=127.0.0.1/32

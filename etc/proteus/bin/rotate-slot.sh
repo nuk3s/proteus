@@ -4,7 +4,12 @@
 # Usage: rotate-slot.sh <slot>      e.g. proton-1
 #
 # Flow (per attempt; up to MAX_ATTEMPTS):
-#   1. Mint a new WG config via proton-mint.
+#   1. Mint a new WG config via proton-mint. NOTE: since 2026-08, each slot owns
+#      a PERSISTENT per-slot WG key (proton-mint reuses it); a "mint" now only
+#      rotates the SERVER, not the key. See gotchas.md "Per-slot persistent WG
+#      keys". Caveat: staging (step 2) briefly runs this slot's key on a 2nd
+#      server alongside the live one, so the slot self-collides for the ~30s
+#      staging window — only this rotating slot, and MAX_ATTEMPTS absorbs it.
 #   2. Stage it in a parallel namespace ($slot-s) at index +100.
 #   3. Verify handshake + basic TLS egress in the staging namespace.
 #   4. Run reputation-probe.sh inside the staging ns.
@@ -37,11 +42,22 @@ MAX_ATTEMPTS="${MAX_ATTEMPTS:-5}"
 RETRY_SLEEP="${RETRY_SLEEP:-3}"
 AUTO_DIR="/etc/proteus/wg/proton/auto"
 LOG_TAG="rotate-${SLOT}"
+
+# This script has no other proteus.env dependency (vpnns-up.sh, called below,
+# sources its own config). It's always launched fresh by systemd
+# (ExecStart=, no EnvironmentFile=), so it can't inherit anything from a
+# parent shell. Load the UI-managed overlay directly so an operator-set
+# PROTEUS_STREAMING_MIN_MBPS knob reaches this process.
+[ -f /etc/proteus/proteus-local.env ] && . /etc/proteus/proteus-local.env
+
+# shellcheck source=/dev/null
+. /etc/proteus/bin/history.sh
+
 # Streaming gate: reject an exit that can't sustain streaming-grade bandwidth so
 # every promoted slot is streaming-capable. 4K needs ~25 Mbps; surveyed exits do
 # 44-289, so this rarely bites but stops the occasional dud. 25 MB probe (1 MB
 # rides slow-start; see the throughput-probe-artifact findings).
-STREAMING_MIN_MBPS="${STREAMING_MIN_MBPS:-25}"
+STREAMING_MIN_MBPS="${PROTEUS_STREAMING_MIN_MBPS:-${STREAMING_MIN_MBPS:-25}}"
 TPUT_URL="https://speed.cloudflare.com/__down?bytes=26214400"
 
 log() { logger -t "$LOG_TAG" -- "$*"; echo "[$(date -Iseconds)] $*"; }
@@ -78,6 +94,23 @@ systemctl start proteus-proton-api-whitelist.service || {
 cleanup_staging() {
     /etc/proteus/bin/vpnns-down.sh "$STAGE_NAME" >/dev/null 2>&1 || true
 }
+
+# Trigger attribution: the broker (manual, via the web UI) or slot-warmup.sh
+# (health, Tier-2) drop a one-shot trigger file before starting this unit;
+# absent that, treat the run as the timer-scheduled default. Consume (rm) it
+# immediately so a stale file can never mis-attribute a later run.
+# NOTE: filename is the bare slot name (no "trigger-" prefix) — this must
+# match proteus-ui-apply's TRIGGER_DIR/slot convention (see
+# etc/proteus/bin/proteus-ui-apply, cmd=="rotate": os.path.join(trigger_dir,
+# slot)), which is what actually writes "manual" for a UI-initiated rotation.
+TRIGGER_FILE="/run/proteus/$SLOT"
+TRIGGER=$(cat "$TRIGGER_FILE" 2>/dev/null || echo scheduled)
+rm -f "$TRIGGER_FILE"
+if [ -f /etc/proteus/state/rotation-paused ] && [ "$TRIGGER" != "manual" ]; then
+    log "rotation paused; skipping (trigger=$TRIGGER)"
+    exit 0
+fi
+OLD_LOGICAL=$(grep -s '^LOGICAL_NAME=' "/etc/proteus/state/$SLOT.meta" | cut -d= -f2- || true)
 
 # Each attempt: mint -> stage -> verify tunnel -> reputation probe.
 # On any failure: clean up this attempt's artifacts and continue loop.
@@ -200,6 +233,7 @@ done
 
 if [[ -z "$good_conf" ]]; then
     log "ERR: all $MAX_ATTEMPTS attempts failed — leaving current slot untouched"
+    history_append "$SLOT" "${OLD_LOGICAL:-?}" "${OLD_LOGICAL:-?}" "$TRIGGER" "all-fail" "${MAX_ATTEMPTS:-5}"
     exit 2
 fi
 
@@ -221,6 +255,37 @@ systemctl kill --signal=HUP proteus-dispatcher.service 2>/dev/null || \
 
 ln -sfn "$good_conf" "${AUTO_DIR}/${SLOT}.conf"
 log "promoted $SLOT -> $good_conf (exit_ip=$good_exit_ip)"
+
+# Display metadata for the web UI. proton-mint stamps every minted conf with
+# "# logical=" / "# exit_country=" header comments (see proton-mint's
+# out_path header) — read those back rather than re-deriving them.
+#
+# SECURITY: this metadata is THIRD-PARTY data (Proton's server names, via
+# their API) and MUST NOT go anywhere that gets dot-sourced as shell. The
+# .state file is sourced as root by repopulate-wg-peers.sh (every boot) and
+# vpnns-down.sh (every teardown) — a logical name like
+# "US-FREE#1$(touch /tmp/pwned)" would execute on source. So the display
+# metadata lives in a SEPARATE sidecar (.meta) that nothing sources, only
+# parsed as KEY=value by the daemon (proteus-ui / ui_logic.parse_kv). We also
+# strip control/newline chars as defense in depth, since a newline could
+# otherwise inject an extra KEY=value line into the sidecar.
+logical=$(sed -n 's/^# logical=//p' "$good_conf" | head -n1)
+exit_country=$(sed -n 's/^# exit_country=//p' "$good_conf" | head -n1)
+domain=$(sed -n 's/^# physical_domain=//p' "$good_conf" | head -n1)
+logical_clean=$(printf '%s' "$logical" | tr -d '\000-\037')
+country_clean=$(printf '%s' "$exit_country" | tr -d '\000-\037')
+domain_clean=$(printf '%s' "$domain" | tr -d '\000-\037')
+meta="/etc/proteus/state/$SLOT.meta"
+{
+    echo "LOGICAL_NAME=$logical_clean"
+    echo "EXIT_COUNTRY=$country_clean"
+    echo "PHYSICAL_DOMAIN=$domain_clean"
+    echo "EXIT_IP=$good_exit_ip"
+    echo "MINTED_AT=$(date -Is)"
+} > "$meta"
+chgrp proteus-ui "$meta" 2>/dev/null || true
+chmod 640 "$meta" 2>/dev/null || true
+history_append "$SLOT" "${OLD_LOGICAL:-?}" "$logical_clean" "$TRIGGER" "promoted" "${attempt:-1}"
 
 # 7) Prune — keep newest 2 auto-mints per slot.
 mapfile -t stale < <(

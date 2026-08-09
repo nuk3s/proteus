@@ -1,0 +1,14 @@
+[Unit]
+Description=Apply proteus client network-isolation mode to nftables
+# The @client_pivot set this toggles is defined in nftables.conf, so the
+# ruleset must be loaded first. If it runs early the script no-ops safely.
+After=nftables.service
+Wants=nftables.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/proteus/bin/proteus-client-isolation.sh
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target

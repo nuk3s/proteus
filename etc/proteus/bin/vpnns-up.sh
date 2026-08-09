@@ -14,6 +14,8 @@ set -euo pipefail
 # installer-rendered env; fall back to the historical production values so an
 # un-migrated box still works.
 [[ -r /etc/proteus/proteus.env ]] && source /etc/proteus/proteus.env
+# UI-set overrides survive installer re-runs
+[ -f /etc/proteus/proteus-local.env ] && . /etc/proteus/proteus-local.env
 CLIENT_VLAN_CIDR="${PROTEUS_CLIENT_VLAN_CIDR:-172.16.1.0/24}"
 # Default spreads across distinct Quad9 service IPs (secured 9.9.9.9 plus the
 # unsecured-tier 9.9.9.10 / 149.112.112.10): separate anycast service addresses
