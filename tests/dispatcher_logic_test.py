@@ -2,6 +2,7 @@
 from pathlib import Path
 import pytest
 
+import dispatcher_logic
 from dispatcher_logic import load_instances
 
 
@@ -279,3 +280,91 @@ def test_parse_source_pin_elements_with_ttl_skips_malformed() -> None:
         ["not-an-ip", "not-a-mark"],
     ]
     assert parse_source_pin_elements_with_ttl(elems) == [("172.16.1.10", 1, None)]
+
+
+# --- playability-biased pinning ------------------------------------------------
+def _mk_slot(tmp_path, name, score, *, playable=None, at=None, now=1000):
+    (tmp_path / f"{name}.state").write_text(
+        f"STATUS=ok\nCOMPOSITE_SCORE={score}\nSCORE_UPDATED_AT={now}\n")
+    if playable is not None:
+        (tmp_path / f".playability-state.{name}").write_text(
+            f"PLAYABLE={playable}\nAT={at if at is not None else now}\n")
+
+
+def test_new_pins_avoid_a_known_unplayable_slot(tmp_path):
+    # Equal scores and equal load: the only thing separating them is streaming.
+    _mk_slot(tmp_path, "proton-1", 100, playable="no")
+    _mk_slot(tmp_path, "proton-2", 100, playable="yes")
+    got = dispatcher_logic.pick_distributed(
+        [("proton-1", 1), ("proton-2", 2)], str(tmp_path), {}, now=1000)
+    assert got == ("proton-2", 2)
+
+
+def test_unplayable_slot_still_wins_if_it_is_the_only_one(tmp_path):
+    # Stranding a client is worse than handing it a slot that can't stream.
+    _mk_slot(tmp_path, "proton-1", 100, playable="no")
+    got = dispatcher_logic.pick_distributed(
+        [("proton-1", 1)], str(tmp_path), {}, now=1000)
+    assert got == ("proton-1", 1)
+
+
+def test_all_unplayable_falls_back_to_the_full_set(tmp_path):
+    # Every slot gated: keep normal least-loaded behaviour rather than None.
+    _mk_slot(tmp_path, "proton-1", 100, playable="no")
+    _mk_slot(tmp_path, "proton-2", 100, playable="no")
+    got = dispatcher_logic.pick_distributed(
+        [("proton-1", 1), ("proton-2", 2)], str(tmp_path), {2: 5}, now=1000)
+    assert got == ("proton-1", 1)          # least-loaded still decides
+
+
+def test_playability_does_not_override_load_spreading_among_playable(tmp_path):
+    _mk_slot(tmp_path, "proton-1", 100, playable="yes")
+    _mk_slot(tmp_path, "proton-2", 100, playable="yes")
+    got = dispatcher_logic.pick_distributed(
+        [("proton-1", 1), ("proton-2", 2)], str(tmp_path), {1: 9}, now=1000)
+    assert got == ("proton-2", 2)
+
+
+def test_stale_unplayable_verdict_is_ignored(tmp_path):
+    # A verdict older than the freshness window says nothing about the exit now.
+    _mk_slot(tmp_path, "proton-1", 100, playable="no",
+             at=1000 - dispatcher_logic.PLAYABILITY_FRESH_SECONDS - 1)
+    _mk_slot(tmp_path, "proton-2", 100, playable="yes")
+    got = dispatcher_logic.pick_distributed(
+        [("proton-1", 1), ("proton-2", 2)], str(tmp_path), {2: 9}, now=1000)
+    assert got == ("proton-1", 1)          # stale "no" ignored -> least-loaded wins
+
+
+def test_unknown_playability_is_treated_as_playable(tmp_path):
+    # No file at all (never checked, or just rotated) must not exclude a slot.
+    _mk_slot(tmp_path, "proton-1", 100)
+    _mk_slot(tmp_path, "proton-2", 100, playable="no")
+    got = dispatcher_logic.pick_distributed(
+        [("proton-1", 1), ("proton-2", 2)], str(tmp_path), {}, now=1000)
+    assert got == ("proton-1", 1)
+
+
+def test_is_playable_survives_garbage(tmp_path):
+    for body in ("", "junk", "PLAYABLE=no\nAT=notanumber\n", "PLAYABLE=maybe\n"):
+        (tmp_path / ".playability-state.proton-9").write_text(body)
+        assert dispatcher_logic.is_playable(str(tmp_path), "proton-9", 1000) is True
+    assert dispatcher_logic.is_playable(str(tmp_path), "proton-absent", 1000) is True
+
+
+def test_prefer_playable_can_be_disabled(tmp_path):
+    _mk_slot(tmp_path, "proton-1", 100, playable="no")
+    _mk_slot(tmp_path, "proton-2", 100, playable="yes")
+    got = dispatcher_logic.pick_distributed(
+        [("proton-1", 1), ("proton-2", 2)], str(tmp_path), {2: 9},
+        now=1000, prefer_playable=False)
+    assert got == ("proton-1", 1)
+
+
+def test_degraded_still_excluded_regardless_of_playability(tmp_path):
+    (tmp_path / "proton-1.state").write_text(
+        "STATUS=degraded\nCOMPOSITE_SCORE=100\nSCORE_UPDATED_AT=1000\n")
+    (tmp_path / ".playability-state.proton-1").write_text("PLAYABLE=yes\nAT=1000\n")
+    _mk_slot(tmp_path, "proton-2", 50, playable="no")
+    got = dispatcher_logic.pick_distributed(
+        [("proton-1", 1), ("proton-2", 2)], str(tmp_path), {}, now=1000)
+    assert got == ("proton-2", 2)          # degraded loses even to a gated slot

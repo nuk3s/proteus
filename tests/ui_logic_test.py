@@ -159,6 +159,50 @@ def test_lockout():
     assert not lo.locked("192.0.2.1", now=100.0)
 
 
+def test_lockout_global_ceiling_bounds_distributed_guessing():
+    # The per-source limit alone counts nothing an attacker can't choose: on a
+    # /24 they get limit*254 attempts. The global ceiling is the real bound.
+    lo = ui_logic.Lockout(limit=5, window_s=60, global_limit=20)
+    for i in range(20):
+        src = f"172.16.1.{i}"          # a fresh source every time
+        assert not lo.locked(src, now=100.0), i
+        lo.record_failure(src, now=100.0)
+    # Every individual source is still under its own limit (1 failure each)...
+    assert len(lo._fails["172.16.1.0"]) == 1
+    # ...but the global ceiling has been reached, so a brand-new source is locked.
+    assert lo.locked("172.16.1.200", now=100.0)
+    # It drains with the window rather than latching.
+    assert not lo.locked("172.16.1.200", now=161.0)
+
+
+def test_lockout_success_does_not_clear_the_global_counter():
+    # A valid login from one address says nothing about a distributed attack.
+    lo = ui_logic.Lockout(limit=5, window_s=60, global_limit=3)
+    for i in range(3):
+        lo.record_failure(f"10.0.0.{i}", now=100.0)
+    lo.clear("10.0.0.1")
+    assert lo.locked("10.0.0.99", now=100.0)
+
+
+def test_lockout_prunes_so_spoofed_sources_cannot_exhaust_memory():
+    lo = ui_logic.Lockout(limit=5, window_s=60, global_limit=10**9, max_sources=50)
+    for i in range(500):
+        lo.record_failure(f"10.1.%d.%d" % (i // 256, i % 256), now=100.0)
+    assert len(lo._fails) <= 50, len(lo._fails)
+    # aged entries disappear entirely rather than accumulating
+    lo.locked("10.1.0.0", now=100.0 + 61)
+    assert len(lo._fails) == 0 and lo._global == []
+
+
+def test_lockout_per_source_still_applies():
+    # The global ceiling must not have replaced the per-source one.
+    lo = ui_logic.Lockout(limit=3, window_s=60, global_limit=10**9)
+    for _ in range(3):
+        lo.record_failure("10.0.0.7", now=100.0)
+    assert lo.locked("10.0.0.7", now=100.0)
+    assert not lo.locked("10.0.0.8", now=100.0)
+
+
 def test_lockout_thread_safety():
     # ThreadingHTTPServer runs one thread per request, so record_failure and
     # locked() race each other across concurrent login attempts. limit is set

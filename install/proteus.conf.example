@@ -68,3 +68,14 @@ UI_PORT=8443
 # top of MGMT_CIDR. Use this for an admin/workstation subnet that isn't the
 # proxy's own mgmt network. Default 127.0.0.1/32 means "no extra source".
 UI_MGMT_EXTRA=127.0.0.1/32
+
+# Should devices on the CLIENT VLAN be able to reach the web UI?
+# The panel has no source-based authorisation: anyone who reaches it and has
+# the passphrase gets the same full-privilege UI as you do from the management
+# LAN — rotate exits, write knobs, drive the privileged broker. On a VLAN whose
+# whole purpose is to carry untrusted devices, that is usually not what you
+# want, so this defaults to "no" and the UI is reachable from MGMT_CIDR (plus
+# UI_MGMT_EXTRA) only.
+# Set to "yes" only if you administer the gateway from a device on the client
+# VLAN itself.
+UI_CLIENT_VLAN_ACCESS=no

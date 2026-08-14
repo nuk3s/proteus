@@ -102,6 +102,13 @@ KNOBS = {k.key: k for k in [
     Knob("PROTEUS_REP_MAX_MANDATORY_ERRORS", "gates", "int", 0, 5, applies="next rotation",
          label="Reputation errors tolerated", unit="", default="1",
          help="Maximum failed mandatory reputation probes before a server is rejected."),
+    Knob("PROTEUS_PLAYABILITY_CHECK", "gates", "str", choices=("on", "off"),
+         applies="next warmup pass",
+         label="Keep checking streaming after go-live", unit="", default="on",
+         help="A new server is always tested for video playback before it goes live, "
+              "but an exit can get blocked later. With this on, live servers are "
+              "re-tested about every 15 minutes and swapped out if video stops "
+              "working — otherwise they keep serving until their next daily rotation."),
     Knob("PROTEUS_PROTON_COUNTRY", "proton-dns", "str", pattern=r"^[A-Z]{2}$", applies="next rotation",
          label="Exit country", unit="", default="US",
          help="Two-letter country code for newly-minted Proton exit servers (e.g. US, CH, NL)."),
@@ -200,31 +207,71 @@ def parse_kv(text: str) -> dict[str, str]:
 
 
 class Lockout:
-    """Per-source login-failure lockout. Sliding window, in-memory only.
+    """Login-failure throttle. Sliding window, in-memory only.
 
-    Shared across request-handler threads under ThreadingHTTPServer, so all
-    read-modify-write access to _fails is guarded by a lock (same pattern as
-    dispatcher.py's _instances lock).
+    TWO ceilings, because a per-source one alone counts nothing an attacker
+    can't choose. The source address IS attacker-controlled: anyone on the
+    client VLAN can cycle through the /24 and collect a fresh per-source budget
+    for every address, so a per-source-only limit doesn't cap the attack, it
+    multiplies by the size of the subnet (5/min becomes ~1270/min on a /24).
+    The GLOBAL ceiling is the one that actually bounds a distributed guess.
+
+    The global limit is set far above any plausible human typo rate, because
+    tripping it locks *everyone* out of the UI until the window drains — that
+    is a deliberate trade (a stranger can deny you the panel) and it is why it
+    isn't set low. SSH is unaffected, and `systemctl restart proteus-ui` clears
+    it immediately since none of this is persisted.
+
+    Shared across request-handler threads under ThreadingHTTPServer, so every
+    read-modify-write is guarded (same pattern as dispatcher.py's _instances).
     """
 
-    def __init__(self, limit: int = 5, window_s: int = 60):
+    def __init__(self, limit: int = 5, window_s: int = 60,
+                 global_limit: int = 60, max_sources: int = 4096):
         self.limit, self.window_s = limit, window_s
+        self.global_limit, self.max_sources = global_limit, max_sources
         self._fails: dict[str, list[float]] = {}
+        self._global: list[float] = []
         self._lock = threading.Lock()
+
+    def _prune(self, now: float) -> None:
+        """Caller must hold the lock. Drops aged entries everywhere.
+
+        Without this, one dict key per spoofed source accumulates forever — a
+        slow memory exhaustion that costs the attacker nothing.
+        """
+        cutoff = now - self.window_s
+        self._global = [t for t in self._global if t > cutoff]
+        stale = [s for s, ts in self._fails.items() if not ts or ts[-1] <= cutoff]
+        for s in stale:
+            del self._fails[s]
+        # Hard bound even if a flood outpaces expiry: evict the least-recently
+        # active sources. They lose their individual budget, but the global
+        # ceiling still covers them, so this cannot be used to wash out a lock.
+        if len(self._fails) > self.max_sources:
+            for s, _ in sorted(self._fails.items(), key=lambda kv: kv[1][-1])[
+                    :len(self._fails) - self.max_sources]:
+                del self._fails[s]
 
     def record_failure(self, src: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
         with self._lock:
             self._fails.setdefault(src, []).append(now)
+            self._global.append(now)
+            self._prune(now)
 
     def locked(self, src: str, now: float | None = None) -> bool:
         now = time.time() if now is None else now
         with self._lock:
-            recent = [t for t in self._fails.get(src, []) if now - t < self.window_s]
-            self._fails[src] = recent
-            return len(recent) >= self.limit
+            self._prune(now)
+            if len(self._global) >= self.global_limit:
+                return True
+            return len([t for t in self._fails.get(src, []) if now - t < self.window_s]) >= self.limit
 
     def clear(self, src: str) -> None:
+        """Successful login clears that source. Deliberately does NOT clear the
+        global counter — a valid login from one address says nothing about the
+        distributed guessing that tripped it."""
         with self._lock:
             self._fails.pop(src, None)
 

@@ -11,13 +11,16 @@ import socket
 import ssl
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ui_logic
 
-SECRETS = "/etc/proteus/ui/secrets"
+# Overridable only so the login throttle can be exercised by tests against a
+# throwaway secrets dir; nothing in production sets it.
+SECRETS = os.environ.get("PROTEUS_UI_SECRETS", "/etc/proteus/ui/secrets")
 STATIC = "/etc/proteus/ui/index.html"
 STATE_DIR = "/etc/proteus/state"
 HEALTH_DIR = "/run/proteus-slot-health"
@@ -30,6 +33,23 @@ log = logging.getLogger("proteus-ui")
 logging.basicConfig(stream=sys.stdout, level=logging.INFO,
                     format="%(levelname)s %(message)s")
 LOCKOUT = ui_logic.Lockout()
+
+# Hard cap on concurrent passphrase verifications.
+#
+# verify_passphrase is 600k PBKDF2-SHA256 rounds — ~220ms of real CPU, and
+# hashlib releases the GIL, so N threads genuinely burn N cores. It runs BEFORE
+# any authentication, by definition, so without a cap ~18 unauthenticated
+# requests/sec saturate all four cores of this box. That doesn't just slow the
+# panel: it starves the NFQUEUE dispatcher, and every client's new flows are
+# routed by that dispatcher. Login DoS becomes gateway-wide packet loss.
+#
+# One at a time. This is a single-admin panel, so serialising logins costs
+# nothing real, and it bounds an attacker to one core no matter how hard they
+# push. The short timeout (rather than failing instantly) keeps a legitimate
+# login working under light contention while still shedding load fast enough
+# that waiting threads can't pile up.
+LOGIN_SLOT = threading.BoundedSemaphore(1)
+LOGIN_WAIT_S = 1.0
 
 
 def read(path: str) -> str:
@@ -134,6 +154,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):  # no access logging, by design
         pass
 
+    def setup(self):
+        # TLS handshake happens HERE, inside the worker thread (see TLSServer).
+        # StreamRequestHandler.setup() then re-applies self.timeout to the
+        # wrapped socket for the request itself.
+        self.request = self.server.ssl_ctx.wrap_socket(self.request, server_side=True)
+        self.connection = self.request
+        super().setup()
+
     def _auth_ok(self) -> bool:
         # Bearer token in the Authorization header (stored in localStorage by the
         # page). No cookie: a self-signed cert makes the page a non-secure context,
@@ -200,8 +228,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if LOCKOUT.locked(src):
                 log.warning("login lockout src=%s", src)
                 return self._json(429, {"error": "locked out, retry later"})
+            # Read the body and the stored hash BEFORE taking the slot, so the
+            # serialised section is only the expensive part.
+            supplied = self._body().get("passphrase", "")
             stored = read(f"{SECRETS}/passwd")
-            if ui_logic.verify_passphrase(self._body().get("passphrase", ""), stored):
+            if not LOGIN_SLOT.acquire(timeout=LOGIN_WAIT_S):
+                # Someone is already verifying. Shed rather than queue: waiting
+                # threads are what turn a CPU flood into thread exhaustion.
+                log.warning("login busy src=%s", src)
+                return self._json(429, {"error": "busy, retry"})
+            try:
+                accepted = ui_logic.verify_passphrase(supplied, stored)
+            finally:
+                LOGIN_SLOT.release()
+            if accepted:
                 LOCKOUT.clear(src)
                 tok = ui_logic.mint_session(self.server.session_key)
                 # Return the token in the body; the page stashes it in localStorage
@@ -251,6 +291,39 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
 
 
+class TLSServer(http.server.ThreadingHTTPServer):
+    """Serve TLS with the handshake in the WORKER thread, not the accept loop.
+
+    Wrapping the *listening* socket (the obvious `srv.socket =
+    ctx.wrap_socket(...)`) makes accept() perform the handshake, and accept()
+    runs in the single serve_forever loop. One client that completes the TCP
+    connection and then simply says nothing blocks that loop forever: no other
+    connection is accepted, and the panel is gone for everyone. It costs the
+    attacker one socket and no authentication.
+
+    So: accept the raw socket here, hand it to the thread, and let the handler
+    wrap it (see Handler.setup). A stalled handshake then costs one worker
+    thread with a timeout on it, which is what the threading server is for.
+    """
+
+    daemon_threads = True
+
+    def get_request(self):
+        sock, addr = self.socket.accept()
+        # Bound the handshake itself; without this the timeout only starts
+        # applying once StreamRequestHandler.setup() runs, i.e. after it.
+        sock.settimeout(Handler.timeout)
+        return sock, addr
+
+    def handle_error(self, request, client_address):
+        # A failed handshake is normal internet noise (port scanners, plain-HTTP
+        # requests to an HTTPS port). Don't dump a traceback per probe.
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ssl.SSLError, socket.timeout, ConnectionError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def main() -> None:
     for req in (f"{SECRETS}/passwd", f"{SECRETS}/tls/cert.pem", f"{SECRETS}/tls/key.pem"):
         if not os.path.exists(req):
@@ -273,9 +346,9 @@ def main() -> None:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.load_cert_chain(f"{SECRETS}/tls/cert.pem", f"{SECRETS}/tls/key.pem")
-    srv = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    srv = TLSServer(("0.0.0.0", PORT), Handler)
     srv.session_key = session_key
-    srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+    srv.ssl_ctx = ctx
     log.info("proteus-ui listening on :%d (TLS)", PORT)
     srv.serve_forever()
 

@@ -2,12 +2,13 @@
 # etc/proteus/bin/proteus-ui-passwd
 """Set the proteus web UI passphrase. Run as root. --stdin for scripted use."""
 from __future__ import annotations
-import getpass, os, pwd, sys
+import getpass, os, pwd, subprocess, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ui_logic
 
 DEST = "/etc/proteus/ui/secrets/passwd"
+SESSION_KEY = "/etc/proteus/ui/secrets/session.key"
 
 if os.geteuid() != 0:
     sys.exit("run as root")
@@ -21,10 +22,67 @@ if len(p1) < 12:
     sys.exit("refusing passphrase shorter than 12 characters")
 os.makedirs(os.path.dirname(DEST), mode=0o700, exist_ok=True)
 tmp = DEST + ".tmp"
-with open(tmp, "w") as f:
-    f.write(ui_logic.hash_passphrase(p1) + "\n")
 u = pwd.getpwnam("proteus-ui")
-os.chown(tmp, u.pw_uid, u.pw_gid)
-os.chmod(tmp, 0o600)
+
+# O_NOFOLLOW + O_EXCL, not open(tmp, "w").
+#
+# This runs as root, but the directory it writes into is mode 700 owned by the
+# UNPRIVILEGED proteus-ui user — the account the web daemon runs as, and the
+# one an attacker would land on first if the panel is ever compromised. A plain
+# open() follows symlinks, so that account could pre-place a symlink at
+# passwd.tmp and have root write attacker-chosen content to any path on the box
+# and chmod it. That is a straight unprivileged-to-root escalation, in the tool
+# whose whole job is credentials. O_NOFOLLOW refuses to traverse a final-
+# component symlink; O_EXCL refuses to reuse a file someone else left lying
+# there. Write through the fd we opened, never re-open by path.
+try:
+    os.unlink(tmp)
+except FileNotFoundError:
+    pass
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+try:
+    os.fchown(fd, u.pw_uid, u.pw_gid)
+    os.fchmod(fd, 0o600)
+    os.write(fd, (ui_logic.hash_passphrase(p1) + "\n").encode())
+finally:
+    os.close(fd)
 os.rename(tmp, DEST)
 print("passphrase updated")
+
+# Revoke every existing session.
+#
+# Session tokens are stateless HMACs over expiry+nonce with a 24h TTL, signed
+# with session.key — which was minted once and never rotated. Changing only the
+# passphrase therefore left every already-issued token valid for up to another
+# day, which is exactly backwards: the reason you reset a passphrase is that
+# you believe someone else has it, and the person you're locking out is the one
+# holding a live token.
+#
+# Deleting the key is not enough on its own: the running daemon read it into
+# memory at startup and keeps signing with it. The restart is what makes the
+# revocation real, so a failure here has to be loud rather than swallowed.
+try:
+    os.unlink(SESSION_KEY)
+except FileNotFoundError:
+    pass  # never started, or already rotated — the restart still mints a fresh one
+
+# try-restart, not restart: on a fresh box the unit exists but isn't running
+# yet (no TLS cert), and `restart` would fail there for no reason. Note that
+# try-restart also returns 0 when it does nothing because the unit is stopped —
+# which is fine (a stopped daemon holds no key in memory, and the next start
+# mints a fresh one), but it means rc=0 alone doesn't prove a running daemon
+# was cycled. Report what is actually true rather than a blanket success.
+r = subprocess.run(["systemctl", "try-restart", "proteus-ui.service"],
+                   capture_output=True, text=True)
+active = subprocess.run(["systemctl", "is-active", "--quiet", "proteus-ui.service"]).returncode == 0
+if r.returncode != 0:
+    print("WARNING: could not restart proteus-ui — if it is running, existing sessions\n"
+          "         are STILL VALID until you run:\n"
+          "             systemctl restart proteus-ui.service\n"
+          f"         ({(r.stderr or '').strip() or 'systemctl failed'})", file=sys.stderr)
+    sys.exit(1)
+if active:
+    print("existing sessions revoked (session key rotated, proteus-ui restarted)")
+else:
+    print("session key rotated; proteus-ui is not running, so it will pick up a fresh\n"
+          "key on next start — any old token is already dead.")

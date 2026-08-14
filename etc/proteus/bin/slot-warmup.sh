@@ -51,6 +51,45 @@ THROUGHPUT_TARGET_URL="https://speed.cloudflare.com/__down?bytes=26214400"
 THROUGHPUT_TIMEOUT_S=30
 PASS_COUNTER_FILE="$HEALTH_DIR/.pass-counter"
 
+# --- ongoing playability (streaming reputation) -------------------------------
+# rotate-slot.sh gates a CANDIDATE on playability before promoting it, but an
+# exit that passed can be bot-gated days later — Proton IPs get flagged over
+# time. Nothing else here would notice: the throughput probe above pulls from
+# speed.cloudflare.com, which a bot-gated exit serves perfectly, so the slot
+# keeps reporting STATUS=ok while YouTube refuses to play on it. Observed live
+# 2026-08-14: 3 of 5 slots LOGIN_REQUIRED, all STATUS=ok, one of them promoted
+# (and therefore gate-passed) only hours earlier.
+#
+# So: re-check the promoted exit periodically and rotate it out when it goes
+# bad. Deliberately NOT wired into FAIL_STREAK/DEGRADED — a bot-gated exit is
+# perfectly good for everything except streaming, and degrading it would evict
+# its client pins and concentrate everyone onto the remaining slots, which is a
+# worse outcome than a slow YouTube fix. It triggers a rotation and nothing
+# else; the slot keeps serving until a replacement passes the gate.
+PLAYABILITY_CHECK="${PROTEUS_PLAYABILITY_CHECK:-on}"          # on|off
+# One slot per N passes, round-robin, so each slot is re-checked every
+# N x <slots> passes: 20 x 5 x ~10s ~= every 17 min per slot. The page is
+# ~900KB, so this is ~3KB/s of background traffic, not the ~450KB/s that
+# checking every slot every pass would cost.
+PLAYABILITY_EVERY_N_PASSES=20
+PLAYABILITY_URL="${PROTEUS_PLAYABILITY_URL:-https://www.youtube.com/watch?v=jNQXAC9IVRw}"
+PLAYABILITY_MUST_CONTAIN='"playabilityStatus":{"status":"OK"'
+# PINNED desktop UA, load-bearing in both directions (measured 2026-08-08):
+# a mobile UA 302s to m.youtube.com, whose body lacks the marker, so a healthy
+# exit would look broken; and m.youtube.com does not bot-gate at all, so a
+# genuinely gated exit would look fine. Do not rotate this UA.
+PLAYABILITY_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+PLAYABILITY_TIMEOUT_S=20
+# Two consecutive failures, ~17 min apart, before acting — one transient fetch
+# failure must not rotate a healthy exit.
+PLAYABILITY_FAILS_BEFORE_ROTATE="${PROTEUS_PLAYABILITY_FAILS:-2}"
+# Per-slot floor between playability-triggered rotations. A SUCCESSFUL rotation
+# yields a playable exit by construction (rotate-slot.sh won't promote one that
+# fails the gate), so this only throttles the all-fail case — where no candidate
+# in 5 tries was playable and retrying immediately would just burn Proton API
+# mints for nothing.
+PLAYABILITY_ROT_COOLDOWN="${PROTEUS_PLAYABILITY_ROT_COOLDOWN:-3600}"
+
 # shellcheck source=/dev/null
 source /etc/proteus/bin/scoring.sh
 
@@ -161,6 +200,77 @@ EOF
                 logger -t "$LOG_TAG" "$inst auto-rotation failed to start"
         fi
     fi
+}
+
+# Re-check that a PROMOTED slot can still stream, and rotate it out if not.
+# Runs for at most one slot per pass (see the round-robin pick in the main
+# loop). Never touches FAIL_STREAK, STATUS or the composite score — see the
+# rationale at PLAYABILITY_CHECK above.
+playability_check() {
+    local inst=$1 ns="ns-$1"
+    local fails_file="$HEALTH_DIR/.playability-fails.$inst"
+    local last_rot_file="$HEALTH_DIR/.playability-lastrot.$inst"
+    local fails=0 body ok=0
+    [[ -r "$fails_file" ]] && fails=$(<"$fails_file")
+
+    body=$(ip netns exec "$ns" curl -sL -A "$PLAYABILITY_UA" \
+            -H "Accept: text/html,*/*" \
+            --max-time "$PLAYABILITY_TIMEOUT_S" --connect-timeout 8 \
+            -- "$PLAYABILITY_URL" 2>/dev/null) || true
+    # A fetch that returns nothing at all is a transport problem, not a verdict:
+    # the slot may simply be mid-rotation. Treat it like a failure for counting
+    # purposes but say so distinctly, so the log doesn't blame the exit's
+    # reputation for what was a dead socket.
+    if [[ -z "$body" ]]; then
+        fails=$((fails + 1))
+        logger -t "$LOG_TAG" "$inst playability probe unreachable (${fails}/${PLAYABILITY_FAILS_BEFORE_ROTATE})"
+    elif grep -qF -e "$PLAYABILITY_MUST_CONTAIN" <<<"$body"; then
+        ok=1
+    else
+        fails=$((fails + 1))
+        local why="not playable"
+        grep -qiE "sign in to confirm you.{0,3}re not a bot" <<<"$body" && why="bot-gated"
+        logger -t "$LOG_TAG" "$inst playability FAIL ($why) (${fails}/${PLAYABILITY_FAILS_BEFORE_ROTATE})"
+    fi
+
+    # Record the verdict for the dispatcher, which biases NEW client pins away
+    # from slots that cannot stream (dispatcher_logic.is_playable). Written on
+    # every check, including the transient-failure passes that do not yet
+    # justify a rotation — a client picking a slot right now cares about the
+    # last observation, not about whether we have decided to act on it.
+    _write_verdict() {
+        local v=$1 f="$HEALTH_DIR/.playability-state.$inst"
+        printf 'PLAYABLE=%s\nAT=%s\n' "$v" "$(date +%s)" > "$f.tmp" && mv "$f.tmp" "$f"
+    }
+
+    if (( ok )); then
+        [[ "$fails" != "0" ]] && logger -t "$LOG_TAG" "$inst playability recovered"
+        echo 0 > "$fails_file.tmp" && mv "$fails_file.tmp" "$fails_file"
+        _write_verdict yes
+        return 0
+    fi
+
+    echo "$fails" > "$fails_file.tmp" && mv "$fails_file.tmp" "$fails_file"
+    _write_verdict no
+    (( fails < PLAYABILITY_FAILS_BEFORE_ROTATE )) && return 0
+
+    if [[ -f /etc/proteus/state/rotation-paused ]]; then
+        logger -t "$LOG_TAG" "$inst playability rotation suppressed (paused)"
+        return 0
+    fi
+    local now last=0
+    now=$(date +%s)
+    [[ -r "$last_rot_file" ]] && last=$(<"$last_rot_file")
+    if (( now - last < PLAYABILITY_ROT_COOLDOWN )); then
+        logger -t "$LOG_TAG" "$inst playability rotation on cooldown ($((now - last))s < ${PLAYABILITY_ROT_COOLDOWN}s)"
+        return 0
+    fi
+    echo "$now" > "$last_rot_file.tmp" && mv "$last_rot_file.tmp" "$last_rot_file"
+    echo 0 > "$fails_file.tmp" && mv "$fails_file.tmp" "$fails_file"
+    logger -t "$LOG_TAG" "$inst playability rotation triggered (fails=$fails)"
+    mkdir -p /run/proteus && echo health > "/run/proteus/$inst"
+    systemctl start --no-block "proteus-rotate-slot@$inst.service" || \
+        logger -t "$LOG_TAG" "$inst playability rotation failed to start"
 }
 
 # Resolve the warmup target without touching any slot's tunnel: local unbound
@@ -283,6 +393,14 @@ slot_list=${slot_list# }
 
 tp_slot=$(pick_throughput_slot "$pass_counter" "$THROUGHPUT_EVERY_N_PASSES" "$slot_list")
 
+# Same round-robin picker (it is generic despite the name), offset by 10 passes
+# so a playability fetch and a 25MB throughput pull never land on the same slot
+# in the same pass: throughput fires at pass%60==0, playability at pass%20==10.
+pl_slot=""
+if [[ "$PLAYABILITY_CHECK" == "on" ]]; then
+    pl_slot=$(pick_throughput_slot "$((pass_counter + 10))" "$PLAYABILITY_EVERY_N_PASSES" "$slot_list")
+fi
+
 # One resolution per pass, shared by every warm_one job below.
 WARMUP_IP=$(_warmup_ip)
 
@@ -294,4 +412,6 @@ for inst in $slot_list; do
     fi
 done
 warm_dns6 &
+# Backgrounded like the rest: a slow YouTube fetch must not delay the pass.
+[[ -n "$pl_slot" ]] && playability_check "$pl_slot" &
 wait

@@ -10,7 +10,7 @@ DNS_INSTANCE=dns   # fresh-install DNS instance name (index 99 via override)
 _export_vars() {
     local line
     export MGMT_IFACE CLIENT_IFACE MGMT_CIDR CLIENT_VLAN_CIDR CLIENT_GW_IP \
-           SLOT_COUNT DNS_UPSTREAMS UNBOUND_UPSTREAM PROTON_COUNTRY STREAMING_MIN_MBPS \
+           SLOT_COUNT DNS_UPSTREAMS UNBOUND_UPSTREAM PROTON_COUNTRY STREAMING_MIN_MBPS UI_CLIENT_VLAN_ACCESS \
            NFT_REVERT_SECONDS DNS_INSTANCE UI_PORT UI_MGMT_EXTRA
     while IFS= read -r line; do export "${line?}"; done < <(derive)
     export DNS_FWMARK_HEX="0x$(printf '%x' "$DNS_INDEX")"
@@ -65,6 +65,17 @@ _export_vars() {
     # validator is what makes NetShield usable downstream, and it costs only the
     # last hop — 10.2.0.1 validates upstream itself and that hop is inside the
     # WireGuard tunnel. Any other upstream keeps the validator.
+    # The web-UI accept rule for the client VLAN, rendered as a COMPLETE line so
+    # the whole rule can be present or absent — envsubst has no conditionals.
+    # Default is absent: the panel applies no source-based authorisation, so
+    # reaching it from an untrusted VLAN means full admin rights with only the
+    # passphrase in the way. $CLIENT_VLAN below is an nft-native define and is
+    # single-quoted here so the shell leaves it for nftables to resolve.
+    if [[ "${UI_CLIENT_VLAN_ACCESS:-no}" == "yes" ]]; then
+        export UI_CLIENT_RULE="        iifname \"${CLIENT_IFACE}\" ip saddr \$CLIENT_VLAN tcp dport ${UI_PORT} counter accept comment \"proteus-ui-client\""
+    else
+        export UI_CLIENT_RULE="        # client-VLAN access to the UI is disabled (UI_CLIENT_VLAN_ACCESS=no)"
+    fi
     if ip_in_cidr "$UNBOUND_UPSTREAM" 10.2.0.0/16; then
         export UNBOUND_MODULE_CONFIG='module-config: "iterator"'
     else
@@ -80,7 +91,7 @@ _export_vars() {
 # The flip side: a variable MISSING from this list is not an error — envsubst
 # copies the literal `${NAME}` into the output, and unbound then refuses to start
 # on the unknown option. Every var a template references must be listed here.
-INSTALLER_VARS='$MGMT_IFACE $CLIENT_IFACE $MGMT_CIDR $CLIENT_VLAN_CIDR $CLIENT_GW_IP $DNS_UPSTREAMS $UNBOUND_UPSTREAM $STREAMING_MIN_MBPS $PROTON_COUNTRY $DNS_INSTANCE $DNS_INDEX $DNS_TABLE $DNS_TRANSIT_MAIN $DNS_FWMARK_HEX $UNBOUND_FORWARD_ADDRS $UNBOUND_TLS_UPSTREAM $UNBOUND_MODULE_CONFIG $UNBOUND_TLS_CERT_BUNDLE $UI_PORT $UI_MGMT_EXTRA'
+INSTALLER_VARS='$MGMT_IFACE $CLIENT_IFACE $MGMT_CIDR $CLIENT_VLAN_CIDR $CLIENT_GW_IP $DNS_UPSTREAMS $UNBOUND_UPSTREAM $STREAMING_MIN_MBPS $PROTON_COUNTRY $DNS_INSTANCE $DNS_INDEX $DNS_TABLE $DNS_TRANSIT_MAIN $DNS_FWMARK_HEX $UNBOUND_FORWARD_ADDRS $UNBOUND_TLS_UPSTREAM $UNBOUND_MODULE_CONFIG $UNBOUND_TLS_CERT_BUNDLE $UI_PORT $UI_MGMT_EXTRA $UI_CLIENT_RULE'
 
 render_all() {
     local out=${1:?staging dir required}

@@ -25,6 +25,8 @@ _apply_defaults() {
     # Measured ~12ms UDP, 0 loss over ~100 queries. Point this at a public
     # resolver and render.sh puts the validator and DoT back automatically.
     : "${UNBOUND_UPSTREAM:=10.2.0.1}"
+    # Secure default: the admin panel is mgmt-only unless explicitly opened up.
+    : "${UI_CLIENT_VLAN_ACCESS:=no}"
     : "${PROTON_COUNTRY:=US}"
     : "${STREAMING_MIN_MBPS:=25}"
     : "${NFT_REVERT_SECONDS:=900}"
@@ -105,6 +107,8 @@ validate_config() {
         || { die "UNBOUND_UPSTREAM must be a single bare IPv4 address (got '$UNBOUND_UPSTREAM')"; return 1; }
     ip_in_cidr "$CLIENT_GW_IP" "$CLIENT_VLAN_CIDR" \
         || { die "CLIENT_GW_IP ($CLIENT_GW_IP) must lie inside CLIENT_VLAN_CIDR ($CLIENT_VLAN_CIDR)"; return 1; }
+    [[ "$UI_CLIENT_VLAN_ACCESS" == "yes" || "$UI_CLIENT_VLAN_ACCESS" == "no" ]] \
+        || { die "UI_CLIENT_VLAN_ACCESS must be exactly 'yes' or 'no' (got '$UI_CLIENT_VLAN_ACCESS'); a typo would silently leave the admin panel unreachable from the client VLAN"; return 1; }
     ! cidrs_overlap "$MGMT_CIDR" "$CLIENT_VLAN_CIDR" \
         || { die "MGMT_CIDR and CLIENT_VLAN_CIDR must not overlap"; return 1; }
     [[ "$SLOT_COUNT" =~ ^[0-9]+$ ]] && (( SLOT_COUNT >= 1 && SLOT_COUNT <= 9 )) \

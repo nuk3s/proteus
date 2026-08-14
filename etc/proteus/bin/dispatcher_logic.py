@@ -145,6 +145,44 @@ def pick_by_score(
 SPREAD_BAND = float(os.environ.get("PROTEUS_SPREAD_BAND", "40.0"))
 
 
+# How long a playability verdict is trusted. Comfortably longer than the
+# ~16-minute re-check interval, so a slot isn't treated as "unknown" between
+# checks, but short enough that a stale "no" can't outlive its exit forever.
+# (rotate-slot.sh also deletes the file on promotion, which is the precise
+# invalidation; this is the backstop for the case where that doesn't happen.)
+PLAYABILITY_FRESH_SECONDS = 3600
+
+
+def is_playable(health_dir: str, name: str, now: int,
+                fresh_seconds: int = PLAYABILITY_FRESH_SECONDS) -> bool:
+    """Last known streaming verdict for a slot. Unknown counts as playable.
+
+    slot-warmup writes this; see playability_check there. Absent, unreadable,
+    malformed or stale all resolve to True on purpose — a slot is presumed good
+    until something actually observed otherwise, because the alternative
+    (presuming bad) would empty the eligible pool on any monitoring hiccup and
+    strand every new client.
+    """
+    try:
+        with open(f"{health_dir}/.playability-state.{name}") as f:
+            kv = {}
+            for line in f:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    kv[k] = v
+    except OSError:
+        return True
+    if kv.get("PLAYABLE", "yes") != "no":
+        return True
+    try:
+        if now - int(kv.get("AT", "0")) > fresh_seconds:
+            return True          # verdict too old to act on
+    except ValueError:
+        return True
+    return False
+
+
 def pick_distributed(
     instances: Iterable[tuple[str, int]],
     health_dir: str,
@@ -153,6 +191,7 @@ def pick_distributed(
     now: int,
     fresh_seconds: int = SCORE_FRESH_SECONDS,
     spread_band: float = SPREAD_BAND,
+    prefer_playable: bool = True,
 ) -> tuple[str, int] | None:
     """Pick a slot for a new pin, spreading load across the good slots.
 
@@ -176,6 +215,24 @@ def pick_distributed(
         scored.append((name, mark, s.score))
     if not scored:
         return None
+
+    # Prefer slots that could still stream when last checked. A bot-gated exit
+    # is fine for everything else, so it stays eligible for scoring, routing and
+    # rotation — it is only moved to the back of the queue for NEW pins, which
+    # is the one moment we get to choose without disrupting anybody.
+    #
+    # This narrows ONLY if something survives. If every slot is currently gated,
+    # keep the full set: handing a client a gated exit is worse than nothing,
+    # but handing it nothing at all is worse still.
+    #
+    # Existing pins are untouched by design — they live in the nftables map and
+    # never reach this function. A client already on a slot that goes bad is
+    # fixed by slot-warmup rotating that slot's exit, not by re-pinning it,
+    # which would change its IP mid-session for no gain.
+    if prefer_playable:
+        playable = [t for t in scored if is_playable(health_dir, t[0], now)]
+        if playable:
+            scored = playable
 
     best = max(score for _, _, score in scored)
     eligible = [(n, m, sc) for (n, m, sc) in scored if sc >= best - spread_band]

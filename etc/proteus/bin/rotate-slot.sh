@@ -254,6 +254,10 @@ systemctl kill --signal=HUP proteus-dispatcher.service 2>/dev/null || \
     log "WARN: dispatcher SIGHUP failed (not running?)"
 
 ln -sfn "$good_conf" "${AUTO_DIR}/${SLOT}.conf"
+# The verdict recorded against the OLD exit says nothing about this one,
+# which just passed the playability gate. Drop it so the dispatcher stops
+# steering new pins away from a slot that is now known-good.
+rm -f "${HEALTH_DIR:-/run/proteus-slot-health}/.playability-state.$SLOT"
 log "promoted $SLOT -> $good_conf (exit_ip=$good_exit_ip)"
 
 # Display metadata for the web UI. proton-mint stamps every minted conf with

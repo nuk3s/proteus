@@ -78,13 +78,13 @@ table inet filter {
 
         iifname "${MGMT_IFACE}" tcp dport 22 ip saddr $RFC1918 counter accept comment "ssh-mgmt"
 
-        # Proteus web UI (HTTPS). Both rules reach the SAME full-privilege UI:
-        # auth is the bearer token alone, with no source-based restriction, so a
-        # client-VLAN device that has the passphrase can rotate slots, write
-        # knobs and drive the privileged broker exactly like mgmt can. Delete
-        # the "proteus-ui-client" rule to keep the UI on the mgmt LAN.
+        # Proteus web UI (HTTPS). Auth is the bearer token alone — there is no
+        # source-based authorisation, so ANY source that reaches this port and
+        # has the passphrase can rotate slots, write knobs and drive the
+        # privileged broker. The client-VLAN rule below is therefore rendered
+        # only when UI_CLIENT_VLAN_ACCESS=yes; it is off by default.
         iifname "${MGMT_IFACE}"   ip saddr { $LAN_MGMT, $UI_MGMT_EXTRA } tcp dport ${UI_PORT} counter accept comment "proteus-ui-mgmt"
-        iifname "${CLIENT_IFACE}" ip saddr $CLIENT_VLAN tcp dport ${UI_PORT} counter accept comment "proteus-ui-client"
+${UI_CLIENT_RULE}
 
         # Local resolver: clients on the client VLAN may query unbound on 172.16.1.5.
         iifname "${CLIENT_IFACE}" ip saddr $CLIENT_VLAN udp dport 53 counter accept comment "client-dns"
