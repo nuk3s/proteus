@@ -8,8 +8,8 @@ set -u
 shopt -s nullglob
 
 for st in /etc/proteus/state/*.state; do
-    # shellcheck disable=SC1090
     WG_ENDPOINT_IP=""
+    # shellcheck disable=SC1090  # runtime-determined path, by design
     . "$st"
     if [[ -z "${WG_ENDPOINT_IP:-}" && -n "${WG_CONF:-}" && -r "$WG_CONF" ]]; then
         WG_ENDPOINT_IP=$(awk -F'= *' '

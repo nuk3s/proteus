@@ -10,6 +10,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 apply_files() {
     local stage=${1:?stage dir}
+    # An EMPTY ruleset passes `nft -c` (nothing to check) and would replace the
+    # kill-switch with nothing at all, so size-check before validating.
+    [[ -s "$stage/nftables.conf" ]] \
+        || { die "rendered nftables.conf is empty (render failed?); not installing"; return 1; }
     # validate the rendered ruleset BEFORE it lands on disk (a bad render must
     # not sit at /etc/nftables.conf where a reboot would load it).
     # Safe to run this early, before /etc/proteus/nft is created below: the
@@ -34,7 +38,7 @@ apply_files() {
         [[ -f "$f" ]] || continue
         install -o root -g root -m 0755 "$f" "/etc/proteus/bin/$(basename "$f")"
     done
-    log "staged files + systemd units + $(ls "$REPO_ROOT"/etc/proteus/bin | grep -vc __pycache__) bin scripts installed"
+    log "staged files + systemd units + $(find "$REPO_ROOT"/etc/proteus/bin -maxdepth 1 -type f | wc -l) bin scripts installed"
 
     # --- client-isolation boot seed ---
     # /etc/nftables.conf ends with an include of /etc/proteus/nft/client-pivot-seed[.]nft,

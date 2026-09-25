@@ -1,12 +1,25 @@
 #!/usr/bin/env bash
 set -uo pipefail
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../.." || exit 1
 source tests/_assert.sh
 source install/lib/common.sh
 source install/lib/render.sh
 
 load_config install/tests/fixtures/good.conf
 validate_config
+
+echo "render: a missing envsubst is a hard failure, not a silent empty render"
+# A PATH with the two external tools render_all needs and nothing else, so the
+# check is what fails — not mkdir or basename.
+NOENV=$(mktemp -d); ln -s "$(command -v mkdir)" "$NOENV/mkdir"; ln -s "$(command -v basename)" "$NOENV/basename"
+OUT=$(mktemp -d)
+( PATH="$NOENV" render_all "$OUT" ) 2>/dev/null && r=rendered || r=refused
+assert_eq "$r" refused "render_all without envsubst returns non-zero"
+assert_eq "$(find "$OUT" -type f | wc -l)" "0" "and writes no (empty) files"
+rm -rf "$NOENV" "$OUT"
+
+command -v envsubst >/dev/null 2>&1 \
+    || { echo "  - skipped remaining render checks (envsubst not installed: apt install gettext-base)"; summary; exit $?; }
 STAGE=$(mktemp -d)
 render_all "$STAGE"
 

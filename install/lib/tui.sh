@@ -2,6 +2,8 @@
 # Proteus TUI toolkit — colors, banner, boxes, steps, spinner, prompts.
 # Pure bash + ANSI (256-color). No external deps so it runs on a fresh Debian.
 # Source this; then call proteus_banner / step / ok / ask / etc.
+#
+# shellcheck disable=SC2034  # the full palette is defined even where a name is currently unused
 
 # --- capability + palette -----------------------------------------------------
 # Honour NO_COLOR and non-tty output by blanking the escapes.

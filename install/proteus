@@ -167,7 +167,8 @@ screen_apply() {
         source "$HERE/lib/common.sh"; source "$HERE/lib/render.sh"; source "$HERE/lib/apply.sh"
         load_config "$CONF"
         local stage="$HERE/.staging"
-        info "installing dependencies…"; install_deps_wrap
+        info "installing dependencies…"
+        install_deps_wrap || { bad "dependency install failed — see: sudo ./install/install.sh --render"; exit 1; }
         info "rendering config…";        render_all "$stage" >/dev/null
         info "applying files + network (behind ${NFT_REVERT_SECONDS:-600}s revert)…"
         apply_files "$stage" >/dev/null && apply_network >/dev/null
@@ -183,7 +184,10 @@ screen_apply() {
         || { pause "reconnected OK? press enter to lock it in (or Ctrl-C to bail)…"; source "$HERE/lib/apply.sh"; confirm 2>/dev/null || true; }
 }
 install_deps_wrap() {   # real mode: run install.sh's dep step quietly
-    ( cd "$HERE/.." && source "$HERE/install.sh" >/dev/null 2>&1 ); install_deps
+    # In a subshell: install.sh sets -e for its own phases, and this wizard
+    # deliberately runs without it. The subshell keeps -e where the phase
+    # expects it and reports a failed apt as a non-zero status here.
+    ( source "$HERE/install.sh" && install_deps ) >/dev/null 2>&1
 }
 
 # ---- 4. go live: login, mint, enable ----------------------------------------
@@ -212,11 +216,17 @@ screen_confirm() {
         echo; spin "minting dedicated DNS tunnel" 0.7
         spin "enabling services (dispatcher, warmup, daily rotation)" 1.0
     else
-        source "$HERE/install.sh" >/dev/null 2>&1 || true
-        info "Proton login (skips if already logged in):"; proton_bootstrap
-        info "minting initial exits (this takes a couple of minutes):"; initial_mint
-        info "enabling services:"; enable_services
-        doctor_post || true
+        # Each phase runs in a subshell that has sourced install.sh: the phases
+        # rely on install.sh's `set -e` to stop on a hard failure, and this
+        # shell deliberately runs without -e.
+        info "Proton login (skips if already logged in):"
+        ( source "$HERE/install.sh" && proton_bootstrap ) \
+            || { bad "Proton login failed — retry with: sudo /etc/proteus/bin/proton-bootstrap, then sudo ./install/install.sh --confirm"; exit 1; }
+        info "minting initial exits (this takes a couple of minutes):"
+        ( source "$HERE/install.sh" && initial_mint ) || warn "some initial mints failed — their timers will retry"
+        info "enabling services:"
+        ( source "$HERE/install.sh" && enable_services ) || warn "some services failed to enable — check: systemctl status 'proteus-*'"
+        ( source "$HERE/install.sh" && doctor_post ) || true
     fi
     echo; ok "all exits promoted · dispatcher active · daily rotation armed."
     [[ $DEMO == 1 ]] && beat 1

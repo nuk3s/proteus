@@ -10,11 +10,14 @@ WireGuard interface creation follows the wireguard.com/netns pattern: `ip link a
 
 Inbound flow from `ens19`:
 
-1. **prerouting_mangle** (priority mangle, -150). Filters out the packets we don't touch (non-client-VLAN, private destinations, multicast, etc.).
-2. If the packet already has a ct mark → copy to meta mark, return. Flows stay on their tunnel even if the map entry expired.
-3. Else look up `ip daddr map @vpn_dispatch`. Hit → use that mark, save to ct mark, return.
-4. Miss + `ct state new` → **NFQUEUE 0**. Dispatcher picks a slot, inserts `(daddr, mark)` into the map with 12h timeout, re-injects.
-5. After mark is set, `ip rule fwmark 0xN lookup 10N` routes to the per-slot veth → into `ns-proton-N` → out `wg0` (MASQUERADE on wg0 in the ns).
+1. **prerouting_mangle** (priority mangle, -150). Filters out the packets we don't touch (non-IPv4, non-client-VLAN, private destinations, multicast, etc.).
+2. If the packet already has a ct mark → copy to meta mark, return. Flows stay on their tunnel even if the map entries expired.
+3. Else look up `ip saddr map @source_pin` (the per-client pin). Hit → use that mark, save to ct mark, return. This is what makes every flow from one device leave through the same exit.
+4. Else look up `ip daddr map @vpn_dispatch` (per-destination fallback). Hit → same.
+5. Miss + `ct state new` → **NFQUEUE 0**. The dispatcher picks a slot (`pick_distributed`, below), pins the source in `@source_pin` for `PROTEUS_PIN_TTL_S` (default 6h), records `(daddr, mark)` in `@vpn_dispatch` (12h), sets the mark, re-injects.
+6. After mark is set, `ip rule fwmark 0xN lookup 10N` routes to the per-slot veth → into `ns-proton-N` → out `wg0` (MASQUERADE on wg0 in the ns).
+
+The dispatcher re-reads the slot list on SIGHUP (rotate-slot.sh sends one after every promotion). The handler only sets a flag; the reload happens at the next pick, because the handler can fire while the dispatcher already holds its own lock (see `_install_signal_handlers` in `dispatcher.py`).
 
 Return traffic follows the ct state established,related accept on the forward chain.
 
@@ -147,7 +150,7 @@ a per-rotation client pubkey.
 
 ## Stickiness vs rotation — why they coexist cleanly
 
-The sticky map `@vpn_dispatch` maps `daddr → mark`, not `daddr → endpoint`. Rotation replaces the endpoint (WG peer) associated with a mark but leaves the mark itself alone. So:
+Both sticky maps (`@source_pin`: `saddr → mark`, `@vpn_dispatch`: `daddr → mark`) map to a **mark**, not to an endpoint. Rotation replaces the endpoint (WG peer) associated with a mark but leaves the mark itself alone. So, taking the destination map as the example:
 
 - A flow to destination D got mark 3 this morning, went through the proton-3 slot.
 - Midday, proton-3 rotates to a new Proton exit. `@vpn_dispatch[D] = 3` is untouched.

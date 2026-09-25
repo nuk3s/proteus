@@ -183,7 +183,9 @@ ip route show table $((100+N))
 # Is @wg_peers up-to-date?
 sudo nft list set inet filter wg_peers
 
-# What is the dispatcher mapping destinations to?
+# Which slot is each client pinned to? (source_pin is the one that matters;
+# vpn_dispatch is the per-destination fallback)
+sudo nft list map inet filter source_pin
 sudo nft list map inet filter vpn_dispatch | head -30
 
 # Force a refresh of peer whitelist after any manual change

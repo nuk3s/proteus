@@ -141,4 +141,9 @@ enable_services() {
     systemctl enable proteus-ui.service
 }
 
-main "$@"
+# Only run when executed. The wizard (install/proteus) sources this file for
+# install_deps / proton_bootstrap / initial_mint / enable_services, and a
+# `source` must define those functions, not start an install.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

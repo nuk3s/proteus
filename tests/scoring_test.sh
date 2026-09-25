@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tests/scoring_test.sh — black-box tests for etc/proteus/bin/scoring.sh
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 # shellcheck source=tests/_assert.sh
 source tests/_assert.sh

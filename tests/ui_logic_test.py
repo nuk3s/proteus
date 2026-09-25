@@ -187,7 +187,7 @@ def test_lockout_success_does_not_clear_the_global_counter():
 def test_lockout_prunes_so_spoofed_sources_cannot_exhaust_memory():
     lo = ui_logic.Lockout(limit=5, window_s=60, global_limit=10**9, max_sources=50)
     for i in range(500):
-        lo.record_failure(f"10.1.%d.%d" % (i // 256, i % 256), now=100.0)
+        lo.record_failure("10.1.%d.%d" % (i // 256, i % 256), now=100.0)
     assert len(lo._fails) <= 50, len(lo._fails)
     # aged entries disappear entirely rather than accumulating
     lo.locked("10.1.0.0", now=100.0 + 61)
@@ -376,3 +376,22 @@ def test_choices_knob_schema_json_safe():
     assert wire["PROTEUS_CLIENT_ISOLATION"]["choices"] == ["open", "isolated"]
     # non-choice knobs still carry an (empty) choices field, not a crash
     assert wire["PROTEUS_STREAMING_MIN_MBPS"]["choices"] == []
+
+
+def test_builtin_checks_match_reputation_probe_script():
+    """ui_logic.BUILTIN_CHECKS is a read-only mirror of reputation-probe.sh's
+    probe list ("keep in sync" says the comment; this is what keeps it).
+    Parse the probe() calls out of the script and compare url, tier and body."""
+    import re
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent / "etc/proteus/bin/reputation-probe.sh").read_text()
+    found = set()
+    for m in re.finditer(r'(mandatory|advisory)_results\+=\( "\$\(probe\s+\S+\s+"([^"]+)"', src):
+        tier, url = m.group(1), m.group(2)
+        segment = src[m.end(): src.index(')" )', m.end())]
+        quoted = re.findall(r"'([^']*)'", segment)       # [expected-code, body?]
+        body = quoted[1] if len(quoted) > 1 else None
+        found.add((url, tier, body))
+    assert len(found) >= 5, found
+    expected = {(c["url"], c["tier"], c.get("body")) for c in ui_logic.BUILTIN_CHECKS}
+    assert found == expected, {"script_only": found - expected, "ui_only": expected - found}

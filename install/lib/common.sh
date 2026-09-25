@@ -122,7 +122,7 @@ DNS_INDEX=99   # fixed, off the live (1..SLOT_COUNT) and staging (101..100+N) ra
 
 # Emit KV lines for every derived value. Sourceable / greppable by render + tests.
 derive() {
-    local n net3
+    local n
     # client-VLAN /30 transit prefix base is 172.31.<index>.0/30 (main .1, ns .2)
     for (( n=1; n<=SLOT_COUNT; n++ )); do
         echo "SLOT_${n}_FWMARK=${n}"
