@@ -13,7 +13,7 @@ _export_vars() {
            SLOT_COUNT DNS_UPSTREAMS UNBOUND_UPSTREAM PROTON_COUNTRY STREAMING_MIN_MBPS UI_CLIENT_VLAN_ACCESS \
            NFT_REVERT_SECONDS DNS_INSTANCE UI_PORT UI_MGMT_EXTRA
     while IFS= read -r line; do export "${line?}"; done < <(derive)
-    export DNS_FWMARK_HEX="0x$(printf '%x' "$DNS_INDEX")"
+    DNS_FWMARK_HEX="0x$(printf '%x' "$DNS_INDEX")"; export DNS_FWMARK_HEX
     # Build unbound's forward-zone from UNBOUND_UPSTREAM alone. DNS_UPSTREAMS is
     # NOT consulted here: it feeds the per-netns resolv.conf for the reputation
     # probes, and the two are deliberately decoupled (see common.sh).
@@ -95,6 +95,12 @@ INSTALLER_VARS='$MGMT_IFACE $CLIENT_IFACE $MGMT_CIDR $CLIENT_VLAN_CIDR $CLIENT_G
 
 render_all() {
     local out=${1:?staging dir required}
+    # A missing envsubst must be a hard stop, not a quiet one: under a caller
+    # without `set -e` (the wizard) the loop below would still create every
+    # output file — empty. An empty nftables.conf passes `nft -c`, so that
+    # render would then be installed as-is: no kill-switch, no units, no env.
+    command -v envsubst >/dev/null 2>&1 \
+        || { die "envsubst not found (apt install gettext-base); refusing to render"; return 1; }
     mkdir -p "$out"
     _export_vars
     local f base

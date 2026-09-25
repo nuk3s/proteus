@@ -296,7 +296,7 @@ _warmup_ip() {
 warm_one() {
     local inst=$1 run_tp=${2:-0}
     local ns=ns-$inst
-    local out="" latency_ms=0 status_code="" connect_s=""
+    local out="" latency_ms=0 connect_s=""
     local throughput_mbps=""
 
     # Multi-probe per pass (existing behavior).

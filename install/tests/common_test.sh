@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -uo pipefail
-cd "$(dirname "$0")/../.."
+cd "$(dirname "$0")/../.." || exit 1
 source tests/_assert.sh
 source install/lib/common.sh
 

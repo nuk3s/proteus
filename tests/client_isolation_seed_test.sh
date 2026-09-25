@@ -45,7 +45,7 @@ out=$(seed isolated closed)
 assert_eq "$r" ok "fail-closed seed is comment-only, not empty (an operator must be able to read the state)"
 assert_eq "$(seed isolated closed | grep -c '^#')" "2" "fail-closed seed is all comments"
 assert_eq "$(seed open open | grep -cE $'\r')" "0" "no CR in output (a CRLF seed hard-fails the whole ruleset)"
-assert_eq "$(seed open open | tail -c1 | xxd -p)" "0a" "seed ends with a newline (a truncated last line is a parse error)"
+assert_eq "$(seed open open | tail -c1 | od -An -tx1 | tr -d ' \n')" "0a" "seed ends with a newline (a truncated last line is a parse error)"
 
 echo "the CIDR is validated before it reaches an nft statement"
 for bad in "172.16.1.0/24; rm -rf /" '$(id)' "172.16.1.0" "not-a-cidr" "172.16.1.0/24 172.16.2.0/24"; do

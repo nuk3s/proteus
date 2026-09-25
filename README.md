@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/gateway-transparent%20L3-E0883C?style=flat-square&labelColor=1B1815">
   <img src="https://img.shields.io/badge/tunnels-Proton%20WireGuard-D7A55F?style=flat-square&labelColor=1B1815">
   <img src="https://img.shields.io/badge/OS-Debian%2013-7E7A46?style=flat-square&labelColor=1B1815">
-  <img src="https://img.shields.io/badge/tests-219%20passing-7E8A4E?style=flat-square&labelColor=1B1815">
+  <img src="https://img.shields.io/badge/tests-327%20passing-7E8A4E?style=flat-square&labelColor=1B1815">
   <img src="https://img.shields.io/badge/deps-bash%20%2B%20python3-8F8A7A?style=flat-square&labelColor=1B1815">
 </p>
 

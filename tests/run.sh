@@ -6,9 +6,14 @@
 #   tests/run.sh scoring    # run only tests/scoring_test.sh
 #
 # Exits non-zero if any test fails.
+#
+# Needs: bash, python3 (+ pytest for the *_test.py files), coreutils, curl,
+# openssl (UI tests; skipped without it) and envsubst from gettext-base
+# (installer render tests; skipped without it). All of these are on the
+# gateway after install.sh's deps phase.
 
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 filter=${1:-}
 fail=0

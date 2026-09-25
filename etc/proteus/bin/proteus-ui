@@ -18,13 +18,15 @@ from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ui_logic
 
-# Overridable only so the login throttle can be exercised by tests against a
-# throwaway secrets dir; nothing in production sets it.
+# Overridable only so the daemon can be exercised by tests against throwaway
+# directories (tests/ui_login_throttle_test.sh, tests/ui_http_test.sh);
+# nothing in production sets these. Only root can set the daemon's
+# environment (the broker rejects any key that is not a known knob).
 SECRETS = os.environ.get("PROTEUS_UI_SECRETS", "/etc/proteus/ui/secrets")
 STATIC = "/etc/proteus/ui/index.html"
-STATE_DIR = "/etc/proteus/state"
-HEALTH_DIR = "/run/proteus-slot-health"
-RUN_DIR = "/run/proteus"
+STATE_DIR = os.environ.get("PROTEUS_UI_STATE_DIR", "/etc/proteus/state")
+HEALTH_DIR = os.environ.get("PROTEUS_UI_HEALTH_DIR", "/run/proteus-slot-health")
+RUN_DIR = os.environ.get("PROTEUS_UI_RUN_DIR", "/run/proteus")
 CHECKS_FILE = "/etc/proteus/checks.json"
 APPLY_SOCK = f"{RUN_DIR}/apply.sock"
 PORT = int(os.environ.get("PROTEUS_UI_PORT", "8443"))
@@ -119,8 +121,14 @@ def status() -> dict:
             rotating=unit_active(name),
             now=now,
         ))
-    history = [json.loads(l) for l in
-               read(f"{RUN_DIR}/rotation-history.jsonl").splitlines() if l.strip()]
+    history = []
+    for line in read(f"{RUN_DIR}/rotation-history.jsonl").splitlines():
+        if not line.strip():
+            continue
+        try:
+            history.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue   # one torn row must not turn the whole status page into a 500
     disp = {}
     try:
         disp = json.loads(read(f"{RUN_DIR}/dispatcher-status.json") or "{}")
@@ -185,9 +193,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _body(self) -> dict:
         try:
             n = int(self.headers.get("Content-Length", 0))
-            return json.loads(self.rfile.read(min(n, 65536)) or "{}")
+            obj = json.loads(self.rfile.read(min(n, 65536)) or "{}")
         except (ValueError, json.JSONDecodeError):
             return {}
+        # `[]`, `"x"` or `42` are valid JSON but not a request. Callers do
+        # .get() on the result; anything but a dict would raise AttributeError
+        # out of the handler, dropping the connection with no reply and a
+        # traceback in the journal. Treat it like a malformed body instead.
+        return obj if isinstance(obj, dict) else {}
 
     def _mutating_guard(self) -> bool:
         # Bearer-token auth is inherently CSRF-proof (the token must be attached

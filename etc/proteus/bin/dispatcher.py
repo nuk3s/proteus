@@ -2,17 +2,21 @@
 """
 Proteus dispatch daemon.
 
-Reads packets on NFQUEUE 0. For each first-seen destination IP, picks a
-currently-up VPN instance at random, inserts (dest_ip -> mark) into the
-nftables map `inet filter vpn_dispatch`, then sets the packet's fwmark
-and accepts it so policy routing can steer it to the chosen namespace.
-
-Follow-up packets to the same destination hit the map directly in
-prerouting_mangle and never reach us — so we are only invoked on brand-
-new destinations.
+Reads packets on NFQUEUE 0. A packet only gets here when neither its source
+nor its destination is already mapped (see prerouting_mangle in
+etc/nftables.conf). For each one we pick a slot with pick_distributed
+(fresh score, not degraded, within SPREAD_BAND of the best, least-loaded,
+playable preferred), pin the SOURCE to that slot in `inet filter source_pin`
+(so every later flow from that client rides the same exit for PIN_TTL_S),
+record the destination in `inet filter vpn_dispatch` as a fallback, then set
+the packet's fwmark and accept it so policy routing steers it to the slot's
+namespace. Later packets from a pinned source hit the map in the kernel and
+never reach us.
 
 The list of active instances is read from /etc/proteus/state/*.state.
-Send SIGHUP to reload (e.g. after rotation).
+Send SIGHUP to reload it (rotate-slot.sh does, after every promotion). The
+reload is deferred to the next pick()/janitor pass — see
+_install_signal_handlers for why the handler itself must do nothing else.
 """
 
 import grp
@@ -28,7 +32,6 @@ import tempfile
 import threading
 import time
 from collections import Counter
-from pathlib import Path
 
 STATE_DIR = "/etc/proteus/state"
 HEALTH_DIR = "/run/proteus-slot-health"
@@ -162,7 +165,24 @@ class Dispatcher:
         # single-threaded) increments it; the janitor thread reads it.
         self._counts_lock = threading.Lock()
         self._flow_counts: Counter[str] = Counter()
+        # Set by the SIGHUP handler, consumed at the top of pick() and
+        # janitor_once(). The handler runs on the main thread between two
+        # bytecodes of whatever that thread is doing — including the middle
+        # of pick() with self._lock held. A handler that called reload()
+        # directly would then block on that same (non-reentrant) lock and
+        # hang the daemon: every new client flow stuck in NFQUEUE, forever.
+        # Reproduced in tests/dispatcher_daemon_test.py.
+        self._reload_pending = threading.Event()
         self.reload()
+
+    def request_reload(self) -> None:
+        """Signal-handler-safe: only flips a flag. No I/O, no locks."""
+        self._reload_pending.set()
+
+    def _apply_pending_reload(self) -> None:
+        if self._reload_pending.is_set():
+            self._reload_pending.clear()
+            self.reload()
 
     def reload(self) -> None:
         new = load_instances(STATE_DIR)
@@ -185,6 +205,7 @@ class Dispatcher:
         return counts
 
     def pick(self) -> tuple[str, int] | None:
+        self._apply_pending_reload()
         with self._lock:
             if not self._instances:
                 return None
@@ -267,6 +288,7 @@ class Dispatcher:
     def janitor_once(self) -> None:
         """One pass: evict source_pin entries whose mark belongs to a degraded
         slot, then publish a status snapshot for the web UI."""
+        self._apply_pending_reload()
         with self._lock:
             instances = list(self._instances)
         self._evict_degraded_pins(instances)
@@ -461,6 +483,34 @@ def _nft_source_pin_remove(src_ip: str) -> bool:
     return True
 
 
+def _install_signal_handlers(d: Dispatcher) -> None:
+    """SIGHUP = re-read the instance list (rotate-slot.sh sends it after
+    every promotion).
+
+    Two rules, both load-bearing:
+
+    1. The handler only sets a flag. Python runs it on the main thread at
+       the next bytecode boundary — which can be inside pick() while
+       self._lock is held (pick() shells out to nft under that lock, so the
+       window is the whole nft call, on every new flow). Taking the lock
+       from the handler deadlocks the daemon.
+
+    2. siginterrupt(False): the main thread spends its life in the
+       netfilterqueue extension's C recv() loop. Python installs signal
+       handlers without SA_RESTART, so a SIGHUP that lands while idle makes
+       that recv() fail with EINTR. netfilterqueue 1.1.0 (Debian 13's
+       python3-netfilterqueue) handles that itself (runs our handler,
+       loops); releases before 1.1 left the loop instead, so nfq.run()
+       returned and main() fell out the bottom. With SA_RESTART neither
+       path is exercised: the kernel resumes the recv() and the Python
+       handler runs when the next packet arrives, which is exactly when
+       the reload is needed. tests/dispatcher_daemon_test.py pins this at
+       the C recv() level.
+    """
+    signal.signal(signal.SIGHUP, lambda *_: d.request_reload())
+    signal.siginterrupt(signal.SIGHUP, False)
+
+
 def main() -> int:
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
     _setup_logging()
@@ -470,8 +520,7 @@ def main() -> int:
         log.error("no active VPN instances in %s; exiting", STATE_DIR)
         return 1
 
-    # SIGHUP reloads the instance list (called after rotation).
-    signal.signal(signal.SIGHUP, lambda *_: d.reload())
+    _install_signal_handlers(d)
 
     # Start the pin janitor in the background.
     janitor = threading.Thread(target=d.janitor_loop, name="janitor", daemon=True)
@@ -485,9 +534,15 @@ def main() -> int:
         nfq.run()
     except KeyboardInterrupt:
         log.info("interrupted; shutting down")
+        return 0
     finally:
         nfq.unbind()
-    return 0
+    # run() only returns on a recv() error (see _install_signal_handlers).
+    # That is a failure, not a clean stop: exit non-zero so systemd's
+    # Restart=on-failure actually restarts us instead of leaving every new
+    # client flow to fall through the NFQUEUE bypass into the forward drop.
+    log.error("NFQUEUE receive loop exited unexpectedly; exiting for restart")
+    return 1
 
 
 if __name__ == "__main__":
