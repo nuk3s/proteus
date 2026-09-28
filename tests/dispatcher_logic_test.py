@@ -520,3 +520,132 @@ def test_is_udm_tunnel_source_follows_a_relocated_tunnel() -> None:
     configured subnet rather than a baked-in 10.99.99.0/30."""
     assert is_udm_tunnel_source("10.98.98.2", "10.98.98.0/30")
     assert not is_udm_tunnel_source("10.99.99.2", "10.98.98.0/30")
+
+
+# --- the janitor's drain of stopped or removed slots --------------------------
+
+from dispatcher_logic import (  # noqa: E402
+    LIVE_SLOT_MARKS, load_state_files, unclaimed_slot_marks,
+)
+
+
+def test_load_state_files_keeps_every_instance(tmp_path: Path) -> None:
+    """The drain needs to know which marks are claimed by ANY tunnel that is
+    up, not only by the slots the dispatcher hands out."""
+    (tmp_path / "proton-1.state").write_text("INSTANCE=proton-1\nFWMARK=0x1\n")
+    (tmp_path / "proton-1-s.state").write_text("INSTANCE=proton-1-s\nFWMARK=0x65\n")
+    (tmp_path / "dns-6.state").write_text("INSTANCE=dns-6\nFWMARK=0x6\n")
+    (tmp_path / "broken.state").write_text("INSTANCE=broken\n")
+    assert sorted(load_state_files(str(tmp_path))) == [
+        ("dns-6", 0x6), ("proton-1", 0x1), ("proton-1-s", 0x65)]
+    assert load_instances(str(tmp_path)) == [("proton-1", 0x1)]
+
+
+def test_a_broken_state_file_warns_once_not_every_janitor_pass(
+        tmp_path: Path, caplog) -> None:
+    """The janitor re-reads every state file (dns-6 and staging copies too)
+    once a minute. A file that stays broken warns once; it warns again when
+    its problem changes, or when it breaks again after a good read."""
+    import logging
+    caplog.set_level(logging.WARNING, logger="dispatcher")
+    bad = tmp_path / "dns-6.state"
+    (tmp_path / "proton-1.state").write_text("INSTANCE=proton-1\nFWMARK=0x1\n")
+
+    def warnings() -> list[str]:
+        out = [r.getMessage() for r in caplog.records]
+        caplog.clear()
+        return out
+
+    bad.write_text("INSTANCE=dns-6\nFWMARK=zz\n")
+    for _ in range(3):
+        assert load_state_files(str(tmp_path)) == [("proton-1", 0x1)]
+    assert warnings() == [f"bad FWMARK in {bad}: 'zz'"]
+
+    bad.write_text("INSTANCE=dns-6\nFWMARK=0xq\n")
+    load_state_files(str(tmp_path))
+    load_state_files(str(tmp_path))
+    assert warnings() == [f"bad FWMARK in {bad}: '0xq'"], "a new problem warns"
+
+    bad.write_text("INSTANCE=dns-6\nFWMARK=0x6\n")
+    load_state_files(str(tmp_path))
+    bad.write_text("INSTANCE=dns-6\nFWMARK=0xq\n")
+    load_state_files(str(tmp_path))
+    assert warnings() == [f"bad FWMARK in {bad}: '0xq'"], \
+        "broken again after a good read warns again"
+
+    bad.unlink()
+    bad.mkdir()                                 # open() fails: IsADirectoryError
+    load_state_files(str(tmp_path))
+    load_state_files(str(tmp_path))
+    msgs = warnings()
+    assert len(msgs) == 1 and msgs[0].startswith(f"could not read {bad}: "), msgs
+
+
+def test_unclaimed_slot_marks_are_live_slot_marks_nothing_claims() -> None:
+    entries = [("proton-1", 0x1), ("proton-2", 0x2), ("dns-6", 0x6),
+               ("proton-1-s", 0x65), ("custom-7", 0x7)]
+    out = unclaimed_slot_marks(entries)
+    assert 0x3 in out                       # a stopped proton-3
+    assert {0x1, 0x2} & out == set()        # live slots
+    assert 0x6 not in out and 0x7 not in out, \
+        "a mark claimed by a non-slot tunnel's state file is not a slot's"
+    assert out <= LIVE_SLOT_MARKS
+    assert LIVE_SLOT_MARKS == frozenset(range(1, 100))
+    for never in (0x0, 0x65, 0xc7, 0x100, 0x1234):
+        assert never not in out, hex(never)
+
+
+def test_unclaimed_slot_marks_leaves_out_the_excluded_dns_mark() -> None:
+    """The DNS tunnel's index sits inside the slot range; while it is down no
+    state file claims it, so the caller excludes it by value."""
+    out = unclaimed_slot_marks([("proton-1", 0x1)], exclude=[0x63])
+    assert 0x63 not in out and 0x62 in out
+
+
+def test_unclaimed_slot_marks_is_none_without_a_live_slot() -> None:
+    """The empty-list guard: a read listing no live slot (a state dir caught
+    mid-rewrite, or every file unreadable) must not make every mark drainable."""
+    assert unclaimed_slot_marks([]) is None
+    assert unclaimed_slot_marks([("dns-6", 0x6), ("proton-1-s", 0x65)]) is None
+
+
+# --- reading back the mark of an element that clashed ------------------------
+
+from dispatcher_logic import parse_get_element_mark  # noqa: E402
+
+# `nft get element` output, captured from nft 1.1.3 in a scratch netns.
+_GET_PIN = """table inet filter {
+\tmap source_pin {
+\t\ttype ipv4_addr : mark
+\t\tsize 256
+\t\ttimeout 6h
+\t\telements = { 172.16.1.50 timeout 30s expires 29s997ms : 0x0000002a }
+\t}
+}
+"""
+_GET_DEST = """table inet filter {
+\tmap vpn_dispatch {
+\t\ttype ipv4_addr : mark
+\t\ttimeout 12h
+\t\telements = { 203.0.113.10 expires 11h59m59s997ms : 0x00000001 }
+\t}
+}
+"""
+
+
+def test_parse_get_element_mark_reads_nft_1_1_3_output() -> None:
+    assert parse_get_element_mark(_GET_PIN, "172.16.1.50") == 0x2a
+    assert parse_get_element_mark(_GET_DEST, "203.0.113.10") == 0x1
+    assert parse_get_element_mark(
+        "elements = { 203.0.113.10 : 0x00000003 }", "203.0.113.10") == 0x3
+    assert parse_get_element_mark(
+        "elements = { 203.0.113.10 : 7 }", "203.0.113.10") == 7
+
+
+def test_parse_get_element_mark_refuses_anything_else() -> None:
+    assert parse_get_element_mark(_GET_PIN, "172.16.1.5") is None, \
+        "a key that is a prefix of the listed one is a different host"
+    assert parse_get_element_mark(_GET_PIN, "172.16.1.51") is None
+    assert parse_get_element_mark("", "172.16.1.50") is None
+    assert parse_get_element_mark(None, "172.16.1.50") is None
+    assert parse_get_element_mark("elements = { 172.16.1.50 : }", "172.16.1.50") is None

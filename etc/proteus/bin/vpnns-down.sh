@@ -51,4 +51,19 @@ ip netns del "$NS" 2>/dev/null || true
 ip link del "$VETH_MAIN" 2>/dev/null || true
 rm -f "$STATE_FILE"
 rm -rf "$NETNS_CONF_DIR"
+
+# A live slot's pins still carry its mark and now lead to the sentinel, so a
+# pinned client hangs until its pin expires. Tell the dispatcher, now that the
+# state file is gone: it stops picking this slot at once, and its janitor
+# drains the slot's pins once two passes in a row find it still gone (a
+# restart is back long before that, and vpnns-up.sh signals again when it
+# is). Staging copies (proton-N-s) and the DNS tunnel are not in its list, so
+# they are left out; rotate-slot.sh signals after a promotion itself. Silent
+# and never fatal: at boot and shutdown the dispatcher is not running, and in
+# a test sandbox systemctl may be missing or have no systemd to talk to.
+# --kill-who=main for the reason given in rotate-slot.sh: the nft children
+# and ExecStartPre do not handle SIGHUP.
+if [[ "$INSTANCE" =~ ^proton-[0-9]+$ ]]; then
+    systemctl kill --kill-who=main --signal=HUP proteus-dispatcher.service >/dev/null 2>&1 || true
+fi
 echo "DOWN: ${INSTANCE}"

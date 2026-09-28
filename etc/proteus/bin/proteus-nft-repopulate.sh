@@ -82,9 +82,10 @@ mapfile -t units < <(present proteus-wg-peers.service proteus-client-isolation.s
 # `restart` of an idle unit is a plain start; of a running one, systemd stops
 # the run and starts a fresh one against the new ruleset. The scripts tolerate
 # the stop: each rebuilds its set from scratch on the next run.
-# proteus-trusted-egress.sh swaps @trusted_src in one nft transaction, deletes
-# its ip rules in the order 100, 95, 90 and adds 90 first, so a kill at any
-# point never leaves the pref-100 return rules without pref 90, and the kernel
+# proteus-trusted-egress.sh swaps @trusted_src in one nft transaction and adds
+# every rule and route it needs before it removes a stale one (pref 90 before
+# any pref-100 rule, and after the last one on the way out), so a kill at any
+# point leaves a consistent rule set that the next run finishes, and the kernel
 # drops its flock when the process dies.
 #
 # --no-block on every job, never a waiting call. This runs inside

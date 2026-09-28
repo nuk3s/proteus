@@ -1,0 +1,57 @@
+[Unit]
+Description=Proteus fail-closed routing, armed before the network comes up
+# The catch rule and the ingress sink (routeguard.sh with no table
+# arguments). Everything else that arms them runs once the network is up:
+# vpnns-up.sh and vpnns-down.sh, and the dispatcher's ExecStartPre. If
+# nftables.service fails to load the ruleset at boot, the box forwards with no
+# firewall at all, and until the first of those runs, client traffic routes
+# via main and out the uplink. The routing layer needs no nftables, so it can
+# be in place before the first interface is.
+#
+# Placed like Debian's nftables.service. No default dependencies: they would
+# order it after basic.target, and through Before=network-pre.target hold the
+# network back until then (the network does not otherwise wait for it). After
+# systemd-sysctl.service, because that writes the `all` keys into every
+# interface that exists by then: a sysctl.d file with
+# net.ipv6.conf.all.disable_ipv6 = 0 would switch IPv6 back on for the sink's
+# dummy device (see routeguard.sh for why it is off). Before
+# network-pre.target, which ifupdown (networking.service, ifup@), systemd-networkd
+# and NetworkManager all order themselves after. None of them pulls that
+# target in, so Wants= does, or the ordering would not apply.
+# For systemd-networkd the ordering is not enough. By default it deletes every
+# ip rule and route it did not configure itself, these rules and every later
+# routeguard and slot rule included (ManageForeignRoutingPolicyRules= and
+# ManageForeignRoutes= in networkd.conf, both on by default). A box whose
+# network networkd runs needs ManageForeignRoutingPolicyRules=no and
+# ManageForeignRoutes=no in a networkd.conf.d drop-in. ifupdown does not
+# touch them.
+DefaultDependencies=no
+After=systemd-sysctl.service
+Before=network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# The client interface comes from PROTEUS_CLIENT_IFACE, by name. The kernel
+# stores a rule on a name that no device has yet and attaches it when the
+# device appears or udev renames a NIC to it, so arming it before udev has
+# named the NIC is fine.
+# The fallback that derives the name from PROTEUS_CLIENT_GW_IP cannot work
+# this early, as no address is assigned yet. RG_BEFORE_NETWORK=1 skips the
+# check that the named interface exists and holds that address, for the same
+# reason; the later runs check it.
+EnvironmentFile=-/etc/proteus/proteus.env
+Environment=RG_BEFORE_NETWORK=1
+# '-': a failure is in the journal, and the dispatcher's ExecStartPre arms the
+# same rules once the network is up. A box without PROTEUS_CLIENT_IFACE gets a
+# sink on wg-udm only this early, and a warning, at every boot. That should
+# not leave a failed unit behind.
+ExecStart=-/etc/proteus/bin/routeguard.sh
+
+[Install]
+# sysinit.target, not network-pre.target. A unit wanted by a passive target
+# starts only if something pulls that target in: nftables.service does, but a
+# box whose nftables.service is disabled or masked is exactly one this unit
+# has to cover. sysinit.target is part of every boot that brings up a network.
+WantedBy=sysinit.target

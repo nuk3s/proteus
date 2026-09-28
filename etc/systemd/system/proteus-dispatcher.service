@@ -18,11 +18,13 @@ EnvironmentFile=-/etc/proteus/proteus-local.env
 ExecStartPre=-+/etc/proteus/bin/routeguard.sh
 ExecStart=/etc/proteus/bin/dispatcher.py
 Restart=on-failure
-# A SIGHUP that lands before dispatcher.py has installed its handler (while
-# it imports and starts up) or during interpreter shutdown kills the
-# process, and systemd counts death by SIGHUP as a clean exit, so
-# Restart=on-failure alone would leave it down. rotate-slot.sh sends one
-# after every promotion.
+# dispatcher.py ignores SIGHUP from the top of the script until its handler
+# is in place, so a SIGHUP kills the process only while the interpreter
+# starts up (before the script's first lines run) or shuts down. systemd
+# counts death by SIGHUP as a clean exit, so Restart=on-failure alone would
+# leave it down.
+# Senders: rotate-slot.sh after every promotion, vpnns-up.sh and
+# vpnns-down.sh whenever a live slot comes up or stops.
 RestartForceExitStatus=SIGHUP
 RestartSec=5s
 User=root

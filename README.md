@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/gateway-transparent%20L3-E0883C?style=flat-square&labelColor=1B1815">
   <img src="https://img.shields.io/badge/tunnels-Proton%20WireGuard-D7A55F?style=flat-square&labelColor=1B1815">
   <img src="https://img.shields.io/badge/OS-Debian%2013-7E7A46?style=flat-square&labelColor=1B1815">
-  <img src="https://img.shields.io/badge/tests-1334%20passing-7E8A4E?style=flat-square&labelColor=1B1815">
+  <img src="https://img.shields.io/badge/tests-1706%20passing-7E8A4E?style=flat-square&labelColor=1B1815">
   <img src="https://img.shields.io/badge/deps-bash%20%2B%20python3-8F8A7A?style=flat-square&labelColor=1B1815">
 </p>
 
@@ -107,6 +107,7 @@ Slot `N` uses fwmark `N`, routing table `100+N`, and transit `/30` `172.31.N.0/3
 
 - Debian 13 (trixie) or another apt + systemd distro. Debian 13 ships the Proton library (`python3-proton-vpn-api-core`) in `main`; on other distros the installer adds Proton's official repo.
 - Two network interfaces: one for management, one facing the client VLAN.
+- An upstream router that keeps the client VLAN off the internet except through Proteus. Proteus protects only the traffic sent to it. If the router also has an address on the client VLAN (a router that runs DHCP there usually does), block forwarding from that VLAN to the internet on the router, and send no IPv6 router advertisements on that VLAN. Otherwise a device that picks the router as its gateway, or takes IPv6 from it, goes around Proteus. `gotchas.md` shows how to check both.
 - A Proton VPN account. The one-time login prompts for 2FA; after that, minting is unattended.
 - Root on the target. The wizard's `--demo` needs neither root nor an account.
 

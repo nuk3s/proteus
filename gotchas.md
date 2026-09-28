@@ -18,6 +18,8 @@ Three more paths end the same way, because each leaves a dispatched flow with **
    - Every slot table ends in `blackhole default metric 4294967295`, installed before any teardown. Rules are **kept** across rebuild and stop, so a slot is either routed through its veth or dropped, never `main`.
    - One static `not fwmark 0x0/0xffffffff blackhole` rule at pref 32000 catches a mark with no slot rule. Typed without the mask, `not fwmark 0` stores mark 0/mask 0 and matches nothing (`ip rule` then lists it as `not from all blackhole`), so re-run `routeguard.sh` rather than adding it by hand.
    - The ingress sink: `iif <client iface> lookup 900` and `iif wg-udm lookup 900` at pref 32020, where table 900 is `default dev proteus-null` (a dummy device), with RFC1918 destinations sent to `main` first at pref 32010. It keys on the ingress interface, so it holds for a flow that lost its mark and for a box with no ruleset.
+   - `proteus-routeguard.service` arms the catch rule and the sink at boot, before any interface comes up and without waiting for nftables.service. Before it, the first arming was the first slot's `vpnns-up.sh` or the dispatcher's `ExecStartPre`, both after `network-online.target`, so a ruleset that failed to load at boot left clients a plain router until then. That early run keys the client interface on `PROTEUS_CLIENT_IFACE` by name (the rule attaches when udev names the NIC); on a box with only `PROTEUS_CLIENT_GW_IP` it covers `wg-udm` alone until the first slot comes up or the dispatcher starts. The name must be the NIC's primary name, not one of its altnames (`ip link` lists them as `altname`): the kernel attaches a waiting rule by primary name only, so a rule armed early on an altname stays detached for the whole boot, and nftables' `iifname` never matches an altname either. `routeguard.sh` warns about one once the network is up.
+   - systemd-networkd deletes every ip rule and route it did not configure itself (`ManageForeignRoutingPolicyRules=` and `ManageForeignRoutes=` in `networkd.conf`, both on by default), and with them this whole layer, the slot rules and sentinels included. On a box whose network networkd runs, set `ManageForeignRoutingPolicyRules=no` and `ManageForeignRoutes=no` in a `/etc/systemd/networkd.conf.d/` drop-in. ifupdown does not touch them.
 2. Firewall (`nftables.conf` and its template):
    - `chain prerouting_ctsave` copies the dispatcher's verdict into conntrack, so a dispatched flow keeps its slot for life.
    - `chain forward` opens with guards that drop meta-marked, and original-direction ct-marked, packets headed anywhere but `v-proton-*` (counter `marked_leak_fwd`), then `unmarked-client-egress`, which drops unmarked traffic from the client interface or `wg-udm` to a public address. The marked accepts are `oifname "v-proton-*"`-scoped too.
@@ -29,11 +31,34 @@ The firewall cannot cover its own absence, so the no-ruleset case is the routing
 **Don't regress it:**
 - Never `ip route flush table <slot table>` or `ip rule del` a slot rule in a code path that can run while traffic flows. Delete the specific route (`ip route del default via <transit> table N`), never the sentinel.
 - Sentinels and the catch rule are `blackhole`, not `unreachable`. Both stop the leak, but `unreachable` answers the client with ICMP host-unreachable, and a client TCP stack aborts `connect()` on that at once: a few failed connects on every promotion. `blackhole` drops silently and the client's SYN retransmit lands in the rebuilt tunnel.
+- `routeguard.sh TABLE` and `rg_sentinel_ensure` take slot tables only: 101..300 except 253..255. A blackhole default anywhere else does damage: in 255 (local) it cuts the box off, 0 and 254 are `main`, and in 900 it would drop every tunnel reply at the reverse-path check once the sink's device route went missing. Don't widen the check; a new table range belongs in `rg_table_ok` with its reason.
 - The ingress sink must be a route to a real device, never `blackhole` or `unreachable`. With `rp_filter` on, a tunnel's reply to a client is validated by looking up its public source as if it had arrived on the client interface, which lands on the pref-32020 rule. A non-unicast answer there drops every tunnel reply.
+- `rp_filter` must be 0 or 2, never 1, and `net.ipv6.conf.all.forwarding` must stay 0. Both come from `etc/sysctl.d/90-proxy-hardening.conf`, which the installer copies to `/etc/sysctl.d/` under the same name and loads; the file's comments give the reason for each value. Strict mode drops every tunnel reply, with the sink or without it: the lookup above never ends on the slot veth the reply came in on. The kernel uses the higher of `conf.all` and an interface's own value, so the file's `conf.all.rp_filter=2` also covers an interface set to 1. IPv6 forwarding off is what keeps client IPv6 from being routed when no ruleset is loaded, because the sink and its RFC1918 exemptions are IPv4-only. `tests/sysctl_hardening_test.sh` pins the values and reproduces the strict-mode drop.
 - Keep `ct direction original` on the ct-mark guards. Replies to clients carry the flow's ct mark out the client interface (including the client-DNS redirect, whose flow is dispatched before the DNAT) and must pass.
-- `fwmark_reflect` must stay 0 (the installer pins it in `99-proteus.conf`). With it on, the ICMP errors and TCP RSTs the box sends to a client inherit the flow's mark, and policy routing sends them into the slot tunnel instead of straight back out the client interface. The guards do not drop them (a slot veth is an allowed way out), so no counter shows it.
+- `fwmark_reflect` must stay 0 (the installer pins it in `99-proteus.conf`). With it on, the ICMP errors and TCP RSTs the box sends to a client inherit the flow's mark, and policy routing sends them into the slot tunnel instead of straight back out the client interface. The guards do not drop them (a slot veth is an allowed way out), so no counter shows it. `tcp_fwmark_accept` must stay 0 for a similar reason (pinned in `90-proxy-hardening.conf`): a client's TCP DNS query reaches unbound already marked, because the flow is dispatched before the redirect, and with it on unbound's accepted socket takes that mark and its answers route into the slot tunnel.
 - Keep `own-icmp-error-for-tunnelled-flow` above `ct state established,related accept` in chain output. Below it, the accept passes the errors and they leave the uplink on any box whose `postrouting_guard` has been edited away.
 - Reload with `nft -f` or `systemctl reload nftables`. `systemctl restart nftables` is only safe while `/etc/systemd/system/nftables.service.d/proteus.conf` is in place: without it, restart flushes the ruleset before reloading and stop leaves none (see operations.md).
+
+## Re-adding the trusted-egress rules routed replies out the uplink
+
+**Symptom:** none anyone saw; found in review. Every run of `proteus-trusted-egress.sh` (boot, every web UI save, every pairing) opened a window of a few milliseconds in which a slot's reply to a host on a trusted range left the management uplink. It only happens when the router does not masquerade into the tunnel: a masquerading router sends everything from the tunnel address, and replies to that are on-link on `wg-udm`.
+
+**Cause.** The reply comes out of the slot namespace, which has a return route per trusted range, and `to <range> lookup 110 pref 100` sends it to `wg-udm`. The script deleted every rule at prefs 100, 95 and 90 and flushed table 110 before adding them back, and in between the lookup fell through to `main`. The forward chain accepts the packet as established, and the marked-traffic guards only look at the original direction. Removing a range, or switching the feature off, was worse: the slots kept their return routes, so that range's replies left the uplink until its flows ended or the slot rotated.
+
+**Fix.**
+- Make before break. The script adds what the new list needs first (table-110 routes, then pref 90, then pref 95 and pref 100 per range), then reads the installed rules and routes back with `ip -j` and removes only the stale ones: pref 100 first, pref 90 last, table-110 routes after the rules that led to them. A rule that stays is never touched, and table 110 is never flushed while the feature is on.
+- A removed range's return routes leave the slots before its rules go. Without the route, a reply stays in the slot and follows its default route into its own tunnel, as it did before the feature existed. If a slot cannot be cleaned, the stale rules are kept and the run fails, so systemd retries it.
+- Table 110 ends in `blackhole default metric 4294967295`, like the slot tables. When `wg-udm` goes down or is deleted, the kernel removes every route through it, and a pref-100 lookup then ends in the blackhole instead of `main`.
+- Switching off (an empty list, or no pairing) closes the gate, then removes the slot return routes, then the rules with pref 90 last, then, when unpairing, the interface. If a slot cannot be cleaned, the rules and table 110 stay and the run exits 1 so systemd retries it: the slot's replies then reach `wg-udm` (or the catch, once the interface is gone) instead of `main`. Pref 90 stays with them, so the web UI is not affected.
+- The tunnel subnet has its own pref-100 rule and table-110 route. Its replies otherwise use `wg-udm`'s connected route in `main`, which goes with the device, and would then leave by `main`'s default route.
+- `ip rule add` failing "File exists" is not taken as proof the rule is installed. The kernel's duplicate test ignores any selector the new rule leaves out, so `from <mgmt ip> to X lookup main pref 90` blocks `from <mgmt ip> lookup main pref 90`. The script reads the rules back, removes such a look-alike and adds the rule again; one it may not remove (it carries a `tos`, say) fails the run before anything after it is applied.
+- Slot cleanup leaves any return route that overlaps the client VLAN. `vpnns-up.sh` adds that one for the CIDR the slot was built with, and an installer apply that changes `PROTEUS_CLIENT_VLAN_CIDR` does not rebuild running slots.
+
+**Don't regress it:**
+- No `ip rule del pref N` or `ip route flush table 110` in the reconcile path. Those are for teardown only.
+- Pref 90 goes in before any pref-100 rule and comes out after the last one. Without it, the web UI's replies to a trusted-VLAN host go down the tunnel.
+- Don't swap the teardown order for a lasting `to <range> blackhole` rule. With the feature off, pref 90 and 95 are gone, and that rule would drop the web UI's replies and the client VLAN's pivot to the range.
+- Don't read "File exists" from `ip rule add` as success on its own; check the rule is really there.
 
 ## `type route` hook doesn't reliably reroute on this kernel
 
@@ -105,7 +130,7 @@ The old form of this entry blamed `tunnel RTT + Quad9 RTT` (~150-200ms) plus TCP
 
 ## SIGHUP to the dispatcher re-reads state, not code
 
-`proteus-dispatcher.service` reloads the instance pool on SIGHUP — but only by re-running `load_instances()` on the already-imported Python module, and not at once: the handler sets a flag, and the next pick or janitor pass does the reload (see `_install_signal_handlers` in `dispatcher.py` and operations.md → "Add or replace a slot"). Code changes in `dispatcher.py` require a full `systemctl restart`. The line in `journalctl` you want to confirm is "loaded N VPN instance(s): …" after the restart.
+`proteus-dispatcher.service` reloads the instance pool on SIGHUP — but only by re-running `load_instances()` on the already-imported Python module, and not at once: the handler sets a flag, and the next pick or janitor pass does the reload (see `_install_signal_handlers` in `dispatcher.py` and operations.md → "Add or replace a slot"). The janitor re-reads the state files on every pass as well, so a missed SIGHUP costs at most a minute (about a second while the list is empty: then a new flow re-reads it too). Code changes in `dispatcher.py` require a full `systemctl restart`. The line in `journalctl` you want to confirm is "loaded N VPN instance(s): …" after the restart.
 
 ## Don't query AbuseIPDB / Scamalytics from the mgmt IP
 
@@ -118,6 +143,24 @@ AbuseIPDB is kept as a documented fallback if empirical probes later prove insuf
 Reddit 403s a large fraction of Proton streaming exits **by policy, not by reputation**. Observed 3/5 streaming-pool slots getting 403 at Reddit despite clean mandatory probes. If you make Reddit mandatory, rotation will usually fail because *every* candidate Proton gives you has Reddit blocked.
 
 Keep it advisory (reports "ADVISORY BLOCK: reddit" in the log but doesn't fail the verdict) unless the tier structure changes.
+
+## A client can go around Proteus if the router lets it
+
+Proteus is the client VLAN's advertised gateway, but a device that ignores DHCP (a static setup, a buggy app, anything hostile) can send its traffic to any other router on the VLAN. If the upstream router holds an address there and forwards that VLAN to the internet, that device reaches the internet under the home IP and Proteus never sees a packet. IPv6 is the same: router advertisements on the VLAN hand every client a route that skips Proteus, which forwards IPv4 only. Nothing on the gateway can stop either one; the router's own policy is the control.
+
+Check both from a host on the client VLAN, without touching its normal routing. Give one test socket a private firewall mark and a policy rule that sends only that mark via the router's client-VLAN address:
+
+```bash
+sudo ip route add default via <router's client-VLAN address> dev <client iface> table 4242
+sudo ip rule add pref 900 fwmark 0x4242 lookup 4242
+# fetch an IP-echo URL over a socket with SO_MARK 0x4242, bound to the host's client-VLAN address:
+# it must time out. The same fetch without the mark must succeed and show a VPN exit.
+sudo ip rule del pref 900 fwmark 0x4242 lookup 4242; sudo ip route flush table 4242
+```
+
+Confirm the router is really on the VLAN (it answers ARP and ping there), or a timeout proves nothing. For IPv6: the gateway's client interface accepts router advertisements, so `ip -6 route show default` empty and only a link-local address on it means nothing is advertising.
+
+Re-check after router firmware updates and firewall or zone changes: the protection lives in the router's configuration, not here.
 
 ## The UniFi IPS sometimes drops SSH to the VM
 

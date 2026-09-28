@@ -32,6 +32,13 @@ accept-all table; a box that had no `/etc/nftables.conf` keeps the new file.)
 If the revert has already fired, `--confirm` refuses and says so: re-run the
 install. If the
 current ruleset cannot be listed, the apply stops before arming anything.
+Once the new ruleset has loaded, the apply installs the kernel settings in
+`etc/sysctl.d/` under the same names in `/etc/sysctl.d/` (so a hand-made
+`90-proxy-hardening.conf` is replaced), loads them with `sysctl -p`, and
+writes `99-proteus.conf`. The revert leaves those files in place. The apply
+warns when a sysctl.d file that sorts after these sets one of their keys to
+another value: the box runs the installer's value until the next reboot and
+the other one after it.
 If everything looks right (you still have SSH, and once bootstrapped, client
 egress), cancel the timer:
 

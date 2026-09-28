@@ -136,6 +136,87 @@ install_repo_files() {
     done
 }
 
+# Kernel settings from the repo's etc/sysctl.d, installed under the same names
+# (so 90-proxy-hardening.conf replaces a hand-made copy) and loaded now. Not
+# part of install_repo_files: apply_files runs before the ruleset loads, and
+# 90-proxy-hardening.conf turns forwarding on. If the ruleset then failed to
+# load, the file would stay on disk and the next boot would forward under
+# whatever ruleset the box had before, which on a fresh box is none or the
+# package's accept-all. apply_network calls this only once `nft -f` has
+# succeeded, where it writes 99-proteus.conf too.
+# `sysctl -p` of each file, not `sysctl --system`: --system re-applies every
+# file on the box mid-install, other packages' included, and fails on any of
+# their keys as well. What -p gives up is the order against the other files.
+# apply_network keeps it against 99-proteus.conf by calling this before its own
+# `sysctl -w` lines; any other file that sorts later and sets one of these keys
+# is what sysctl_boot_overrides reports.
+# Non-zero if a file failed to install or to load. sysctl still sets the
+# other keys of a file after one of them fails.
+install_sysctl_files() {
+    local f dst rc=0
+    for f in "$REPO_ROOT"/etc/sysctl.d/*.conf; do
+        [[ -f "$f" ]] || continue
+        dst="/etc/sysctl.d/$(basename "$f")"
+        if install -o root -g root -m 0644 "$f" "$dst"; then
+            sysctl -q -p "$dst" || rc=1
+        else
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+
+# Keys the installer's sysctl files set (the repo's etc/sysctl.d and
+# 99-proteus.conf) that the next boot will set to something else, because a
+# sysctl.d file sorting after them sets the key too: an operator's file, a
+# package's, or /etc/sysctl.conf linked in as 99-sysctl.conf. The installer
+# loads its files with `sysctl -p` and `sysctl -w`, so their values run now
+# whatever those files say; the change comes with the next reboot, and with
+# rp_filter=1 it drops every tunnel reply. One tab-separated line per key:
+# key, boot value, the file that sets it, the value running, our file.
+# Reads what systemd-sysctl applies at boot, every file in order
+# (`systemd-analyze cat-config sysctl.d`, the last assignment of a key wins),
+# and compares keys as written, a glob only with the same glob: systemd-sysctl
+# never lets a glob override a key set by name. Prints nothing when
+# systemd-analyze is missing or fails.
+sysctl_boot_overrides() {
+    local f ours="/etc/sysctl.d/99-proteus.conf" cfg
+    for f in "$REPO_ROOT"/etc/sysctl.d/*.conf; do
+        [[ -f "$f" ]] && ours+=" /etc/sysctl.d/$(basename "$f")"
+    done
+    command -v systemd-analyze >/dev/null 2>&1 || return 0
+    cfg=$(systemd-analyze --no-pager cat-config sysctl.d 2>/dev/null) || return 0
+    awk -v ours="$ours" '
+        # sysctl.d(5): "-" in front only means "ignore a failure"; if the
+        # first separator is a slash, dots are part of a name, so swap the
+        # two to compare in the dotted form.
+        function norm(k) {
+            sub(/^-/, "", k); gsub(/^[ \t]+|[ \t]+$/, "", k)
+            if (match(k, /[.\/]/) && substr(k, RSTART, 1) == "/") {
+                gsub(/\./, "\001", k); gsub(/\//, ".", k); gsub(/\001/, "/", k)
+            }
+            return k
+        }
+        BEGIN { n = split(ours, a, " "); for (i = 1; i <= n; i++) mine[a[i]] = 1 }
+        # cat-config puts "# <path>" above each file it prints, and
+        # "# <path> -> <target>" above a symlink.
+        /^# \/[^ ]+\.conf( -> .+)?$/ { cur = $2; next }
+        { line = $0; sub(/^[ \t]+/, "", line) }
+        line ~ /^([#;]|$)/ { next }
+        { i = index(line, "="); if (!i) next
+          k = norm(substr(line, 1, i - 1)); v = substr(line, i + 1)
+          gsub(/^[ \t]+|[ \t]+$/, "", v); gsub(/[ \t]+/, " ", v)
+          if (cur in mine) { if (!(k in want)) order[++m] = k; want[k] = v; wfile[k] = cur }
+          last[k] = v; lfile[k] = cur }
+        END {
+            for (j = 1; j <= m; j++) {
+                k = order[j]
+                if (!(lfile[k] in mine) && last[k] != want[k])
+                    printf "%s\t%s\t%s\t%s\t%s\n", k, (last[k] == "" ? "(empty)" : last[k]), lfile[k], want[k], wfile[k]
+            }
+        }' <<<"$cfg"
+}
+
 # The sets a full ruleset load empties, refilled from their sources of truth.
 # Shared by apply_network and by the revert unit, so a revert that fires
 # unattended leaves the box in the same state a successful apply would.
@@ -172,8 +253,8 @@ apply_network() {
     # there comes back, and on Debian that is usually the nftables package's
     # stock accept-all table, which is why confirm() refuses once the revert
     # has fired. With no previous file at all the new one stays. Deleting it
-    # would boot the box with no ruleset while 99-proteus.conf (step 3) still
-    # turns forwarding on: a plain router.
+    # would boot the box with no ruleset while the sysctl files from step 3
+    # still turn forwarding on: a plain router.
     local restore_file=""
     if [[ -e "$NFT_PRIOR_FILE" ]]; then
         restore_file="cp -a $NFT_PRIOR_FILE $NFT_CONF; "
@@ -187,6 +268,14 @@ apply_network() {
     # (install/proteus) runs without it and goes by this function's status.
     nft -f "$NFT_CONF" \
         || { die "nft -f $NFT_CONF failed; the old ruleset is still loaded and the revert armed above fires in ${NFT_REVERT_SECONDS}s"; return 1; }
+    # Kernel settings (etc/sysctl.d, see install_sysctl_files), loaded before
+    # the `sysctl -w` lines below. Boot loads 90-proxy-hardening.conf before
+    # 99-proteus.conf, so this order leaves a key both set with 99's value now,
+    # as after a reboot. A failure only warns: the ruleset is loaded and
+    # routeguard still runs. A strict rp_filter left in place drops every
+    # tunnel reply, which the client-egress check asked for at the end shows.
+    install_sysctl_files \
+        || warn "kernel settings from the repo's etc/sysctl.d not fully applied (see the error above). Check that net.ipv4.conf.all.rp_filter is 0 or 2 (1 drops every tunnel reply) and net.ipv6.conf.all.forwarding is 0, then re-run: sysctl -p /etc/sysctl.d/<file>"
     sysctl -qw net.ipv4.ip_forward=1
     # fwmark_reflect stays at the kernel default (0), pinned here because the
     # box's own replies to clients depend on it: with it on, the ICMP errors
@@ -196,6 +285,13 @@ apply_network() {
     # allowed way out), so nothing counts it either.
     sysctl -qw net.ipv4.fwmark_reflect=0
     install -o root -g root -m 0644 /dev/stdin /etc/sysctl.d/99-proteus.conf <<< $'net.ipv4.ip_forward=1\nnet.ipv4.fwmark_reflect=0'
+    # The loads above leave our values running whatever the other sysctl.d
+    # files say, but at boot a file that sorts after ours wins. Nothing here
+    # would show that before the next reboot, so say it now.
+    local sk sboot sfile srun sours
+    while IFS=$'\t' read -r sk sboot sfile srun sours; do
+        warn "$sfile sets $sk=$sboot and loads after $sours at boot: the box runs $sk=$srun now and $sk=$sboot after the next reboot. Remove the line from $sfile unless that change is meant."
+    done < <(sysctl_boot_overrides)
     # 4. repopulate sets that 'flush ruleset' emptied (the scar). Keep in step
     # with REPOPULATE_CMD above.
     /etc/proteus/bin/repopulate-wg-peers.sh 2>/dev/null || true

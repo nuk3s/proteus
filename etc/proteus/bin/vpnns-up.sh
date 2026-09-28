@@ -277,4 +277,16 @@ WG_ENDPOINT_IP=${WG_ENDPOINT_IP}
 UP_TIME=$(date -Iseconds)
 EOF
 
+# Tell the dispatcher, now that the state file is complete. vpnns-down.sh
+# signalled when this slot stopped, and the reload that followed dropped it
+# from the list; on a one-slot box, or when every slot restarts, that emptied
+# the list, and new flows are dropped while it stays empty. Without this the
+# slot would wait for one of the dispatcher's own re-reads. Same rules as in
+# vpnns-down.sh: live slots only (a staging copy is not in the list, and after
+# a promotion rotate-slot.sh's own SIGHUP is a harmless second reload), silent
+# and never fatal (at boot the slots come up before the dispatcher starts).
+if [[ "$INSTANCE" =~ ^proton-[0-9]+$ ]]; then
+    systemctl kill --kill-who=main --signal=HUP proteus-dispatcher.service >/dev/null 2>&1 || true
+fi
+
 echo "UP: ${INSTANCE}  ns=${NS}  transit=${TRANSIT_NS}  fwmark=${FWMARK}  table=${RT_TABLE}  peer=${WG_ENDPOINT_IP}"

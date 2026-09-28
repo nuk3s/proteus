@@ -112,8 +112,13 @@ UNBOUND_GID=$(getent passwd unbound | cut -d: -f4)
 
 # ---- PROTEUS-MAIN (this netns) -------------------------------------------
 ip link set lo up
-sysctl -q -w net.ipv4.ip_forward=1 net.ipv4.conf.all.rp_filter=2 net.ipv4.conf.default.rp_filter=2 \
-    || die "sysctl in main"
+# The box's kernel settings: the tracked sysctl file, then what apply_network
+# sets on top of it (99-proteus.conf). Only this namespace gets them. The slot
+# namespaces vpnns-up.sh creates copy IPv4 conf.all/default from the host's
+# initial namespace (net.core.devconf_inherit_init_net), which on the gateway
+# is the one the file configures and here is the machine running the sim.
+sysctl -q -p "$SIM/sysctl-90.conf" || die "loading the sysctl file in main"
+sysctl -q -w net.ipv4.ip_forward=1 net.ipv4.fwmark_reflect=0 || die "sysctl in main"
 
 for ns in client upstream trusted; do ip netns add "$ns" || die "netns add $ns"; ip -n "$ns" link set lo up; done
 
@@ -550,6 +555,11 @@ if [[ $TEMPLATE == 1 ]]; then
 else
     cp "$NFT_TREE/etc/nftables.conf" "$SIM/nftables.conf"
 fi
+# The kernel settings go with the code under test. A tree from before the
+# file was tracked gets this checkout's copy.
+SYSCTL_FILE=$BASE/etc/sysctl.d/90-proxy-hardening.conf
+[[ -f "$SYSCTL_FILE" ]] || SYSCTL_FILE=$ROOT/etc/sysctl.d/90-proxy-hardening.conf
+cp "$SYSCTL_FILE" "$SIM/sysctl-90.conf"
 
 # --- /etc overlay top layer ---------------------------------------------------
 T=$SIM/etc-top

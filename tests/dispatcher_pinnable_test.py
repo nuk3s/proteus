@@ -290,9 +290,9 @@ def _dispatch_one(dispatcher, monkeypatch, tmp_path, src: str, dst: str):
     pins: list[tuple[str, int]] = []
     dests: list[tuple[str, int]] = []
     monkeypatch.setattr(dispatcher, "_nft_source_pin_insert",
-                        lambda ip, mark: bool(pins.append((ip, mark))) or True)
+                        lambda ip, mark: pins.append((ip, mark)) or dispatcher.INSERT_ADDED)
     monkeypatch.setattr(dispatcher, "_nft_map_insert",
-                        lambda ip, mark: bool(dests.append((ip, mark))) or True)
+                        lambda ip, mark: dests.append((ip, mark)) or dispatcher.INSERT_ADDED)
 
     d._instances = [("proton-1", 0x1)]
     pkt = _FakePacket(src, dst)
@@ -575,7 +575,7 @@ def test_eviction_adjusts_the_cached_counts(
     monkeypatch.setattr(dispatcher, "_nft_vpn_dispatch_remove", lambda ip: True)
 
     assert d._load_counts("vpn_dispatch") == {0x1: 1, 0x2: 1}
-    d._evict_degraded_pins([("proton-1", 0x1), ("proton-2", 0x2)])
+    d._evict_pins([("proton-1", 0x1), ("proton-2", 0x2)])
     assert d._load_counts("source_pin") == {}
     assert d._load_counts("vpn_dispatch") == {0x2: 1}
 
@@ -610,7 +610,7 @@ def test_evict_degraded_clears_both_maps(
                         lambda ip: bool(dropped_dests.append(ip)) or True)
 
     d = dispatcher.Dispatcher()
-    d._evict_degraded_pins([("proton-1", 0x1), ("proton-2", 0x2)])
+    d._evict_pins([("proton-1", 0x1), ("proton-2", 0x2)])
 
     assert dropped_pins == ["172.16.1.50"]
     assert dropped_dests == ["203.0.113.10"], \
@@ -645,5 +645,5 @@ def test_evict_leaves_everything_alone_when_no_slot_is_degraded(
                         lambda ip: bool(removed.append(ip)) or True)
 
     d = dispatcher.Dispatcher()
-    d._evict_degraded_pins([("proton-1", 0x1)])
+    d._evict_pins([("proton-1", 0x1)])
     assert removed == []

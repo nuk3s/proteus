@@ -38,6 +38,19 @@ sudo nft list chain inet filter output | grep output-dropped
 # how to route those into the tunnel instead.
 sudo nft list counters table inet filter
 
+# Kernel settings, from /etc/sysctl.d/90-proxy-hardening.conf (the repo's
+# etc/sysctl.d, installed under the same name) and the installer's
+# 99-proteus.conf. Expect ip_forward 1, rp_filter 2 (1 drops every tunnel
+# reply), IPv6 forwarding 0 and both fwmark knobs 0. The file's comments say
+# why each one matters.
+sysctl net.ipv4.ip_forward net.ipv4.conf.all.rp_filter net.ipv6.conf.all.forwarding \
+    net.ipv4.fwmark_reflect net.ipv4.tcp_fwmark_accept
+# What the next boot sets: every sysctl.d file in boot order, the last line for
+# a key wins. A file listed after 90-proxy-hardening.conf that sets one of its
+# keys overrides it at boot while the box still runs the file's value (the
+# installer warns about it).
+systemd-analyze cat-config sysctl.d | grep -E '^# /|rp_filter|ip_forward|ipv6\.conf\..*\.forwarding|fwmark'
+
 # Fail-closed routing (routeguard.sh): the catch rule, the ingress sink, and a
 # blackhole sentinel at the end of every table a mark rule points at (listed
 # after the real default route while the slot is up).
@@ -51,6 +64,15 @@ ip route show table 900                  # "default dev proteus-null"
 for t in $(ip rule show | awk '/fwmark/ && /lookup/ {print $NF}' | sort -un); do
     echo "table $t: $(ip route show table "$t" | tr '\n' ';')"
 done
+# proteus-routeguard.service arms the catch rule and the sink at every boot,
+# before any interface is up; vpnns-up.sh, vpnns-down.sh and the dispatcher
+# arm them again once the network is up.
+systemctl is-enabled proteus-routeguard.service   # "enabled"
+# Expect nothing. A line names a PROTEUS_CLIENT_IFACE that does not exist or
+# does not hold PROTEUS_CLIENT_GW_IP (the sink is armed on that name anyway,
+# so it covers the wrong interface), an unknown client interface, a refused
+# table, or a rule that failed.
+sudo journalctl -b --no-pager | grep 'routeguard: '
 
 # The ingress sink transmits nothing while nftables is loaded: chain forward
 # drops unmarked client egress (unmarked-client-egress) before the sink's
@@ -171,11 +193,12 @@ Rotation is automatic, but manual mint is occasionally needed:
 # Mint a fresh config for slot N
 sudo /etc/proteus/bin/proton-mint --slot proton-3 --out-dir /etc/proteus/wg/proton/auto
 
-# Bring it up (or replace what's live)
+# Bring it up (or replace what's live). For a proton-N slot, vpnns-up.sh
+# then tells the dispatcher to re-read state itself.
 sudo /etc/proteus/bin/vpnns-up.sh proton-3 /etc/proteus/wg/proton/auto/proton-3-<latest>.conf
 
-# Tell dispatcher to re-read state (main process only: the default
-# --kill-who=all would also HUP its nft children and ExecStartPre)
+# The same signal by hand (main process only: the default --kill-who=all
+# would also HUP its nft children and ExecStartPre)
 sudo systemctl kill --kill-who=main --signal=HUP proteus-dispatcher.service
 ```
 
@@ -185,7 +208,9 @@ lag the signal by up to a minute on a quiet VLAN. Each pick applies a pending
 reload before it chooses, so a flow that arrives after the signal normally
 gets the new list. For an instant it may not: a pick already under way when
 the signal lands, or one that arrives while the janitor is mid-reload, uses
-the previous list for that one decision.
+the previous list for that one decision. Without the signal, the janitor
+still finds the new slot on its next pass (the log line then ends "found by
+the janitor's re-read"); the signal only makes it sooner.
 
 ## Force a rotation now (bypass the timer)
 
@@ -266,7 +291,7 @@ sudo /etc/proteus/bin/repopulate-wg-peers.sh
 # Wipe everything related to slot N and bring it back from scratch
 sudo /etc/proteus/bin/vpnns-down.sh proton-N
 sudo /etc/proteus/bin/vpnns-up.sh proton-N /etc/proteus/wg/proton/auto/proton-N.conf
-sudo systemctl kill --kill-who=main --signal=HUP proteus-dispatcher.service
+# No manual HUP: vpnns-down.sh and vpnns-up.sh each signal the dispatcher for a live slot.
 ```
 
 If a *staging* instance (`proton-N-s`) got orphaned because `rotate-slot.sh` was killed mid-attempt:

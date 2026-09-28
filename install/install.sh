@@ -123,6 +123,13 @@ initial_mint() {
 
 enable_services() {
     systemctl daemon-reload
+    # Arms the catch rule and the ingress sink at every boot, before the
+    # network comes up (see the unit). apply_network already armed them for
+    # this boot; --now only makes the unit read active until the next one.
+    # Not fatal: the dispatcher and the slots arm the same rules, and stopping
+    # here would leave every unit below disabled.
+    systemctl enable --now proteus-routeguard.service \
+        || warn "proteus-routeguard.service not enabled; fail-closed routing is armed only once the network is up"
     local n
     for (( n=1; n<=SLOT_COUNT; n++ )); do systemctl enable --now "proteus-proton@proton-$n" || true; done
     systemctl enable --now proteus-dns-tunnel.service unbound proteus-dispatcher.service

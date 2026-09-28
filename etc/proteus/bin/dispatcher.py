@@ -23,10 +23,27 @@ policy routing steers it to the slot's namespace. Later packets that hit a
 map entry are marked in the kernel and never reach us.
 
 The list of active instances is read from /etc/proteus/state/*.state.
-Send SIGHUP to reload it (rotate-slot.sh does, after every promotion). The
+Send SIGHUP to reload it (rotate-slot.sh does after every promotion, and
+vpnns-up.sh / vpnns-down.sh whenever a live slot comes up or stops). The
 reload is deferred to the next pick()/janitor pass — see
 _install_signal_handlers for why the handler itself must do nothing else.
+Two re-reads cover a SIGHUP that never arrives: the janitor's on every pass,
+and pick()'s, at most once per EMPTY_REREAD_S, while the list is empty.
 """
+
+import signal
+
+# Until main() installs the real handler, a SIGHUP would kill the process (the
+# default action), and rotate-slot.sh, vpnns-up.sh or vpnns-down.sh can send
+# one at any moment, including during the scapy import below, the slowest
+# part of startup. So ignore it from the first line, before anything heavy;
+# main() requests one reload once the handler is in place, which turns a
+# signal dropped here into a late reload instead of a restart. Only when run
+# as the daemon: importing this module (the tests do) must not change the
+# importer's signal handling. Nothing forks before the handler replaces
+# SIG_IGN, so no nft child inherits it.
+if __name__ == "__main__":
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
 import grp
 import json
@@ -34,7 +51,6 @@ import logging
 import logging.handlers
 import os
 import random
-import signal
 import subprocess
 import sys
 import tempfile
@@ -84,9 +100,11 @@ from netfilterqueue import NetfilterQueue
 from scapy.layers.inet import IP
 
 from dispatcher_logic import (
-    load_instances, degraded_marks, parse_source_pin_elements,
-    parse_source_pin_elements_with_ttl, pick_distributed, is_pinnable_source,
-    is_udm_tunnel_source, build_status_snapshot,
+    load_instances, load_state_files, is_live_slot, unclaimed_slot_marks,
+    degraded_marks, parse_source_pin_elements,
+    parse_source_pin_elements_with_ttl, parse_get_element_mark,
+    pick_distributed, is_pinnable_source, is_udm_tunnel_source,
+    build_status_snapshot,
 )
 import ipaddress
 import trusted
@@ -269,6 +287,23 @@ def _pinnable_cidrs() -> list[str]:
 # _nft_source_pin_insert) so PROTEUS_PIN_TTL_S actually takes effect without
 # an nftables.conf reload. Default matches the prior hard-coded 6h.
 PIN_TTL_S = int(os.environ.get("PROTEUS_PIN_TTL_S", "21600"))
+
+
+def _dns_tunnel_mark() -> int | None:
+    """The DNS tunnel's fwmark, which the janitor must never drain.
+
+    vpnns-up.sh gives it its index as the mark, and that index sits inside the
+    live-slot mark range (see dispatcher_logic.LIVE_SLOT_MARKS). Its state file
+    claims it while the tunnel is up; this covers the rest of the time, e.g. a
+    rotate-dns.sh swap that fails half way. Same default as rotate-dns.sh.
+    """
+    try:
+        return int(os.environ.get("PROTEUS_DNS_INDEX", "6"))
+    except ValueError:
+        return None
+
+
+_NOT_SLOT_MARKS = frozenset(m for m in (_dns_tunnel_mark(),) if m is not None)
 NFT_TABLE_FAMILY = "inet"
 NFT_TABLE = "filter"
 NFT_MAP = "vpn_dispatch"
@@ -283,6 +318,9 @@ NFT_SOURCE_PIN_MAP = "source_pin"
 # inserts and evictions adjust the cached numbers as they happen, so a couple
 # of seconds of staleness cannot meaningfully misplace an assignment.
 LOAD_CACHE_TTL_S = 2.0
+# How often pick() may re-read the state dir while it has no instance to hand
+# out. See pick().
+EMPTY_REREAD_S = 1.0
 LOG_PATH = "/var/log/proteus/dispatcher.log"
 QUEUE_NUM = 0
 SNAPSHOT = "/run/proteus/dispatcher-status.json"
@@ -382,9 +420,18 @@ class Dispatcher:
         # under the GIL.
         self._reload_pending = False
         # Serialises _apply_pending_reload between the janitor thread and the
-        # NFQUEUE callback. Only ever taken there: the signal handler must
-        # never touch it (it runs on the main thread, which may be holding it).
+        # NFQUEUE callback, and the janitor's own re-read with both. Never
+        # taken by the signal handler (it runs on the main thread, which may
+        # be holding it).
         self._reload_lock = threading.Lock()
+        # Live-slot marks no state file claimed at the previous janitor pass,
+        # or None when that pass could not tell (first pass, or a read that
+        # listed no live slot). Janitor thread only. See _drainable_marks.
+        self._unclaimed_prev: set[int] | None = None
+        # Monotonic time of the last state-dir read, by any path. Only rate-
+        # limits pick()'s re-read of an empty list, so a racy store from the
+        # janitor thread costs at most one extra or one delayed read.
+        self._read_at = float("-inf")
         self.reload()
 
     def request_reload(self) -> None:
@@ -411,14 +458,41 @@ class Dispatcher:
                 self.reload()
 
     def reload(self) -> None:
+        self._read_at = time.monotonic()
         new = load_instances(STATE_DIR)
         with self._lock:
             self._instances = new
-        log.info(
-            "loaded %d VPN instance(s): %s",
-            len(new),
-            ", ".join(f"{n}=0x{m:x}" for n, m in new) or "(none)",
-        )
+        _log_loaded(new)
+
+    def _refresh_instances(self, why: str) -> list[tuple[str, int]]:
+        """Re-read the state dir, SIGHUP or not, and return every state
+        file's (INSTANCE, FWMARK) for the janitor's drain check. `why` goes
+        into the log line when the list changes.
+
+        vpnns-up.sh and vpnns-down.sh signal when a live slot comes up or
+        stops, but a signal can still go missing, and the list would then
+        lack a slot until some later rotation signalled. The janitor calls
+        this on every pass, which puts the slot back within
+        JANITOR_INTERVAL; pick() calls it while the list is empty. A read
+        with no live slot in it is not adopted (see unclaimed_slot_marks for
+        why it is not trusted); an explicit SIGHUP still adopts one.
+
+        Under _reload_lock for the same reason _apply_pending_reload is: two
+        reloads storing out of order would put the older list back.
+        """
+        with self._reload_lock:
+            self._read_at = time.monotonic()
+            entries = load_state_files(STATE_DIR)
+            new = [(n, m) for n, m in entries if is_live_slot(n)]
+            changed = False
+            if new:
+                with self._lock:
+                    if new != self._instances:
+                        self._instances = new
+                        changed = True
+        if changed:
+            _log_loaded(new, why)
+        return entries
 
     def _load_counts(self, map_name: str) -> dict[int, int]:
         """Per-slot entry count for ONE dispatch map, from a short-lived cache.
@@ -468,8 +542,9 @@ class Dispatcher:
 
         Without this, every new flow inside one cache window would read the
         same numbers and pile onto the same slot — exactly the behaviour
-        pick_distributed exists to avoid. Small drift is possible (an insert
-        that silently hit an existing key still counts as one) and is bounded
+        pick_distributed exists to avoid. Small drift is possible (re-adding a
+        key with the mark it already has succeeds, and still counts as one; a
+        key held with a different mark is a clash and does not) and is bounded
         by the next refresh, which replaces the counts wholesale from nft.
         """
         with self._load_lock:
@@ -493,7 +568,20 @@ class Dispatcher:
         with self._lock:
             instances = list(self._instances)
         if not instances:
-            return None
+            # Every new flow is dropped while the list is empty, so do not
+            # leave it to the janitor (up to JANITOR_INTERVAL away) to notice
+            # a slot that is back. The list empties when a SIGHUP from
+            # vpnns-down.sh is applied while the only slot, or every slot, is
+            # restarting; vpnns-up.sh signals again once the slot is back, and
+            # this covers that signal going missing. At most once per
+            # EMPTY_REREAD_S, as every new flow comes through here meanwhile.
+            if time.monotonic() - self._read_at < EMPTY_REREAD_S:
+                return None
+            self._refresh_instances(" (re-read by a new flow)")
+            with self._lock:
+                instances = list(self._instances)
+            if not instances:
+                return None
 
         # 1. Distribute new assignments across the good slots (fresh, non-
         #    degraded, within SPREAD_BAND of the best), least-loaded first.
@@ -547,10 +635,7 @@ class Dispatcher:
             return
 
         name, mark = choice
-
-        # New flow dispatched to `name` — count it for the UI status snapshot.
-        with self._counts_lock:
-            self._flow_counts[name] += 1
+        picked = mark
 
         # Record the destination always; pin the source only when the source
         # actually identifies a host. Only real client-VLAN/trusted hosts get a
@@ -563,6 +648,13 @@ class Dispatcher:
         # new`, so an established TCP flow never comes back here. A failed
         # insert only costs the NEXT flow to that source or destination a
         # fresh pick.
+        #
+        # An entry that is already there (a clash, see _record) wins over
+        # this pick, and the verdict follows it. The ruleset reads @source_pin
+        # before @vpn_dispatch, so for a pinned host its pin decides (and the
+        # destination entry is written with the pin's mark); for any other
+        # source, the destination entry does.
+        pin_mark = None
         if tunnel_src:
             # Trusted traffic out of the UDM tunnel: the router masquerades, so
             # `src` is the tunnel address for every trusted host alike. The
@@ -573,18 +665,26 @@ class Dispatcher:
             log.debug("tunnel source %s: destination-only dispatch "
                       "(dst=%s -> %s)", src, dest, name)
         elif is_pinnable_source(src, _pinnable_cidrs()):
-            if _nft_source_pin_insert(src, mark):
-                self._load_adjust(NFT_SOURCE_PIN_MAP, mark, 1)
-            else:
-                log.error("source_pin insert failed (0x%x)", mark)
-                log.debug("source_pin insert failed for %s -> %s (0x%x)", src, name, mark)
+            pin_mark = self._record(NFT_SOURCE_PIN_MAP, src, mark,
+                                    _nft_source_pin_insert)
+            if pin_mark is not None:
+                mark = pin_mark
         else:
             log.debug("not pinning untrusted source %s (dst=%s -> %s)", src, dest, name)
-        if _nft_map_insert(dest, mark):
-            self._load_adjust(NFT_MAP, mark, 1)
-        else:
-            log.error("vpn_dispatch insert failed (0x%x)", mark)
-            log.debug("vpn_dispatch insert failed for %s -> %s (0x%x)", dest, name, mark)
+        dest_mark = self._record(NFT_MAP, dest, mark, _nft_map_insert)
+        if pin_mark is None and dest_mark is not None:
+            mark = dest_mark
+
+        if mark != picked:
+            with self._lock:
+                name = next((n for n, m in self._instances if m == mark),
+                            f"0x{mark:x}")
+            log.debug("dispatch src=%s dst=%s: map already held 0x%x, not the "
+                      "picked 0x%x; following it", src, dest, mark, picked)
+
+        # New flow dispatched to `name` — count it for the UI status snapshot.
+        with self._counts_lock:
+            self._flow_counts[name] += 1
 
         pkt.set_mark(mark)
         pkt.accept()
@@ -592,21 +692,80 @@ class Dispatcher:
         # line; the default (INFO) level must not record per-client addresses.
         log.debug("dispatch src=%s dst=%s -> %s (mark 0x%x)", src, dest, name, mark)
 
+    def _record(self, map_name: str, key: str, mark: int, insert) -> int | None:
+        """Write key -> mark into one dispatch map and return the mark the map
+        holds for key afterwards: `mark` itself, or on a clash the mark that
+        was already there. None when that is unknown (the insert failed, or
+        the clashing entry could not be read).
+
+        A clash means two new flows raced: both reached the queue before
+        either entry landed (a new client opening several connections at
+        once, or several packets of one UDP flow before any reply), and the
+        other flow's entry got there first. nft refuses the second add with
+        "File exists" and keeps the first mark. Verdicting our own mark anyway
+        sent this flow out one exit while the map sent the host's (or the
+        destination's) later flows out another. For a later packet of a flow
+        already verdicted it was worse: prerouting_ctsave had saved the first
+        mark, so that one flow left by two exits. Nothing was added, so the
+        cached load is left alone.
+        """
+        result = insert(key, mark)
+        if result == INSERT_ADDED:
+            self._load_adjust(map_name, mark, 1)
+            return mark
+        if result == INSERT_CLASH:
+            held = _nft_map_elem_get(map_name, key)
+            if held is None:
+                log.error("%s entry already present and unreadable "
+                          "(picked 0x%x)", map_name, mark)
+                log.debug("%s entry for %s already present and unreadable",
+                          map_name, key)
+            return held
+        log.error("%s insert failed (0x%x)", map_name, mark)
+        log.debug("%s insert failed for %s (0x%x)", map_name, key, mark)
+        return None
+
     def flow_counts_snapshot(self) -> dict[str, int]:
         with self._counts_lock:
             return dict(self._flow_counts)
 
     def janitor_once(self) -> None:
-        """One pass: evict map entries whose mark belongs to a degraded slot,
-        then publish a status snapshot for the web UI."""
+        """One pass: re-read the instance list, evict map entries whose mark
+        belongs to a degraded slot or to one that has stopped or been
+        removed, then publish a status snapshot for the web UI."""
         self._apply_pending_reload()
+        entries = self._refresh_instances(" (found by the janitor's re-read)")
         with self._lock:
             instances = list(self._instances)
-        self._evict_degraded_pins(instances)
+        self._evict_pins(instances, self._drainable_marks(entries))
         self._publish_snapshot(instances)
 
-    def _evict_degraded_pins(self, instances: list[tuple[str, int]]) -> None:
-        """Drop entries pointing at a degraded slot from BOTH dispatch maps.
+    def _drainable_marks(self, entries: list[tuple[str, int]]) -> set[int]:
+        """Marks of live slots that are gone: stopped (vpnns-down.sh deletes
+        the state file) or removed. Their entries lead to the slot's blackhole
+        sentinel, or with no slot rule left to the catch rule, so a client
+        pinned there hangs until the pin expires (PIN_TTL_S) unless it is
+        drained here and dispatched afresh.
+
+        A mark qualifies only when two consecutive passes, JANITOR_INTERVAL
+        apart, each found no state file claiming it. One read proves little:
+        `systemctl restart proteus-proton@N` leaves the slot without a state
+        file for a few seconds, and vpnns-up.sh rewrites the file in place
+        (truncate, then write), so a read can land in between. A pass whose
+        read lists no live slot drains nothing and restarts the count.
+        Only live-slot marks are candidates, and never the DNS tunnel's (see
+        dispatcher_logic.LIVE_SLOT_MARKS).
+        """
+        unclaimed = unclaimed_slot_marks(entries, _NOT_SLOT_MARKS)
+        prev, self._unclaimed_prev = self._unclaimed_prev, unclaimed
+        if unclaimed is None or prev is None:
+            return set()
+        return unclaimed & prev
+
+    def _evict_pins(self, instances: list[tuple[str, int]],
+                    gone: set[int] = frozenset()) -> None:
+        """Drop entries pointing at a degraded or gone slot from BOTH
+        dispatch maps.
 
         source_pin is the client VLAN's path. vpn_dispatch is the trusted
         VLAN's PRIMARY path — the UDM masquerades, so tunnel traffic dispatches
@@ -616,19 +775,25 @@ class Dispatcher:
         Removing the entry sends the next packet for that key back through the
         NFQUEUE, where pick() chooses a healthy slot.
 
+        `gone` holds the marks of slots that have stopped or been removed (see
+        _drainable_marks). Their entries are worse off than a degraded slot's:
+        the traffic is dropped, not merely slow.
+
         Rotation deliberately needs none of this: rotate-slot.sh replaces the
         WireGuard endpoint inside a slot's namespace and never touches the
         slot's fwmark or routing table (vpnns-up.sh derives FWMARK from the
         slot index, so it is stable across a rotation), which is why an
         existing mark keeps routing correctly into the same, now-rotated
-        namespace. Only degradation makes a mark worth dropping.
+        namespace. Only degradation, or the slot going away, makes a mark
+        worth dropping.
         """
         bad_marks = degraded_marks(instances, HEALTH_DIR)
-        if not bad_marks:
+        if not bad_marks and not gone:
             return
         # Reverse-lookup mark -> name for log messages.
         name_by_mark = {m: n for n, m in instances}
-        evicted = 0
+        evicted: Counter[str] = Counter()
+        drained: set[int] = set()
         for kind, map_name, entries, remove in (
             ("pin", NFT_SOURCE_PIN_MAP, _nft_list_source_pin, _nft_source_pin_remove),
             ("dest", NFT_MAP, _nft_list_vpn_dispatch, _nft_vpn_dispatch_remove),
@@ -639,16 +804,29 @@ class Dispatcher:
                 # other one is still worth sweeping.
                 continue
             for key, mark in listed:
-                if mark in bad_marks and remove(key):
-                    evicted += 1
+                if mark in gone:
+                    why = "gone"
+                elif mark in bad_marks:
+                    why = "degraded"
+                else:
+                    continue
+                if remove(key):
+                    evicted[why] += 1
+                    if why == "gone":
+                        drained.add(mark)
                     # Keep the cached load in step, so picks made before the
                     # next refresh see the freed capacity.
                     self._load_adjust(map_name, mark, -1)
                     # Client/destination IPs -> DEBUG only.
-                    log.debug("evicted %s %s -> %s (degraded)", kind, key,
-                              name_by_mark.get(mark, f"0x{mark:x}"))
-        if evicted:
-            log.info("janitor: evicted %d map entries to degraded slots", evicted)
+                    log.debug("evicted %s %s -> %s (%s)", kind, key,
+                              name_by_mark.get(mark, f"0x{mark:x}"), why)
+        if evicted["degraded"]:
+            log.info("janitor: evicted %d map entries to degraded slots",
+                     evicted["degraded"])
+        if evicted["gone"]:
+            log.info("janitor: evicted %d map entries to stopped or removed "
+                     "slot mark(s) %s", evicted["gone"],
+                     ", ".join(f"0x{m:x}" for m in sorted(drained)))
 
     def _publish_snapshot(self, instances: list[tuple[str, int]]) -> None:
         """Build and atomically write /run/proteus/dispatcher-status.json.
@@ -687,6 +865,16 @@ class Dispatcher:
             time.sleep(JANITOR_INTERVAL)
 
 
+def _log_loaded(instances: list[tuple[str, int]], why: str = "") -> None:
+    # Operators grep for "loaded N VPN instance(s)" to confirm a reload.
+    log.info(
+        "loaded %d VPN instance(s): %s%s",
+        len(instances),
+        ", ".join(f"{n}=0x{m:x}" for n, m in instances) or "(none)",
+        why,
+    )
+
+
 def _count_marks(entries: list[tuple[str, int]] | None) -> dict[int, int]:
     """Per-mark entry count from one map listing. None (an nft error, already
     logged by the lister) becomes `{}` — "no load information" — rather than
@@ -697,32 +885,44 @@ def _count_marks(entries: list[tuple[str, int]] | None) -> dict[int, int]:
     return counts
 
 
-def _nft_map_insert(dest_ip: str, mark: int) -> bool:
-    """Insert (dest_ip -> mark) into the dispatch map."""
-    elem = "{ %s : 0x%x }" % (dest_ip, mark)
+# What one `nft add element` did. nft 1.1.3, checked in a scratch netns:
+# re-adding a key with the mark it already has succeeds (and refreshes its
+# timeout); a key held with a DIFFERENT mark fails with "File exists" and the
+# element keeps its old mark. That second case is a clash, not a success.
+INSERT_ADDED = "added"
+INSERT_CLASH = "clash"
+INSERT_FAILED = "failed"
+
+
+def _nft_map_elem_add(map_name: str, elem: str, key: str) -> str:
+    """`nft add element` one element; INSERT_ADDED, INSERT_CLASH or
+    INSERT_FAILED. `key` is only for the DEBUG log."""
     try:
         r = subprocess.run(
-            ["nft", "add", "element", NFT_TABLE_FAMILY, NFT_TABLE, NFT_MAP, elem],
-            capture_output=True,
-            text=True,
-            timeout=2,
+            ["nft", "add", "element", NFT_TABLE_FAMILY, NFT_TABLE, map_name, elem],
+            capture_output=True, text=True, timeout=2,
         )
     except subprocess.TimeoutExpired:
-        log.error("nft add element (vpn_dispatch) timed out")
-        log.debug("nft add element timed out for %s", dest_ip)
-        return False
+        log.error("nft add element (%s) timed out", map_name)
+        log.debug("nft add element (%s) timed out for %s", map_name, key)
+        return INSERT_FAILED
     if r.returncode != 0:
-        # An existing entry for this key errors out with "File exists" — treat as benign.
         if "File exists" in (r.stderr or ""):
-            return True
-        log.error("nft add element (vpn_dispatch) failed (rc=%s)", r.returncode)
-        log.debug("nft add element failed (%s): %s", r.returncode, r.stderr.strip())
-        return False
-    return True
+            return INSERT_CLASH
+        log.error("nft add element (%s) failed (rc=%s)", map_name, r.returncode)
+        log.debug("nft add element (%s) failed (%s): %s",
+                  map_name, r.returncode, r.stderr.strip())
+        return INSERT_FAILED
+    return INSERT_ADDED
 
 
-def _nft_source_pin_insert(src_ip: str, mark: int) -> bool:
-    """Insert (src_ip -> mark) into the source_pin map.
+def _nft_map_insert(dest_ip: str, mark: int) -> str:
+    """Insert (dest_ip -> mark) into the dispatch map. See _nft_map_elem_add."""
+    return _nft_map_elem_add(NFT_MAP, "{ %s : 0x%x }" % (dest_ip, mark), dest_ip)
+
+
+def _nft_source_pin_insert(src_ip: str, mark: int) -> str:
+    """Insert (src_ip -> mark) into the source_pin map. See _nft_map_elem_add.
 
     Sets an explicit per-element timeout (PIN_TTL_S) rather than relying on
     the map's own default (`timeout 6h` in etc/nftables.conf), so
@@ -731,27 +931,36 @@ def _nft_source_pin_insert(src_ip: str, mark: int) -> bool:
     mark }` is accepted and the element reads back with `timeout: 30`.
     """
     elem = "{ %s timeout %ds : 0x%x }" % (src_ip, PIN_TTL_S, mark)
+    return _nft_map_elem_add(NFT_SOURCE_PIN_MAP, elem, src_ip)
+
+
+def _nft_map_elem_get(map_name: str, key: str) -> int | None:
+    """The mark `map_name` holds for `key`, or None if nft cannot say (the
+    entry expired or was evicted since, or nft failed).
+
+    One `nft get element` rather than a JSON listing of the whole map: this
+    runs on the NFQUEUE path, a burst of new flows from one new host clashes
+    several times in a row, and vpn_dispatch can hold tens of thousands of
+    entries. See parse_get_element_mark for the output it reads.
+    """
     try:
         r = subprocess.run(
-            ["nft", "add", "element", NFT_TABLE_FAMILY, NFT_TABLE,
-             NFT_SOURCE_PIN_MAP, elem],
+            ["nft", "get", "element", NFT_TABLE_FAMILY, NFT_TABLE, map_name,
+             "{ %s }" % key],
             capture_output=True, text=True, timeout=2,
         )
     except subprocess.TimeoutExpired:
-        log.error("nft add element (source_pin) timed out")
-        log.debug("nft add element (source_pin) timed out for %s", src_ip)
-        return False
+        log.error("nft get element (%s) timed out", map_name)
+        return None
     if r.returncode != 0:
-        if "File exists" in (r.stderr or ""):
-            return True
-        log.error("nft add element (source_pin) failed (rc=%s)", r.returncode)
-        log.debug("nft add element (source_pin) failed (%s): %s",
-                  r.returncode, r.stderr.strip())
-        return False
-    return True
+        log.error("nft get element (%s) failed (rc=%s)", map_name, r.returncode)
+        log.debug("nft get element (%s) failed for %s: %s",
+                  map_name, key, r.stderr.strip())
+        return None
+    return parse_get_element_mark(r.stdout, key)
 
 
-JANITOR_INTERVAL = 60  # seconds between degradation eviction passes
+JANITOR_INTERVAL = 60  # seconds between janitor passes (re-read, eviction, snapshot)
 
 
 def _nft_map_elem_list(map_name: str) -> object | None:
@@ -853,7 +1062,8 @@ def _nft_vpn_dispatch_remove(dest_ip: str) -> bool:
 
 def _install_signal_handlers(d: Dispatcher) -> None:
     """SIGHUP = re-read the instance list (rotate-slot.sh sends it after
-    every promotion).
+    every promotion, vpnns-up.sh / vpnns-down.sh when a live slot comes up or
+    stops).
 
     Two rules, both load-bearing:
 
@@ -890,6 +1100,11 @@ def main() -> int:
         return 1
 
     _install_signal_handlers(d)
+    # SIGHUP was ignored until the line above (see the top of this file), and
+    # one that arrived after Dispatcher() read the state files announced a
+    # change that read may have missed. Nothing records whether one came, so
+    # always reload once more: it costs a directory read.
+    d.request_reload()
 
     # Start the pin janitor in the background.
     janitor = threading.Thread(target=d.janitor_loop, name="janitor", daemon=True)

@@ -236,6 +236,28 @@ def test_unit_restarts_a_dispatcher_killed_by_sighup():
         assert "RestartForceExitStatus=SIGHUP" in lines, unit
 
 
+def test_unit_comment_names_every_sighup_sender():
+    """The comment on RestartForceExitStatus says who sends the SIGHUP. It
+    named rotate-slot.sh alone after vpnns-down.sh started sending one too;
+    a sender left out is one an operator reading the unit will not think of
+    when the dispatcher reloads or restarts."""
+    root = Path(__file__).resolve().parent.parent
+    senders = {p.name for p in (root / "etc/proteus/bin").iterdir()
+               if p.is_file() and "--signal=HUP proteus-dispatcher.service"
+               in p.read_text(errors="replace")}
+    assert senders >= {"rotate-slot.sh", "vpnns-up.sh", "vpnns-down.sh"}, senders
+    for unit in (root / "etc/systemd/system/proteus-dispatcher.service",
+                 root / "install/templates/proteus-dispatcher.service.tmpl"):
+        lines = unit.read_text().splitlines()
+        i = lines.index("RestartForceExitStatus=SIGHUP")
+        j = i
+        while j > 0 and lines[j - 1].startswith("#"):
+            j -= 1
+        comment = " ".join(lines[j:i])
+        for s in sorted(senders):
+            assert s in comment, f"{unit.name}: {s} is not named above line {i + 1}"
+
+
 def test_main_exits_nonzero_when_receive_loop_returns(monkeypatch, tmp_path):
     """nfq.run() returning means recv() failed; exit 1 so Restart=on-failure
     fires. (It used to return 0, which systemd treats as a clean stop.)"""
@@ -256,6 +278,104 @@ def test_main_exits_nonzero_when_receive_loop_returns(monkeypatch, tmp_path):
     finally:
         signal.signal(signal.SIGHUP, old)
         signal.siginterrupt(signal.SIGHUP, True)
+
+
+# --- a SIGHUP during startup ---------------------------------------------------
+
+# Stands in for netfilterqueue when dispatcher.py runs as the daemon: the
+# import is where startup spends its time (with scapy right after it), so a
+# rotate-slot.sh or vpnns-down.sh SIGHUP is most likely to land here. It then
+# stops the run: going on into main() would read and write the real box's
+# paths.
+_HUP_ON_IMPORT = """\
+import os, signal
+os.kill(os.getpid(), signal.SIGHUP)
+print("OK survived a SIGHUP during the imports", flush=True)
+raise SystemExit(0)
+"""
+
+
+def test_sighup_during_the_startup_imports_does_not_kill_the_daemon(tmp_path):
+    """Before the handler is installed the default action kills the process,
+    and systemd restarts it only thanks to RestartForceExitStatus=SIGHUP: a
+    restart for what should have been a reload. dispatcher.py ignores SIGHUP
+    from its first lines, before the heavy imports. Run exactly as systemd
+    does (the script itself, as __main__)."""
+    (tmp_path / "netfilterqueue.py").write_text(_HUP_ON_IMPORT)
+    env = dict(os.environ, PYTHONPATH=str(tmp_path))
+    r = subprocess.run([sys.executable, str(_BIN / "dispatcher.py")],
+                       capture_output=True, text=True, timeout=30, env=env)
+    assert r.returncode == 0 and "OK survived" in r.stdout, \
+        f"rc={r.returncode} (-{int(signal.SIGHUP)} is death by SIGHUP)\n{r.stdout}{r.stderr}"
+
+
+def test_importing_the_module_leaves_sighup_alone():
+    """The ignore is for the daemon only; an importer (these tests) keeps its
+    own signal handling."""
+    code = ("import signal, sys, types\n"
+            f"sys.path.insert(0, {str(_BIN)!r})\n"
+            "sys.modules['netfilterqueue'] = types.SimpleNamespace(NetfilterQueue=object)\n"
+            "for n in ('scapy', 'scapy.layers', 'scapy.layers.inet'):\n"
+            "    sys.modules[n] = types.ModuleType(n)\n"
+            "sys.modules['scapy.layers.inet'].IP = object\n"
+            "import dispatcher\n"
+            "print(signal.getsignal(signal.SIGHUP) is signal.SIG_DFL)\n")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                       text=True, timeout=30)
+    assert r.stdout.strip() == "True", r.stdout + r.stderr
+
+
+def test_a_sighup_ignored_during_startup_is_not_lost(monkeypatch, tmp_path):
+    """rotate-slot.sh promotes a slot and signals just after Dispatcher() has
+    read the state files, while SIGHUP is still ignored. The first flow after
+    startup must see the new slot anyway: main() requests one reload once the
+    real handler is in."""
+    sd = _state_dir("proton-1")
+    monkeypatch.setattr(dispatcher, "STATE_DIR", sd)
+    monkeypatch.setattr(dispatcher, "HEALTH_DIR", str(tmp_path / "health"))
+    monkeypatch.setattr(dispatcher, "LOG_PATH", str(tmp_path / "d.log"))
+    _quiet(monkeypatch)
+    # The janitor's own re-read would find the slot too; this is about the
+    # pick path, which must not wait for it.
+    monkeypatch.setattr(dispatcher.Dispatcher, "janitor_loop", lambda self: None)
+
+    real_load = dispatcher.load_instances
+    reads: list[int] = []
+
+    def read_then_promote(state_dir):
+        out = real_load(state_dir)
+        if not reads:
+            Path(sd, "proton-2.state").write_text("INSTANCE=proton-2\nFWMARK=0x2\n")
+            os.kill(os.getpid(), signal.SIGHUP)     # ignored: no handler yet
+        reads.append(1)
+        return out
+    monkeypatch.setattr(dispatcher, "load_instances", read_then_promote)
+
+    seen: dict = {}
+
+    class FakeNFQ:
+        def bind(self, num, cb):
+            self.d = cb.__self__
+
+        def run(self):
+            seen["handler"] = signal.getsignal(signal.SIGHUP)
+            self.d.pick()                           # the first new flow
+            seen["names"] = [n for n, _ in self.d._instances]
+
+        def unbind(self):
+            pass
+
+    monkeypatch.setattr(dispatcher, "NetfilterQueue", FakeNFQ)
+    # What the top of dispatcher.py does when it runs as the daemon.
+    old = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        assert dispatcher.main() == 1
+    finally:
+        signal.signal(signal.SIGHUP, old)
+        signal.siginterrupt(signal.SIGHUP, True)
+    assert callable(seen["handler"]), "main() did not replace the startup SIG_IGN"
+    assert seen["names"] == ["proton-1", "proton-2"], \
+        "the SIGHUP that arrived during startup was lost"
 
 
 # --- subprocess scenarios: real signals on a real main thread -----------------

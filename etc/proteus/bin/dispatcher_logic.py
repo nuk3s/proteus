@@ -18,14 +18,33 @@ from typing import Iterable
 log = logging.getLogger("dispatcher")
 
 
-def load_instances(state_dir: str) -> list[tuple[str, int]]:
-    """Return list of (instance_name, mark_int) from state files in state_dir.
+def is_live_slot(name: str) -> bool:
+    """True for a proton-<N> slot, the only kind that takes client traffic.
+    Specialized tunnels (e.g. dns-6) carry their own dedicated traffic via
+    per-uid routing rules, and a staging copy (proton-N-s) is a rotation's
+    candidate, not yet a slot."""
+    return re.fullmatch(r"proton-\d+", name) is not None
 
-    Only proton-<N> slots participate in client-traffic rotation.
-    Specialized tunnels (e.g. dns-6) are excluded; they carry their own
-    dedicated traffic via per-uid routing rules.
+
+# What load_state_files last warned about, by path. The dispatcher's janitor
+# reads the state dir every pass (once a minute), so a state file that stays
+# broken would otherwise repeat its warning every minute for as long as it
+# sits there. A path warns again once its problem changes, or after a read
+# that found it fine (or gone) in between.
+_state_file_warned: dict[str, str] = {}
+
+
+def load_state_files(state_dir: str) -> list[tuple[str, int]]:
+    """(INSTANCE, FWMARK) from every readable state file in state_dir, whatever
+    the instance: live slots, staging copies and the DNS tunnel alike.
+
+    load_instances narrows this to the slots that take client traffic. The
+    janitor needs the whole list as well, because any instance that is up
+    claims its mark, not only the ones the dispatcher hands out.
     """
-    instances: list[tuple[str, int]] = []
+    global _state_file_warned
+    entries: list[tuple[str, int]] = []
+    problems: dict[str, str] = {}
     for path in sorted(glob.glob(f"{state_dir}/*.state")):
         kv: dict[str, str] = {}
         try:
@@ -36,18 +55,62 @@ def load_instances(state_dir: str) -> list[tuple[str, int]]:
                         k, v = line.split("=", 1)
                         kv[k] = v
         except OSError as e:
-            log.warning("could not read %s: %s", path, e)
+            problems[path] = f"could not read {path}: {e}"
             continue
         name = kv.get("INSTANCE")
         mark = kv.get("FWMARK")
-        if name and not re.fullmatch(r"proton-\d+", name):
-            continue
         if name and mark:
             try:
-                instances.append((name, int(mark, 16)))
+                entries.append((name, int(mark, 16)))
             except ValueError:
-                log.warning("bad FWMARK in %s: %r", path, mark)
-    return instances
+                problems[path] = f"bad FWMARK in {path}: {mark!r}"
+    for path, msg in problems.items():
+        if _state_file_warned.get(path) != msg:
+            log.warning("%s", msg)
+    _state_file_warned = problems
+    return entries
+
+
+def load_instances(state_dir: str) -> list[tuple[str, int]]:
+    """Return list of (instance_name, mark_int) from state files in state_dir.
+
+    Only proton-<N> slots participate in client-traffic rotation (see
+    is_live_slot).
+    """
+    return [(n, m) for n, m in load_state_files(state_dir) if is_live_slot(n)]
+
+
+# The marks the janitor may drain once no state file claims them. vpnns-up.sh
+# sets a slot's FWMARK to its index, and live slots are proton-1..proton-99
+# (rotate-slot.sh's range), so theirs are 0x1..0x63. Anything else found in the
+# maps was not written by the dispatcher and is not its to remove: a staging
+# copy runs at 100+N, and a mark outside this range can only have been added by
+# hand. The DNS tunnel's index can fall inside it (6 on older boxes, 99 on a
+# fresh install), so the caller passes that mark to unclaimed_slot_marks to
+# leave out as well.
+LIVE_SLOT_MARKS = frozenset(range(0x1, 0x64))
+
+
+def unclaimed_slot_marks(
+    entries: Iterable[tuple[str, int]],
+    exclude: Iterable[int] = (),
+) -> set[int] | None:
+    """Live-slot marks that no state file claims right now, or None when the
+    state files list no live slot at all.
+
+    `entries` is load_state_files' (INSTANCE, FWMARK) for EVERY state file:
+    a staging copy or the DNS tunnel claims its mark as firmly as a slot does.
+
+    None is the empty-list guard. A read that finds no live slot is more
+    likely a state dir caught mid-rewrite, or unreadable, than every slot
+    stopping at once; and if they really have all stopped, there is no slot
+    left to move the drained clients to.
+    """
+    entries = list(entries)
+    if not any(is_live_slot(n) for n, _ in entries):
+        return None
+    claimed = {m for _, m in entries}
+    return set(LIVE_SLOT_MARKS - claimed - set(exclude))
 
 
 SCORE_FRESH_SECONDS = 120  # max age of a score for ranking eligibility
@@ -446,6 +509,26 @@ def parse_source_pin_elements_with_ttl(elems: object) -> list[tuple[str, int, in
         except (TypeError, ValueError):
             continue
     return out
+
+
+def parse_get_element_mark(text: str, key: str) -> int | None:
+    """The mark in `nft get element <family> <table> <map> { key }` output.
+
+    nft 1.1.3 ignores -j for `get element` and prints the ruleset form, with
+    the one element on a line such as
+        elements = { 172.16.1.50 timeout 6h expires 5h59m58s : 0x00000002 }
+    (no timeout/expires on a map without them). Returns None unless that line
+    names exactly `key` (172.16.1.5 must not match 172.16.1.50) and ends in a
+    mark nft printed in hex or decimal.
+    """
+    m = re.search(
+        r"elements\s*=\s*\{\s*" + re.escape(key)
+        + r"(?=[\s:])[^:{}\n]*:\s*(0x[0-9a-fA-F]+|[0-9]+)\s*\}",
+        text or "")
+    if m is None:
+        return None
+    raw = m.group(1)
+    return int(raw, 16) if raw.startswith("0x") else int(raw)
 
 
 def build_status_snapshot(pins: dict, counters: dict, now: float) -> dict:

@@ -147,7 +147,7 @@ rg_rule_ensure fwmark notanumber lookup 109 2>/dev/null; echo "bad_rule_rc=$?"
 # Standalone entry point, as the dispatcher unit or an operator calls it.
 ( unset PROTEUS_CLIENT_GW_IP; PROTEUS_ENV_FILE=$ENVF bash "$RG" 150; echo "cli_rc=$?" )
 echo "cli_sentinel=$(ip route show table 150 | grep -c blackhole)"
-echo "cli_bad_table_rc=$(bash "$RG" 1x 2>/dev/null; echo $?)"
+echo "cli_bad_table_rc=$(PROTEUS_ENV_FILE=$ENVF bash "$RG" 1x 2>/dev/null; echo $?)"
 EOS
   printf 'PROTEUS_CLIENT_IFACE=cl0\n' > "$WORK/proteus.env"
   OUT=$(unshare -rn bash "$WORK/netns.sh" "$RG" "$WORK/proteus.env" 2>&1 || true)
@@ -178,9 +178,167 @@ EOS
   assert_eq "$(get unknown_iface_rc)" "1" "an unknown client interface is reported, not ignored"
   assert_eq "$(get cli_rc)" "0" "routeguard.sh TABLE works standalone (reads the env file itself)"
   assert_eq "$(get cli_sentinel)" "1" "... and installs the sentinel"
-  assert_eq "$(get cli_bad_table_rc)" "1" "routeguard.sh rejects a non-numeric table"
+  assert_eq "$(get cli_bad_table_rc)" "2" "routeguard.sh rejects a non-numeric table (exit 2)"
 else
   echo "  - SKIPPED netns behaviour: unprivileged user+net namespaces (unshare -rn) not available"
+fi
+
+# ---------------------------------------------------------------------------
+echo "layer 1 (routing): routeguard.sh takes slot tables only"
+# A sentinel is a blackhole default. In 255 (local) it cuts the box off; 0 and
+# 254 are main, 253 the kernel's default table, 900 the sink's. vpnns-up.sh can
+# create 101..300, and its range would reach 253..255 at idx 153..155.
+tok() { bash -c '. "$1"; rg_table_ok "$2" && echo ok || echo refused' _ "$RG" "$1"; }
+for t in 101 106 110 199 201 252 256 300; do
+  assert_eq "$(tok "$t")" ok "rg_table_ok accepts $t"
+done
+for t in 0 100 253 254 255 301 900 0101 1x "" -5 1e3 99999999999999999999; do
+  assert_eq "$(tok "$t")" refused "rg_table_ok refuses '$t'"
+done
+if command -v ip >/dev/null 2>&1 && userns_ok; then
+  cat > "$WORK/tables.sh" <<'EOS'
+set -u
+RG=$1
+# A client interface that checks out, so the table message is the only one.
+export PROTEUS_ENV_FILE=/nonexistent PROTEUS_CLIENT_IFACE=cl0 PROTEUS_CLIENT_GW_IP=172.16.1.5
+ip link set lo up
+sysctl -q -w net.ipv4.ip_forward=1
+ip link add up0 type dummy; ip addr add 192.0.2.1/24 dev up0; ip link set up0 up
+ip route add default via 192.0.2.254 dev up0
+ip link add cl0 type dummy; ip addr add 172.16.1.5/24 dev cl0; ip link set cl0 up
+rcs=""
+for t in 0 253 254 255 900 100 301 0101 99999999999999999999; do
+  bash "$RG" "$t" 2>/dev/null; rcs+="$t:$? "
+done
+echo "bad_rcs=$rcs"
+echo "bad_blackholes=$(ip route show table all | grep -c '^blackhole')"
+# The catch rule and the sink depend on no table: a bad one does not stop them.
+echo "bad_catch=$(ip route get 203.0.113.9 mark 0x7 2>&1 | head -1)"
+echo "bad_fwd=$(ip route get 203.0.113.9 from 172.16.1.50 iif cl0 2>&1 | head -1)"
+echo "bad_msg=$(bash "$RG" 255 2>&1 | tr '\n' ';')"
+# The installer's shape: one RT_TABLE per state file, one of them bad. The
+# others, before and after it, still get their sentinel.
+bash "$RG" 150 255 151 2>/dev/null; echo "mixed_rc=$?"
+# Both at once: a bad table AND something left unarmed (here the client
+# interface cannot be found). 1 must win: 2 would read as "all else armed".
+( unset PROTEUS_CLIENT_IFACE; PROTEUS_CLIENT_GW_IP=198.51.100.99 bash "$RG" 255 2>/dev/null; echo "both_rc=$?" )
+echo "mixed_sentinels=$(for t in 150 151; do ip route show table "$t" | grep -c 'blackhole default metric 4294967295'; done | tr -d '\n')"
+echo "blackholes=$(ip route show table all | grep -c '^blackhole')"
+echo "uplink_route=$(ip route get 203.0.113.9 2>&1 | head -1)"
+# The sourced function refuses too: vpnns-down.sh passes it the RT_TABLE of a
+# state file, and vpnns-up.sh relies on it before its teardown.
+. "$RG"
+rg_sentinel_ensure 255 2>/dev/null; echo "src_rc=$?"
+echo "src_msg=$(rg_sentinel_ensure 254 2>&1)"
+echo "local_blackholes=$(ip route show table local | grep -c blackhole)"
+echo "main_blackholes=$(ip route show table main | grep -c blackhole)"
+for t in 101 252 256 300; do bash "$RG" "$t" 2>/dev/null; done
+echo "edge_sentinels=$(for t in 101 252 256 300; do ip route show table "$t" | grep -c 'blackhole default metric 4294967295'; done | tr -d '\n')"
+EOS
+  OUT=$(unshare -rn bash "$WORK/tables.sh" "$RG" 2>&1 || true)
+  get() { sed -n "s/^$1=//p" <<<"$OUT" | head -1; }
+  assert_eq "$(get bad_rcs)" "0:2 253:2 254:2 255:2 900:2 100:2 301:2 0101:2 99999999999999999999:2 " \
+    "routeguard.sh exits 2 for 0, the reserved 253..255, the sink table, out-of-range, leading-zero and overlong tables"
+  assert_eq "$(get bad_blackholes)" "0" "... and puts a blackhole in none of them"
+  assert_eq "$(get bad_catch | cnt_re '[Ii]nvalid argument')" "1" "... but still arms the catch rule"
+  assert_eq "$(get bad_fwd | cnt_fx 'dev proteus-null')" "1" "... and the ingress sink"
+  assert_eq "$(get bad_msg)" "routeguard: table 255 is not a slot table (101..300 except 253..255); left alone;" \
+    "... and names the value it refused, and nothing else"
+  assert_eq "$(get mixed_rc)" "2" "a bad table anywhere in the list still exits 2"
+  assert_eq "$(get both_rc)" "1" "a bad table plus something unarmed exits 1, not 2"
+  assert_eq "$(get mixed_sentinels)/$(get blackholes)" "11/2" \
+    "... and the valid tables either side of it get their sentinel, the bad one nothing"
+  assert_eq "$(get uplink_route | cnt_fx 'dev up0')" "1" "the box still routes (local and main untouched)"
+  assert_eq "$(get src_rc)" "1" "sourced rg_sentinel_ensure refuses 255"
+  assert_eq "$(get src_msg)" "routeguard: refusing table 254: not a slot table (101..300 except 253..255)" "... and says which table"
+  assert_eq "$(get local_blackholes)/$(get main_blackholes)" "0/0" "... and local and main stay free of blackholes"
+  assert_eq "$(get edge_sentinels)" "1111" "the edges 101, 252, 256 and 300 are accepted and get their sentinel"
+else
+  echo "  - SKIPPED table validation in a netns: unprivileged user+net namespaces (unshare -rn) not available"
+fi
+
+# ---------------------------------------------------------------------------
+echo "layer 1 (routing): a PROTEUS_CLIENT_IFACE that is wrong is reported, and armed anyway"
+if command -v ip >/dev/null 2>&1 && userns_ok; then
+  cat > "$WORK/iface.sh" <<'EOS'
+set -u
+RG=$1; ENVF=$2
+unset PROTEUS_CLIENT_IFACE PROTEUS_CLIENT_GW_IP RG_BEFORE_NETWORK
+export PROTEUS_ENV_FILE=/nonexistent
+. "$RG"
+ip link set lo up
+ip link add cl0 type dummy; ip addr add 172.16.1.5/24 dev cl0; ip link set cl0 up
+ip link add other0 type dummy; ip link set other0 up
+# <key> <iface> <gw>: "stdout|rc|stderr" of rg_client_iface
+ci() {
+  local out rc err
+  out=$(PROTEUS_CLIENT_IFACE=$2 PROTEUS_CLIENT_GW_IP=$3 rg_client_iface 2>/dev/null); rc=$?
+  err=$(PROTEUS_CLIENT_IFACE=$2 PROTEUS_CLIENT_GW_IP=$3 rg_client_iface 2>&1 >/dev/null)
+  echo "$1=$out|$rc|$err"
+}
+ci right cl0 172.16.1.5
+ci typo cl9 172.16.1.5
+ci wrong other0 172.16.1.5
+ci nowhere cl0 172.16.1.99
+ci nogw_ok cl0 ""
+ci nogw_typo cl9 ""
+RG_BEFORE_NETWORK=1 ci early_typo cl9 172.16.1.5
+RG_BEFORE_NETWORK=1 ci early_wrong other0 172.16.1.5
+# An altname finds the device, yet it is the wrong name to configure: nft
+# iifname never matches it, and a rule armed on it before the NIC existed
+# never attaches.
+if ip link property add dev cl0 altname clalt 2>/dev/null; then
+  ci alt clalt 172.16.1.5
+  ci alt_nogw clalt ""
+fi
+# ip prints a veth or VLAN as name@peer; that is still the primary name.
+if ip link add vc0 type veth peer name vc1 2>/dev/null; then
+  ci veth vc0 ""
+fi
+PROTEUS_CLIENT_IFACE=cl9 PROTEUS_CLIENT_GW_IP=172.16.1.5 rg_sink_ensure 2>/dev/null; echo "sink_typo_rc=$?"
+echo "sink_typo_rule=$(ip rule show pref 32020 | grep -cE 'iif cl9 \[detached\] lookup 900')"
+echo "sink_typo_lan=$(ip rule show pref 32010 | grep -c 'iif cl9')"
+PROTEUS_CLIENT_IFACE=other0 PROTEUS_CLIENT_GW_IP=172.16.1.5 bash "$RG" 2>/dev/null; echo "cli_wrong_rc=$?"
+echo "cli_wrong_rule=$(ip rule show pref 32020 | grep -c 'iif other0 lookup 900')"
+RG_BEFORE_NETWORK=1 PROTEUS_CLIENT_IFACE=other0 PROTEUS_CLIENT_GW_IP=172.16.1.5 bash "$RG" 2>/dev/null; echo "cli_early_rc=$?"
+PROTEUS_CLIENT_IFACE=cl0 PROTEUS_CLIENT_GW_IP=172.16.1.5 bash "$RG" 2>/dev/null; echo "cli_right_rc=$?"
+# The name read from the env file is checked the same way.
+PROTEUS_ENV_FILE=$ENVF bash "$RG" 2>/dev/null; echo "cli_envfile_rc=$?"
+echo "cli_envfile_msg=$(PROTEUS_ENV_FILE=$ENVF bash "$RG" 2>&1 | head -1)"
+EOS
+  printf 'PROTEUS_CLIENT_IFACE=ens91\nPROTEUS_CLIENT_GW_IP=172.16.1.5\n' > "$WORK/typo.env"
+  OUT=$(unshare -rn bash "$WORK/iface.sh" "$RG" "$WORK/typo.env" 2>&1 || true)
+  assert_eq "$(get right)" "cl0|0|" "the right interface: printed, rc 0, no warning"
+  assert_eq "$(get typo)" "cl9|2|routeguard: PROTEUS_CLIENT_IFACE=cl9: no such interface; ingress sink armed on that name anyway" \
+    "a name no interface has: still printed, rc 2, warned"
+  assert_eq "$(get wrong)" "other0|2|routeguard: PROTEUS_CLIENT_IFACE=other0 does not hold PROTEUS_CLIENT_GW_IP 172.16.1.5 (it is on cl0); ingress sink armed on other0 anyway" \
+    "an interface without the gateway address: rc 2, and the warning names the one that has it"
+  assert_eq "$(get nowhere | cut -d'|' -f2)" "2" "a gateway address no interface holds: rc 2"
+  assert_eq "$(get nowhere | cnt_fx '(no interface holds it)')" "1" "... and says so"
+  assert_eq "$(get nogw_ok)/$(get nogw_typo | cut -d'|' -f1,2)" "cl0|0|/cl9|2" "with no PROTEUS_CLIENT_GW_IP only existence is checked"
+  if [[ -n "$(get alt)" ]]; then
+    assert_eq "$(get alt)" "clalt|2|routeguard: PROTEUS_CLIENT_IFACE=clalt is an altname of cl0, which nftables iifname never matches and an ip rule armed before the NIC appeared never attaches to; set it to cl0. Ingress sink armed on clalt anyway" \
+      "an altname: still printed, rc 2, and the warning names the primary name (not 'it is on cl0')"
+    assert_eq "$(get alt_nogw | cut -d'|' -f1,2)" "clalt|2" "... with no PROTEUS_CLIENT_GW_IP as well"
+  else
+    echo "  - SKIPPED altname check: this ip or kernel cannot add an altname"
+  fi
+  if [[ -n "$(get veth)" ]]; then
+    assert_eq "$(get veth)" "vc0|0|" "a name ip prints as name@peer is not taken for an altname"
+  else
+    echo "  - SKIPPED name@peer check: cannot create a veth here"
+  fi
+  assert_eq "$(get early_typo)/$(get early_wrong)" "cl9|0|/other0|0|" \
+    "RG_BEFORE_NETWORK=1: no check at all (the NIC may not have its name or address yet)"
+  assert_eq "$(get sink_typo_rc)" "1" "rg_sink_ensure reports the bad name (rc 1)"
+  assert_eq "$(get sink_typo_rule)/$(get sink_typo_lan)" "1/3" "... and still arms the sink and the LAN exemptions on it, by name"
+  assert_eq "$(get cli_wrong_rc)/$(get cli_wrong_rule)" "1/1" "routeguard.sh exits 1 for a wrong interface, with the rule armed"
+  assert_eq "$(get cli_early_rc)" "0" "... and 0 before the network is up"
+  assert_eq "$(get cli_right_rc)" "0" "... and 0 for the right one"
+  assert_eq "$(get cli_envfile_rc)" "1" "a typo read from the env file is caught too"
+  assert_eq "$(get cli_envfile_msg | cnt_fx 'PROTEUS_CLIENT_IFACE=ens91: no such interface')" "1" "... and named"
+else
+  echo "  - SKIPPED interface check in a netns: unprivileged user+net namespaces (unshare -rn) not available"
 fi
 
 echo "layer 1 (routing): who arms it"
@@ -190,6 +348,129 @@ for u in "$ROOT/etc/systemd/system/proteus-dispatcher.service" "$ROOT/install/te
 done
 assert_eq "$(cnt_fx 'PROTEUS_CLIENT_IFACE=${CLIENT_IFACE}' < "$ROOT/install/templates/proteus.env.tmpl")" "1" "the installer renders PROTEUS_CLIENT_IFACE"
 assert_eq "$(code_only "$APPLY" | cnt_re '/etc/proteus/bin/routeguard\.sh \$\(awk')" "1" "apply_network arms routeguard for every slot state file"
+
+echo "layer 1 (routing): proteus-routeguard.service arms it before the network comes up"
+# Without it, the first arming at boot is the first slot's vpnns-up.sh or the
+# dispatcher's ExecStartPre, both after network-online. If nftables.service
+# fails to load the ruleset, client traffic forwarded before then routes via
+# main and out the uplink.
+UNIT="$ROOT/etc/systemd/system/proteus-routeguard.service"
+UNIT_T="$ROOT/install/templates/proteus-routeguard.service.tmpl"
+unit_key() { grep -E "^$2=" "$1" 2>/dev/null | sed "s/^$2=//" | tr '\n' ';' || true; }
+for u in "$UNIT" "$UNIT_T"; do
+  n=$(basename "$u")
+  assert_eq "$(unit_key "$u" DefaultDependencies)" "no;" "$n: DefaultDependencies=no (the defaults would order it after basic.target)"
+  assert_eq "$(unit_key "$u" After)" "systemd-sysctl.service;" \
+    "$n: After=systemd-sysctl.service only (never after nftables or the network: it must run when they fail)"
+  assert_eq "$(unit_key "$u" Before)/$(unit_key "$u" Wants)" "network-pre.target;/network-pre.target;" \
+    "$n: Before= and Wants=network-pre.target (the target is passive: without Wants the ordering may not apply)"
+  assert_eq "$(unit_key "$u" Requires)$(unit_key "$u" BindsTo)$(unit_key "$u" Requisite)" "" "$n: no hard dependency that could stop it running"
+  assert_eq "$(unit_key "$u" Type)/$(unit_key "$u" RemainAfterExit)" "oneshot;/yes;" "$n: a oneshot that stays active"
+  assert_eq "$(unit_key "$u" EnvironmentFile)" "-/etc/proteus/proteus.env;" "$n: reads PROTEUS_CLIENT_IFACE from proteus.env (optional file)"
+  assert_eq "$(unit_key "$u" Environment)" "RG_BEFORE_NETWORK=1;" "$n: tells routeguard.sh the network is not up yet"
+  assert_eq "$(unit_key "$u" ExecStart)" "-/etc/proteus/bin/routeguard.sh;" "$n: routeguard.sh with no table argument, failure logged not fatal"
+  assert_eq "$(unit_key "$u" WantedBy)" "sysinit.target;" "$n: WantedBy=sysinit.target (pulled in on every boot, nftables enabled or not)"
+  # The unit names systemd-networkd among the managers it is ordered before,
+  # which reads as networkd being covered. It is not, with networkd's defaults.
+  assert_eq "$(cnt_fx 'ManageForeignRoutingPolicyRules=no' < "$u")/$(cnt_fx 'ManageForeignRoutes=no' < "$u")" "1/1" \
+    "$n: says systemd-networkd deletes these rules unless told not to"
+done
+# The operator-facing account of the same, and of what covers a box without
+# PROTEUS_CLIENT_IFACE after the early run (the first slot's vpnns-up.sh comes
+# before the dispatcher).
+GOT="$ROOT/gotchas.md"
+assert_eq "$(cnt_fx 'set `ManageForeignRoutingPolicyRules=no` and `ManageForeignRoutes=no`' < "$GOT")" "1" \
+  "gotchas.md: the networkd settings the routing layer needs"
+assert_eq "$(cnt_fx '`wg-udm` alone until the first slot comes up or the dispatcher starts' < "$GOT")" "1" \
+  "gotchas.md: the early run without PROTEUS_CLIENT_IFACE is followed by the first slot, then the dispatcher"
+assert_eq "$(cnt_fx 'primary name, not one of its altnames' < "$GOT")" "1" "gotchas.md: PROTEUS_CLIENT_IFACE must be the primary name"
+assert_eq "$(cnt_re '^[[:space:]]+systemctl enable --now proteus-routeguard\.service' < "$ROOT/install/install.sh")" "1" \
+  "install.sh enables it"
+# enable_services with systemctl stubbed: what it enables, in what order, and
+# that a failed enable of this unit warns and carries on.
+enable_calls() {  # <exit status for the routeguard enable>
+  ( cd "$ROOT" && . install/install.sh && set +e
+    SLOT_COUNT=1
+    systemctl() { echo "systemctl $*"; [[ "$*" == *proteus-routeguard* ]] && return "$RG_ENABLE_RC"; return 0; }
+    RG_ENABLE_RC=$1 enable_services 2>&1 ) || true
+}
+CALLS=$(enable_calls 0)
+assert_eq "$(sed -n 2p <<<"$CALLS")" "systemctl enable --now proteus-routeguard.service" \
+  "enable_services: enable --now proteus-routeguard.service right after daemon-reload, before any slot or the dispatcher"
+CALLS=$(enable_calls 1)
+assert_eq "$(cnt_fx 'WARN: proteus-routeguard.service not enabled' <<<"$CALLS")" "1" "a failed enable warns"
+assert_eq "$(cnt_fx 'proteus-dispatcher.service' <<<"$CALLS")" "1" "... and enable_services carries on (the dispatcher is still enabled)"
+
+if command -v ip >/dev/null 2>&1 && userns_ok; then
+  # The unit's own command line and environment, with the script path moved to
+  # this checkout. EnvironmentFile= is stood in for by the two variables it
+  # would set: an installer-rendered name, and a gateway address that no
+  # interface holds yet.
+  exec_cmd=$(unit_key "$UNIT" ExecStart | sed -e 's/;$//' -e 's/^-//' -e "s#^/etc/proteus/bin/#$ROOT/etc/proteus/bin/#")
+  unit_env=$(unit_key "$UNIT" Environment | sed 's/;$//')
+  cat > "$WORK/early.sh" <<'EOS'
+set -u
+CMD=$1; UNIT_ENV=$2
+ip link set lo up
+sysctl -q -w net.ipv4.ip_forward=1 net.ipv4.conf.all.rp_filter=2 net.ipv4.conf.default.rp_filter=2
+ip link add up0 type dummy; ip addr add 192.0.2.1/24 dev up0; ip link set up0 up
+ip route add default via 192.0.2.254 dev up0
+fwd() { ip route get 203.0.113.9 from 172.16.1.50 iif "$1" 2>&1 | head -1; }
+# The unit runs before udev has renamed the NIC and before any address.
+# shellcheck disable=SC2086
+err=$(env -i PATH="$PATH" PROTEUS_ENV_FILE=/nonexistent PROTEUS_CLIENT_IFACE=ens19 PROTEUS_CLIENT_GW_IP=172.16.1.5 $UNIT_ENV "$CMD" 2>&1); rc=$?
+echo "unit_rc=$rc"
+echo "unit_err=$err"
+echo "detached=$(ip rule show pref 32020 | grep -cE 'iif ens19 \[detached\] lookup 900')"
+echo "catch=$(ip route get 203.0.113.9 mark 0x7 2>&1 | head -1)"
+# Now the network comes up: the NIC appears under its kernel name, udev renames
+# it, ifupdown gives it its address.
+ip link add eth1 type dummy
+ip link set eth1 name ens19
+ip addr add 172.16.1.5/24 dev ens19; ip link set ens19 up
+echo "attached=$(ip rule show pref 32020 | grep -cE 'iif ens19 lookup 900')"
+echo "fwd_client=$(fwd ens19)"
+echo "fwd_lan=$(ip route get 10.1.2.3 from 172.16.1.50 iif ens19 2>&1 | head -1)"
+# Control: an interface the sink does not name routes via main. That is what
+# the client interface did before this unit, until the first slot came up.
+ip link add ens20 type dummy; ip addr add 172.16.2.5/24 dev ens20; ip link set ens20 up
+echo "fwd_uncovered=$(ip route get 203.0.113.9 from 172.16.2.50 iif ens20 2>&1 | head -1)"
+EOS
+  OUT=$(unshare -rn bash "$WORK/early.sh" "$exec_cmd" "$unit_env" 2>&1 || true)
+  get() { sed -n "s/^$1=//p" <<<"$OUT" | head -1; }
+  assert_eq "$(get unit_rc)/$(get unit_err)" "0/" \
+    "the unit's command exits 0 and warns nothing before the NIC exists or has an address"
+  assert_eq "$(get detached)" "1" "the client sink rule is stored by name, detached until the NIC appears"
+  assert_eq "$(get catch | cnt_re '[Ii]nvalid argument')" "1" "the catch rule is armed"
+  assert_eq "$(get attached)" "1" "once udev renames a NIC to that name the rule attaches"
+  assert_eq "$(get fwd_client | cnt_fx 'dev proteus-null')" "1" "client traffic to a public address is sunk from then on, with no slot up and no ruleset"
+  assert_eq "$(get fwd_lan | cnt_fx 'dev up0')" "1" "client traffic to an RFC1918 address still routes via main"
+  assert_eq "$(get fwd_uncovered | cnt_fx 'dev up0')" "1" "(control: an interface the sink does not cover routes via main)"
+else
+  echo "  - SKIPPED early-boot behaviour: unprivileged user+net namespaces (unshare -rn) not available"
+fi
+
+echo "systemd-analyze verify: proteus-routeguard.service"
+if [[ ! -f "$UNIT" ]]; then
+  assert_eq missing present "proteus-routeguard.service exists"
+elif command -v systemd-analyze >/dev/null 2>&1; then
+  mkdir -p "$WORK/units"
+  # ExecStart points at this checkout, so the check that the command exists
+  # means something here.
+  sed "s#/etc/proteus/bin/#$ROOT/etc/proteus/bin/#" "$UNIT" > "$WORK/units/proteus-routeguard.service"
+  # Control first: a bad key must draw a complaint, or a clean result proves nothing.
+  { cat "$WORK/units/proteus-routeguard.service"; echo "ProteusBogusKey=1"; } > "$WORK/units/zz-control.service"
+  ctl=$(systemd-analyze verify --man=no "$WORK/units/zz-control.service" 2>&1 || true)
+  if grep -q 'ProteusBogusKey' <<<"$ctl"; then
+    out=$(systemd-analyze verify --man=no "$WORK/units/proteus-routeguard.service" 2>&1) && vrc=0 || vrc=$?
+    assert_eq "$vrc" "0" "verify exits 0"
+    assert_eq "$(grep -F 'proteus-routeguard' <<<"$out" || true)" "" "no warning about the unit"
+  else
+    echo "  - SKIPPED: this systemd-analyze did not flag a bogus key; a clean result would prove nothing"
+  fi
+else
+  echo "  - SKIPPED: systemd-analyze not available"
+fi
 
 echo "installer: the nft auto-revert really reverts"
 # Behaviour (failed listing, empty listing, the file restore) is in
