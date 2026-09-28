@@ -9,8 +9,21 @@ ConditionPathIsDirectory=/etc/proteus/state
 Type=simple
 EnvironmentFile=/etc/proteus/proteus.env
 EnvironmentFile=-/etc/proteus/proteus-local.env
+# Arm fail-closed routing (catch rule + ingress sink, see routeguard.sh)
+# before the first mark is handed out: a slot unit that failed early may never
+# have reached its own routeguard call, and ip rules do not survive a reboot.
+# `+` runs it outside this unit's sandbox; `-` keeps a failure from taking the
+# dispatcher (and so all client egress) down: it is logged, and the firewall
+# still holds.
+ExecStartPre=-+/etc/proteus/bin/routeguard.sh
 ExecStart=/etc/proteus/bin/dispatcher.py
 Restart=on-failure
+# A SIGHUP that lands before dispatcher.py has installed its handler (while
+# it imports and starts up) or during interpreter shutdown kills the
+# process, and systemd counts death by SIGHUP as a clean exit, so
+# Restart=on-failure alone would leave it down. rotate-slot.sh sends one
+# after every promotion.
+RestartForceExitStatus=SIGHUP
 RestartSec=5s
 User=root
 # Hardening

@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+"""proteus-cf-report — what the exit ledger says about the Cloudflare standard.
+
+  proteus-cf-report                 human-readable report
+  proteus-cf-report --json          the same data as JSON
+  proteus-cf-report --compact       drop records older than the retention window
+
+Read-only apart from --compact. Any user who can read the ledger can run it.
+Design: architecture.md, "Cloudflare canaries, live checks and the exit ledger"
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ledger  # noqa: E402
+
+DAY = 86400
+ENV_FILES = ("/etc/proteus/proteus.env", "/etc/proteus/proteus-local.env")
+
+
+def env_str(key: str, default: str) -> str:
+    v = None
+    for f in ENV_FILES:
+        try:
+            with open(f) as fh:
+                for line in fh:
+                    if line.startswith(key + "="):
+                        v = line.split("=", 1)[1].strip().strip('"')
+        except OSError:
+            pass
+    return v if v else default
+
+
+def env_int(key: str, default: int) -> int:
+    v = None
+    for f in ENV_FILES:
+        try:
+            with open(f) as fh:
+                for line in fh:
+                    if line.startswith(key + "="):
+                        v = line.split("=", 1)[1].strip().strip('"')
+        except OSError:
+            pass
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_dict(x) -> dict:
+    return x if isinstance(x, dict) else {}
+
+
+def _sanitize(records) -> list:
+    """Defend this script — and ledger.py, which trusts its input — against
+    malformed ledger lines: drop non-dict records outright, and coerce a
+    non-dict canaries/checks field to {} rather than let a stray list or
+    string reach a .get() call downstream. Timestamps are read through
+    ledger._ts, which already tolerates a non-numeric "ts"."""
+    out = []
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        rr = dict(r)
+        rr["canaries"] = _safe_dict(rr.get("canaries"))
+        rr["checks"] = _safe_dict(rr.get("checks"))
+        out.append(rr)
+    return out
+
+
+def _new_counters() -> dict:
+    return {"rejected_seen": 0, "rejected_flagged": 0, "passed_seen": 0, "passed_flagged": 0}
+
+
+def agreement(records, hosts, active_hosts, now: int, window_s: int = 7 * DAY) -> dict:
+    """Per mandatory custom check seen in gate records within window_s: how many
+    candidates it rejected (challenge/block-*/block) and passed, and how each
+    canary — and the basket as a whole — agreed with it.
+
+    Denominators mirror ledger.per_canary: a record counts toward a canary's
+    rejected_seen/passed_seen only when that canary produced a real verdict in
+    the record (not missing, "not-cloudflare", or "transport"). Of those, the
+    ones where the canary's verdict is a fail class count toward
+    rejected_flagged/passed_flagged — so a percentage is always flagged/seen
+    for that one canary, never divided by the raw rejected/passed record
+    count. The synthetic "basket" entry is keyed the same way but counts a
+    record toward *_seen if ANY active (non-quarantined) canary produced a
+    real verdict in it, and toward *_flagged if any active canary flagged it:
+    the whole basket judged as a unit, which is the question the rollout
+    acceptance criteria actually ask.
+    """
+    records = _sanitize(records)
+    active = set(active_hosts)
+    rows: dict = {}
+    for r in records:
+        if r.get("source") != "gate" or now - ledger._ts(r) > window_s:
+            continue
+        can = r["canaries"]
+        for label, cls in r["checks"].items():
+            if not label.startswith("custom:") or cls in ("error", "skip"):
+                continue
+            row = rows.setdefault(label, {"rejected": 0, "passed": 0,
+                                          **{h: _new_counters() for h in hosts},
+                                          "basket": _new_counters()})
+            key = "rejected" if (ledger.is_fail_class(cls) or cls == "block") else "passed"
+            row[key] += 1
+            basket_seen = basket_flagged = False
+            for h in hosts:
+                v = can.get(h)
+                if v is None or v in ("not-cloudflare", "transport"):
+                    continue
+                counters = row[h]
+                counters[key + "_seen"] += 1
+                flagged = ledger.is_fail_class(v)
+                if flagged:
+                    counters[key + "_flagged"] += 1
+                if h in active:
+                    basket_seen = True
+                    basket_flagged = basket_flagged or flagged
+            if basket_seen:
+                row["basket"][key + "_seen"] += 1
+                if basket_flagged:
+                    row["basket"][key + "_flagged"] += 1
+    return rows
+
+
+def build(records, hosts, now: int, slots: int, target: int, min_exits: int,
+          tier: str = "mandatory") -> dict:
+    """`tier` mirrors PROTEUS_CF_TIER: in advisory (shadow) mode the canaries do not
+    gate anything, so the standard used for the pool and attainability is empty and
+    "known-good" means verdict-pass exits, exactly as proton-mint computes it. Canary
+    pass rates and the agreement table are informational and use the full basket."""
+    records = _sanitize(records)
+    active = ledger.active_hosts(records, hosts, now, min_exits)
+    standard = active if tier == "mandatory" else []
+    st = ledger.status(records, hosts, now, slots, target, min_exits)
+    st["standard"].update({
+        "tier": tier, "slots": slots, "size": len(standard),
+        "attainable": ledger.attainable(records, standard, now, slots),
+        "passing_exits_24h": len(ledger.pool(records, standard, now, ttl_s=DAY)),
+        "passing_exits_7d": len(ledger.pool(records, standard, now, ttl_s=7 * DAY)),
+    })
+    st["pool"]["known_good"] = len(ledger.pool(records, standard, now))
+    e30, n30 = ledger.diversity(records, now, 30 * DAY)
+    promos = sorted((r for r in records if r.get("source") == "promote" and r.get("exit_ip")),
+                    key=lambda r: ledger._ts(r))
+    last: dict = {}
+    reused = 0
+    recent = 0
+    for r in promos:
+        ip, ts = r["exit_ip"], ledger._ts(r)
+        if now - ts <= 7 * DAY:
+            recent += 1
+            if ip in last and ts - last[ip] < 7 * DAY:
+                reused += 1
+        last[ip] = ts
+    st["pool"].update({"distinct_exits_30d": e30, "distinct_slash24_30d": n30,
+                       "promotions_7d": recent, "reused_within_window_7d": reused})
+    for c in st["canaries"]:
+        seen7, clean7 = ledger.per_canary(records, c["host"], now, 7 * DAY)
+        c["exits_seen_7d"] = seen7
+        c["pass_rate_7d"] = round(clean7 / seen7, 3) if seen7 else None
+    st["agreement"] = agreement(records, hosts, active, now)
+    st["banned_prefixes"] = sorted(ledger.banned_prefixes(records, now))
+    st["banned_exit_prefixes"] = sorted(ledger.banned_exit_prefixes(records, now))
+    st["good_prefixes"] = sorted(ledger.good_prefixes(records, now))
+    st["good_prefixes24"] = sorted(ledger.good_prefixes24(records, now))
+    st["records"] = len(records)
+    return st
+
+
+def _pct(x) -> str:
+    return " n/a" if x is None else f"{round(x * 100):3d}%"
+
+
+def render(st: dict) -> str:
+    s, p = st["standard"], st["pool"]
+    out = [
+        f"Cloudflare standard: {s['size']} active canaries · tier: {s.get('tier', 'mandatory')}"
+        f" · attainable: {'yes' if s['attainable'] else 'no (not attainable)'}",
+        *(["  (advisory: canaries do not gate; the pool counts verdict-pass exits)"]
+          if s.get("tier") != "mandatory" else []),
+        f"  exits meeting it in 24h: {s['passing_exits_24h']} · exits meeting it in 7d: {s['passing_exits_7d']}"
+        f" · slots: {s['slots']}",
+        f"Known-good pool: {p['known_good']} / {p['target']} target",
+        f"Diversity 7d: {p['distinct_exits_7d']} exits in {p['distinct_slash24_7d']} /24s"
+        f" · promotions {p['promotions_7d']} · reused inside the window {p['reused_within_window_7d']}",
+        f"Diversity 30d: {p['distinct_exits_30d']} exits in {p['distinct_slash24_30d']} /24s",
+        "ASN-banned entry ranges (act at mint): "
+        + (", ".join(f"{b}/16" for b in st["banned_prefixes"]) or "none"),
+        "ASN-banned exit ranges (seen): "
+        + (", ".join(f"{b}/16" for b in st["banned_exit_prefixes"]) or "none"),
+        "Proven entry ranges (7d): "
+        + (", ".join(f"{b}/16" for b in st["good_prefixes"]) or "none"),
+        f"Proven entry /24s (exempt from range bans): {len(st.get('good_prefixes24', []))}",
+        f"Ledger records: {st['records']}",
+        "",
+        "Canaries (pass rate over distinct exits):",
+    ]
+    for c in st["canaries"]:
+        flag = "  QUARANTINED" if c["quarantined"] else ""
+        out.append(f"  {c['host']:<28} 24h {_pct(c['pass_rate_24h'])} of {c['exits_seen_24h']:<4}"
+                   f" 7d {_pct(c['pass_rate_7d'])} of {c['exits_seen_7d']}{flag}")
+    out += ["", "Agreement with mandatory custom checks (gate records, 7d):"]
+    if not st["agreement"]:
+        out.append("  (no custom-check verdicts in the window)")
+    host_order = [c["host"] for c in st["canaries"]]
+    for label, row in st["agreement"].items():
+        out.append(f"  {label}: rejected {row['rejected']}, passed {row['passed']}")
+        for h in ["basket"] + host_order:
+            counters = row.get(h)
+            if not counters:
+                continue
+            name = "basket (any active canary)" if h == "basket" else h
+            rs, rf = counters["rejected_seen"], counters["rejected_flagged"]
+            ps, pf = counters["passed_seen"], counters["passed_flagged"]
+            r_pct = _pct(rf / rs) if rs else _pct(None)
+            p_pct = _pct(pf / ps) if ps else _pct(None)
+            out.append(f"    {name:<28} flagged {rf}/{rs} rejected ({r_pct}),"
+                       f" {pf}/{ps} passed ({p_pct})")
+    return "\n".join(out)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--path", default=ledger.DEFAULT_PATH)
+    ap.add_argument("--canaries-file", default=ledger.DEFAULT_CANARIES_FILE)
+    ap.add_argument("--state-dir", default="/etc/proteus/state")
+    ap.add_argument("--slots", type=int, default=None, help="live slot count (default: proton-*.state files)")
+    ap.add_argument("--target", type=int, default=None)
+    ap.add_argument("--min-exits", type=int, default=None)
+    ap.add_argument("--now", type=int, default=None, help="override the clock (tests)")
+    ap.add_argument("--cf-tier", default=None, help="mandatory|advisory (default: PROTEUS_CF_TIER from the env files)")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--compact", action="store_true")
+    args = ap.parse_args(argv)
+    now = args.now if args.now is not None else int(time.time())
+    if args.compact:
+        if not os.path.exists(args.path):
+            print(f"no ledger at {args.path}; nothing to compact")
+            return 1
+        ttl_s = env_int("PROTEUS_LEDGER_TTL_S", ledger.DEFAULT_TTL_S)
+        kept = ledger.compact(args.path, now, ttl_s=ttl_s)
+        print(f"compacted: {kept} records kept")
+        return 0
+    slots = args.slots if args.slots is not None else len(glob.glob(f"{args.state_dir}/proton-*.state"))
+    target = args.target if args.target is not None else env_int("PROTEUS_MINT_POOL_TARGET", 20)
+    min_exits = args.min_exits if args.min_exits is not None else env_int("PROTEUS_CF_QUARANTINE_MIN_EXITS", 8)
+    hosts = [ledger.host_of(u) for u in ledger.canary_urls(args.canaries_file)]
+    tier = args.cf_tier if args.cf_tier is not None else env_str("PROTEUS_CF_TIER", "mandatory")
+    tier = "mandatory" if tier == "mandatory" else "advisory"
+    st = build(ledger.load(args.path), hosts, now, max(1, slots), target, min_exits, tier=tier)
+    print(json.dumps(st) if args.json else render(st))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

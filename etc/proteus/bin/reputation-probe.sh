@@ -32,9 +32,9 @@ NS="${1:?netns required}"
 [ -f /etc/proteus/proteus-local.env ] && . /etc/proteus/proteus-local.env
 
 # Defaults are tuned for the 5-probe mandatory tier we run (github, google204,
-# ddg, cloudflare, youtube). A "gold standard" exit must reach the popular
-# consumer services that user traffic actually hits, not just Google's
-# captive-portal probe. Override via env if you're tweaking thresholds at the CLI.
+# ddg, cloudflare, youtube) plus the Cloudflare canaries. A "gold standard" exit
+# must reach the popular consumer services that user traffic actually hits, not
+# just Google's captive-portal probe. Override via env if you're tweaking at the CLI.
 #
 # MAX_MANDATORY_ERRORS is an exclusive bound: the test below is
 # `m_error >= MAX_MANDATORY_ERRORS`, so the default of 1 tolerates ZERO errors.
@@ -42,7 +42,12 @@ NS="${1:?netns required}"
 # comparison now would silently loosen every deployment that has tuned this.
 MIN_MANDATORY_PASS="${PROTEUS_REP_MIN_MANDATORY_PASS:-${MIN_MANDATORY_PASS:-4}}"
 MAX_MANDATORY_ERRORS="${PROTEUS_REP_MAX_MANDATORY_ERRORS:-${MAX_MANDATORY_ERRORS:-1}}"
-PER_PROBE_TIMEOUT="${PER_PROBE_TIMEOUT:-40}"
+
+# probe(), the UA pool, the Cloudflare classifier and the canary list live in
+# checklib.sh, shared with slot-warmup.sh so the gate and the live watch judge
+# an exit identically.
+# shellcheck source=/dev/null
+. "$(dirname "${BASH_SOURCE[0]}")/checklib.sh"
 
 ip netns list | awk '{print $1}' | grep -qx "$NS" || {
     echo "netns '$NS' not found" >&2
@@ -61,102 +66,6 @@ ip netns exec "$NS" curl -sI -o /dev/null --max-time 8 https://proton.me/ 2>/dev
 for host in api.github.com www.google.com www.reddit.com duckduckgo.com www.cloudflare.com www.youtube.com; do
     ip netns exec "$NS" getent ahostsv4 "$host" >/dev/null 2>&1 || true
 done
-
-# Rotating realistic desktop/mobile UAs — each probe picks one at random.
-UAS=(
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/198.51.100.0 Safari/537.36"
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15"
-    "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0"
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/198.51.100.0 Mobile Safari/537.36"
-)
-rand_ua() { printf '%s' "${UAS[RANDOM % ${#UAS[@]}]}"; }
-
-# Args: <label> <url> <expected-http-pattern> [body-must-contain] [force-ua]
-# expected-http-pattern is a bash extended regex against the literal HTTP code,
-# anchored to the full string. Use "200" for an exact match or "200|301|302"
-# to accept multiple codes. (Useful when a site geo-redirects, etc.)
-# force-ua pins the User-Agent instead of picking one at random — only for
-# probes whose ASSERTION depends on which site variant answers (see youtube).
-# Prints one of: "PASS <label>", "BLOCK <label> <reason>", "ERROR <label> <reason>"
-probe() {
-    local label="$1" url="$2" expected="$3" want_body="${4:-}" force_ua="${5:-}"
-    local ua body_file code body
-    ua="${force_ua:-$(rand_ua)}"
-    body_file=$(mktemp)
-    # Retry on transient transport errors — tunnels lose stray packets and DNS
-    # warmup can miss even after our priming loop. 3 attempts × 8s each + delays
-    # must stay under PER_PROBE_TIMEOUT.
-    code=$(ip netns exec "$NS" timeout "$PER_PROBE_TIMEOUT" curl -sS \
-        -A "$ua" \
-        -H "Accept: text/html,application/json,*/*" \
-        -o "$body_file" \
-        -w "%{http_code}" \
-        --retry 3 --retry-all-errors --retry-delay 1 \
-        --max-time 8 \
-        --connect-timeout 5 \
-        -- "$url" 2>/dev/null || echo "000")
-    body=$(head -c 4096 "$body_file" 2>/dev/null || true)
-    # Body assertions are matched against the WHOLE response, not the 4096-byte
-    # prefix above. The signals worth asserting on live deep inside big pages —
-    # YouTube's playabilityStatus sits ~100KB into a ~900KB watch page — so a
-    # prefix match would silently never fire and every check would "pass".
-    # -F: literal substring, never a regex. -e: the next arg is the pattern, so
-    # an operator-supplied string starting with "-" can't become a grep option.
-    local body_hit=0
-    if [[ -n "$want_body" ]] && grep -qF -e "$want_body" "$body_file" 2>/dev/null; then
-        body_hit=1
-    fi
-    # Bot-gating (YouTube's "Sign in to confirm you're not a bot") is a genuine
-    # reputation block, but it appears deep in the page, so it needs the same
-    # full-body scan. Kept separate from the challenge markers below rather than
-    # widening those to the full body: strings like "attention required" are
-    # generic enough that scanning 900KB of arbitrary page content for them
-    # would start producing false BLOCKs. The apostrophe is a UTF-8 right single
-    # quote in YouTube's markup, hence .{0,3} rather than a literal.
-    local bot_gated=0
-    if grep -qiE "sign in to confirm you.{0,3}re not a bot" "$body_file" 2>/dev/null; then
-        bot_gated=1
-    fi
-    rm -f "$body_file"
-
-    if [[ "$code" == "000" ]]; then
-        echo "ERROR $label transport-fail"
-        return
-    fi
-
-    if (( bot_gated )); then
-        echo "BLOCK $label bot-gate"
-        return
-    fi
-
-    case "$code" in
-        403|429)
-            echo "BLOCK $label http=$code"
-            return
-            ;;
-    esac
-
-    # Captcha challenges (Cloudflare et al.) — body markers indicating the
-    # site asked us to prove humanity. We BLOCK on these intentionally:
-    # a captcha-clean exit is the gold standard, and rotation has 5 attempts
-    # to find one. Don't relax this.
-    if grep -qiE 'cf-chl-bypass|cdn-cgi/challenge-platform|attention required|unusual traffic from your computer|sorry, we just need to make sure' <<<"$body"; then
-        echo "BLOCK $label body-challenge"
-        return
-    fi
-
-    if ! [[ "$code" =~ ^($expected)$ ]]; then
-        echo "ERROR $label http=$code (expected $expected)"
-        return
-    fi
-    if [[ -n "$want_body" ]] && (( ! body_hit )); then
-        echo "ERROR $label body-missing '$want_body'"
-        return
-    fi
-
-    echo "PASS $label"
-}
 
 mandatory_results=()
 advisory_results=()
@@ -200,42 +109,65 @@ mandatory_results+=( "$(probe youtube    "https://www.youtube.com/watch?v=jNQXAC
 # not abuse-rep, so its verdict is informational only.
 advisory_results+=( "$(probe reddit     "https://www.reddit.com/.json"            200)" )
 
-# Custom operator checks (rotation-only, in this staging netns). A missing or
-# malformed file is ignored — a bad custom list can never stop a rotation.
-# Uses process substitution (< <(...)), NOT a pipe: under `set -euo pipefail` a
-# `python3 ... | while` would run the loop in a subshell and silently discard
-# every += append. A custom check passes on any 2xx/3xx that isn't a block page.
-# An optional "body" field turns a check into a real content assertion instead
-# of a bare status check. That matters for streaming: Netflix, YouTube and Apple
-# all answer HTTP 200 from an exit they will not actually serve video to, so a
-# status-only check cannot express "this exit works for streaming".
-# The field is passed to `grep -F -e` as a literal substring (see probe()), and
-# ui_logic.validate_checks rejects tabs/newlines so it cannot break this TSV.
-CHECKS_FILE="${PROTEUS_CHECKS_FILE:-/etc/proteus/checks.json}"
-if [ -r "$CHECKS_FILE" ]; then
-    while IFS=$'\t' read -r c_tier c_url c_body; do
-        [ -n "$c_url" ] || continue
-        c_host=$(printf '%s' "$c_url" | sed -E 's#^https?://##; s#/.*$##')
-        r=$(probe "custom:${c_host:0:40}" "$c_url" '[23][0-9][0-9]' "${c_body:-}")
-        if [ "$c_tier" = "mandatory" ]; then
+# --- Cloudflare canaries -------------------------------------------------------
+# The shipped basket (or canaries.json), judged purely on Cloudflare's own
+# verdict via cf_probe_canary. Tier comes from PROTEUS_CF_TIER; a canary the
+# ledger shows as site-wide (quarantined) is demoted to advisory for this run
+# so it cannot wedge rotation; a canary that is no longer on Cloudflare is
+# SKIPped and counts for nothing. STANDING is clean/active over the canaries
+# that are part of the standard right now.
+canary_lines=()
+canary_active=0; canary_clean=0
+while IFS= read -r c_url; do
+    [[ -n "$c_url" ]] || continue
+    c_host=$(cf_host "$c_url")
+    cls=$(cf_probe_canary "$NS" "$c_url")
+    canary_lines+=( "$c_host $cls" )
+    case "$cls" in
+        clean)          r="PASS cf:$c_host" ;;
+        challenge)      r="BLOCK cf:$c_host cf-challenge" ;;
+        block-*)        r="BLOCK cf:$c_host cf-${cls#block-}" ;;
+        not-cloudflare) r="SKIP cf:$c_host not-cloudflare" ;;
+        # A lost socket is not a verdict. SKIP, so it counts in neither pass,
+        # block nor error — the same rule slot-warmup.sh's live watch applies
+        # (transport bumps the streak for visibility but never rotates and
+        # never dirties CF_CLEAN). Rotation-time and live verdicts have to agree
+        # on what a canary means, or a candidate gets rejected here for
+        # something the live watch would shrug off. Reachability is still
+        # gated: the built-in mandatory `cloudflare` probe covers an exit that
+        # cannot reach Cloudflare at all. It stays inside canary_active, so
+        # STANDING drops and a candidate that lost a canary mid-probe ranks
+        # below one that answered every canary.
+        *)              r="SKIP cf:$c_host transport-fail" ;;
+    esac
+    if [[ "$cls" != "not-cloudflare" ]] && ! cf_quarantined "$c_host"; then
+        canary_active=$((canary_active + 1))
+        [[ "$cls" == "clean" ]] && canary_clean=$((canary_clean + 1))
+        if [[ "$CF_TIER" == "mandatory" ]]; then
             mandatory_results+=( "$r" )
         else
             advisory_results+=( "$r" )
         fi
-    done < <(python3 -c '
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception:
-    sys.exit(0)
-BAD = ("\t", "\n", "\r")
-for c in d.get("checks", [])[:15]:   # hard cap even for a hand-edited file
-    u = str(c.get("url", "")); t = str(c.get("tier", "")); b = str(c.get("body", ""))
-    if (u.lower().startswith(("http://", "https://"))
-            and t in ("mandatory", "advisory")
-            and not any(x in u for x in BAD) and not any(x in b for x in BAD)):
-        print(t + "\t" + u + "\t" + b)' "$CHECKS_FILE" 2>/dev/null)
-fi
+    else
+        advisory_results+=( "$r" )
+    fi
+done < <(cf_canaries)
+
+# Custom operator checks (rotation-only, in this staging netns). checklib's
+# custom_checks reads checks.json and yields nothing for a missing or malformed
+# file — a bad custom list can never stop a rotation. A custom check passes on
+# any 2xx/3xx that isn't a block page; the optional "body" field turns it into
+# a content assertion (streaming sites answer 200 from exits they won't serve).
+while IFS=$'\t' read -r c_tier c_url c_body; do
+    [ -n "$c_url" ] || continue
+    c_host=$(cf_host "$c_url")
+    r=$(probe "custom:${c_host:0:40}" "$c_url" '[23][0-9][0-9]' "${c_body:-}")
+    if [ "$c_tier" = "mandatory" ]; then
+        mandatory_results+=( "$r" )
+    else
+        advisory_results+=( "$r" )
+    fi
+done < <(custom_checks all)
 
 count() {
     # $1 = prefix (PASS|BLOCK|ERROR), remaining args = results array
@@ -256,6 +188,31 @@ m_error=$(count ERROR "${mandatory_results[@]}")
 echo "--- advisory ---"
 for r in "${advisory_results[@]}"; do echo "$r"; done
 a_block=$(count BLOCK "${advisory_results[@]}")
+
+# BASELINE: the verdict the non-canary mandatory set would give on its own.
+# rotate-slot.sh's step-down promotes only candidates whose baseline passes.
+baseline_results=()
+for r in "${mandatory_results[@]}"; do
+    [[ "$r" == *" cf:"* ]] || baseline_results+=( "$r" )
+done
+b_pass=$(count PASS "${baseline_results[@]}")
+b_block=$(count BLOCK "${baseline_results[@]}")
+b_error=$(count ERROR "${baseline_results[@]}")
+baseline=PASS
+if (( b_block > 0 || b_error >= MAX_MANDATORY_ERRORS || b_pass < MIN_MANDATORY_PASS )); then
+    baseline=FAIL
+fi
+
+# Machine-readable trailer for rotate-slot.sh (ledger + step-down). One CANARY
+# line per canary, one CHECK line per non-canary result, then STANDING and
+# BASELINE. Keep these formats stable; tests and the ledger depend on them.
+for l in "${canary_lines[@]}"; do echo "CANARY $l"; done
+for r in "${mandatory_results[@]}" "${advisory_results[@]}"; do
+    [[ "$r" == *" cf:"* ]] && continue
+    echo "CHECK $(result_class "$r")"
+done
+echo "STANDING $canary_clean/$canary_active"
+echo "BASELINE $baseline"
 
 echo "SUMMARY mandatory: pass=$m_pass block=$m_block error=$m_error | advisory: block=$a_block"
 

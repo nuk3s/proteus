@@ -80,16 +80,40 @@ awk '
     { print }
 ' "$WG_CONF" > "$TMP_CONF"
 
-# Idempotent teardown of any existing instance
+# Fail closed BEFORE tearing anything down (see routeguard.sh for the whole
+# argument). From here until the default route is re-added near the end of
+# this script, this slot's marked traffic has no way out. It used to fall
+# through to `main` and leave by the uplink un-tunnelled. It now hits a
+# blackhole route instead and is dropped silently (a client retransmits into
+# the rebuilt tunnel). That holds for a successful rebuild's sub-second gap,
+# and just as well for a rebuild that `set -e` aborts somewhere below, which
+# leaves the gap open until the next successful run.
+#   - The sentinel is fatal: if it cannot be installed, stop here with the
+#     incumbent tunnel still intact rather than open a gap with nothing
+#     behind it.
+#   - The catch rule and the ingress sink are only warnings: the sentinel
+#     already covers this slot, and the firewall still drops the packet.
+# shellcheck source=/dev/null
+. "$(dirname "${BASH_SOURCE[0]}")/routeguard.sh"
+rg_sentinel_ensure "$RT_TABLE"
+rg_catch_ensure || echo "WARN: catch rule not installed; per-table sentinel and firewall still apply" >&2
+rg_sink_ensure || echo "WARN: ingress sink incomplete; per-table sentinel and firewall still apply" >&2
+
+# Idempotent teardown of any existing instance.
+# The tunnel route is removed explicitly first, so the table state after
+# teardown does not depend on the kernel pruning routes when the veth dies.
+# `via` makes the delete specific: it can never match the blackhole sentinel.
+# The fwmark and source rules are deliberately NOT deleted. They stay in place
+# for the whole rebuild and point at a table that routes this slot's traffic
+# either through the tunnel or nowhere. Deleting them was half of the leak:
+# with no rule for the mark, the lookup went straight to `main`.
+ip route del default via "$TRANSIT_NS" table "$RT_TABLE" 2>/dev/null || true
 ip netns pids "$NS" 2>/dev/null | xargs -r kill 2>/dev/null || true
 ip netns del "$NS" 2>/dev/null || true
 ip link del "$VETH_MAIN" 2>/dev/null || true
 # Clean up a main-ns WG link orphaned by a prior run that died after
 # `ip link add` but before the move into the netns.
 ip link del "$WG_TMP" 2>/dev/null || true
-ip rule del fwmark "$FWMARK" lookup "$RT_TABLE" 2>/dev/null || true
-ip rule del from "$TRANSIT_MAIN" lookup "$RT_TABLE" 2>/dev/null || true
-ip route flush table "$RT_TABLE" 2>/dev/null || true
 
 # Whitelist the WG peer in the main-ns kill-switch BEFORE any handshake can fire.
 # (`add element` is idempotent on duplicate values.)
@@ -134,8 +158,43 @@ unset IFS
 
 ip netns exec "$NS" wg setconf wg0 "$TMP_CONF"
 ip -n "$NS" link set wg0 up
-# return path for client subnet back to main ns
+# Return path for the client subnet back to main ns.
 ip -n "$NS" route add "$CLIENT_VLAN_CIDR" via "$TRANSIT_MAIN" dev "$VETH_NS"
+# Same for every trusted range and for the UDM tunnel itself, so a slot that has
+# just rotated can answer trusted hosts immediately rather than waiting for the
+# reconcile service. `route replace` rather than `add`: only the client route
+# above is guaranteed unique, and a range may legitimately already be present.
+# Rotating-pool slots only — the DNS namespace carries resolver traffic, which
+# never has a trusted-VLAN source. The tunnel subnet is only added alongside at
+# least one trusted range: with the feature off (no trusted.json, an empty one,
+# or one that fails validation) this namespace must come up with exactly the
+# return routes it had before this feature existed — the same gate
+# proteus-trusted-egress.sh applies before it will touch a slot namespace.
+#
+# Always reset _trusted first: with no assignment here at all, a value this
+# variable happened to hold in the *caller's* environment would survive into a
+# non-proton instance (the DNS namespace, which must never get one of these
+# routes) since the `if` below would simply not run.
+#
+# Under `set -euo pipefail` a bare `_trusted=$(...)` propagates the command
+# substitution's exit status like any other simple command, so a missing
+# python3 (127) or a missing/misplaced trusted.py (2) would abort this script
+# right here — before the default route, the intra-namespace firewall, DNS and
+# the state file are ever written, leaving a dead, firewall-less slot on every
+# rotation and boot. `|| _trusted=""` keeps that failure from being anything
+# more than "no trusted ranges this time"; `timeout` keeps a hung trusted.py
+# from stalling the bring-up indefinitely.
+_trusted=""
+if [[ "$INSTANCE" =~ ^proton-[0-9]+$ ]]; then
+    _trusted=$(timeout 5 python3 "${PROTEUS_BIN:-/etc/proteus/bin}"/trusted.py list \
+                   --file "${PROTEUS_TRUSTED_FILE:-/etc/proteus/trusted.json}" \
+                   --mgmt-cidr "${PROTEUS_MGMT_CIDR:-}" \
+                   --client-cidr "${CLIENT_VLAN_CIDR:-}" 2>/dev/null) || _trusted=""
+fi
+for _tc in ${_trusted:+$_trusted "${PROTEUS_UDM_TUNNEL_CIDR:-10.99.99.0/30}"}; do
+    [ -n "$_tc" ] || continue
+    ip -n "$NS" route replace "$_tc" via "$TRANSIT_MAIN" dev "$VETH_NS" || true
+done
 ip -n "$NS" route add default dev wg0
 ip -n "$NS" -6 route add default dev wg0 2>/dev/null || true
 
@@ -185,9 +244,14 @@ ip netns exec "$NS" sysctl -q -w net.ipv6.conf.all.forwarding=1 2>/dev/null || t
 } > "${NETNS_CONF_DIR}/resolv.conf"
 chmod 644 "${NETNS_CONF_DIR}/resolv.conf"
 
-# Main-ns: fwmark -> dedicated table -> veth to ns
+# Main-ns: fwmark -> dedicated table -> veth to ns.
+# The route goes in first, then the rules. On a rebuild the rules never went
+# away, so adding the route is the moment this slot's traffic flows again. On
+# a first bring-up, the rule appears only once the table can route. Both rule
+# adds are add-if-absent: an identical rule left by the previous run counts
+# as success.
 ip route replace default via "$TRANSIT_NS" dev "$VETH_MAIN" table "$RT_TABLE"
-ip rule add fwmark "$FWMARK" lookup "$RT_TABLE" pref $((500 + NAME_IDX))
+rg_rule_ensure fwmark "$FWMARK" lookup "$RT_TABLE" pref $((500 + NAME_IDX))
 
 # Source-IP rule: packets originating from the main-ns side of the veth
 # (i.e. bound to $TRANSIT_MAIN) take the same route table. Used by unbound
@@ -197,7 +261,7 @@ ip rule add fwmark "$FWMARK" lookup "$RT_TABLE" pref $((500 + NAME_IDX))
 # (Tried `type route hook output priority mangle` with mark-set: mangle fires
 # but the reroute is unreliable on this kernel, so we use a deterministic
 # source-based rule instead.)
-ip rule add from "$TRANSIT_MAIN" lookup "$RT_TABLE" pref $((400 + NAME_IDX))
+rg_rule_ensure from "$TRANSIT_MAIN" lookup "$RT_TABLE" pref $((400 + NAME_IDX))
 
 cat > "$STATE_FILE" << EOF
 INSTANCE=${INSTANCE}

@@ -131,6 +131,9 @@ enable_services() {
     # ruleset; re-runs at every boot after nftables.service. daemon-reload above
     # is what makes this unit known on a fresh install.
     systemctl enable --now proteus-client-isolation.service || true
+    # Reconciles trusted.json against nftables at boot; safe to enable unconditionally
+    # since it no-ops (leaves the feature off) until an operator configures a range.
+    systemctl enable --now proteus-trusted-egress.service || true
     systemctl enable --now proteus-slot-warmup.timer proteus-dns-latency.timer \
         proteus-proton-api-whitelist.timer
     for (( n=1; n<=SLOT_COUNT; n++ )); do systemctl enable "proteus-rotate-slot@proton-$n.timer" || true; done

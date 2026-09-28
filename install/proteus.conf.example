@@ -60,13 +60,20 @@ STREAMING_MIN_MBPS=25
 # run `install.sh --confirm`. This is the SSH-lockout safety net.
 NFT_REVERT_SECONDS=900
 
-# TCP port the web UI (proteus-ui) listens on, HTTPS only. Reachable from
-# MGMT_CIDR and CLIENT_VLAN_CIDR (see nftables rules).
+# TCP port the web UI (proteus-ui) listens on, HTTPS only. Who can reach it is
+# decided by two input rules: "proteus-ui-mgmt" accepts MGMT_CIDR plus
+# UI_MGMT_EXTRA on MGMT_IFACE, and "proteus-ui-client" accepts CLIENT_VLAN_CIDR
+# only when UI_CLIENT_VLAN_ACCESS=yes (see both below).
 UI_PORT=8443
 
 # One extra source CIDR allowed to reach the web UI on the mgmt interface, on
 # top of MGMT_CIDR. Use this for an admin/workstation subnet that isn't the
-# proxy's own mgmt network. Default 127.0.0.1/32 means "no extra source".
+# proxy's own mgmt network, including a trusted VLAN that egresses through the
+# UDM tunnel: this setting, not the tunnel, is what gives it the UI. It takes
+# exactly one CIDR. The UI traffic must reach MGMT_IFACE: a UniFi Traffic Route
+# scoped to all destinations (rather than Internet) sends it in through wg-udm
+# instead, where the input chain drops it. Default 127.0.0.1/32 means "no extra
+# source".
 UI_MGMT_EXTRA=127.0.0.1/32
 
 # Should devices on the CLIENT VLAN be able to reach the web UI?

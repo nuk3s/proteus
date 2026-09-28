@@ -16,10 +16,12 @@ import logging
 import os
 import re
 import socket
+import stat
 import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import trusted
 import ui_logic
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(message)s")
@@ -30,6 +32,14 @@ DROPIN_DIR = "/etc/systemd/system/proteus-rotate-slot@.timer.d"
 FLAG_FILE = "/etc/proteus/state/rotation-paused"
 TRIGGER_DIR = "/run/proteus"
 CHECKS_FILE = "/etc/proteus/checks.json"
+CANARIES_FILE = "/etc/proteus/canaries.json"
+TRUSTED_FILE = "/etc/proteus/trusted.json"
+PROTEUS_ENV = "/etc/proteus/proteus.env"
+UDM_KEY_DIR = "/etc/proteus/wg/udm"
+# The kernel's own list of local addresses, readable as a plain file — which is
+# the whole point, since this unit's sandbox denies the netlink socket `ip`
+# needs. Overridable so the suite can point at a fixture.
+FIB_TRIE = "/proc/net/fib_trie"
 # Manual rotation is proton-only in v1: DNS rotates via rotate-dns.sh on its own
 # cooldown, and no proteus-rotate-slot@dns*.service unit exists to start.
 ROTATE_SLOT_RE = re.compile(r"proton-[1-9]")
@@ -63,6 +73,208 @@ def write_json(path: str, obj: dict) -> None:
     except (KeyError, OSError):
         pass
     os.rename(tmp, path)
+
+
+def read_kv(path: str) -> dict:
+    """Parse a KEY=value env file. Missing or unreadable reads as empty, so a
+    caller gets defaults rather than an exception."""
+    try:
+        with open(path) as f:
+            return ui_logic.parse_kv(f.read())
+    except OSError:
+        return {}
+
+
+def read_env(opts) -> dict:
+    """The effective configuration: base file first, then the UI's overlay.
+
+    This is the precedence every script on the box uses — proteus.env then
+    proteus-local.env, the second sourced last so it wins — and the broker has
+    to match it. The overlay is where THIS process writes knob changes, so
+    reading only the base means the broker validates against a configuration
+    that no longer applies anywhere else: an operator who moved
+    PROTEUS_MGMT_CIDR would have trusted ranges checked against the old subnet
+    while the reconcile script guards with the new one, and the mismatch shows
+    up as a feature that is 'on' in the UI and quietly routing nothing.
+    """
+    env = read_kv(opts.proteus_env)
+    env.update(read_kv(opts.env_file))
+    return env
+
+
+def _wg(*args: str, stdin: str | None = None) -> str:
+    return subprocess.run(["wg", *args], input=stdin, capture_output=True,
+                          text=True, check=True, timeout=15).stdout.strip()
+
+
+def write_private(path: str, text: str, mode: int = 0o600) -> None:
+    """Write `text` to `path` atomically, never readable by anyone else at any
+    instant.
+
+    `open()` would create the temp file with the umask's mode — 0644 by default,
+    with a private key already inside it — and a later `chmod` closes that
+    window only after the fact. `O_CREAT|O_EXCL` with the final mode means the
+    file is born at `mode` instead.
+
+    A `.tmp` left behind by a killed process would block `O_EXCL` forever and
+    wedge every future pairing, so a stale one is cleared first; a failure
+    part-way through this call does not leave one either.
+    """
+    tmp = f"{path}.tmp"
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def udm_pair(opts) -> dict:
+    """Mint a keypair for the UDM, record its public half as our peer, and
+    render the configuration the operator pastes into UniFi.
+
+    The UDM's private key is returned and never written: storing it would put a
+    working tunnel credential at rest for no benefit, since losing it before
+    pasting costs only another pairing. Our own server key, by contrast, is kept
+    and reused, so re-pairing does not invalidate anything except the previous
+    UDM key.
+    """
+    key_dir = opts.udm_key_dir
+    os.makedirs(key_dir, exist_ok=True)
+    # lstat, not stat: a symlink here would send the chmod and the keys
+    # somewhere else entirely. The owner check is against this process rather
+    # than a hardcoded 0 so the suite can run unprivileged; the broker is root
+    # in production, where this is exactly "must be a root-owned directory".
+    st = os.lstat(key_dir)
+    if not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError(f"key directory {key_dir} is a symlink or not a directory")
+    if st.st_uid != os.geteuid():
+        raise RuntimeError(f"key directory {key_dir} is owned by uid {st.st_uid}, not this process")
+    os.chmod(key_dir, 0o700)
+
+    server_key = os.path.join(key_dir, "server.key")
+    # Size, not existence, matching the reconcile script's `[ -s ]`: a zero-byte
+    # server.key is a half-written one, and treating it as present would wedge
+    # pairing behind a key that cannot work.
+    if not (os.path.isfile(server_key) and os.path.getsize(server_key) > 0):
+        write_private(server_key, _wg("genkey") + "\n")
+    with open(server_key) as f:
+        server_priv = f.read().strip()
+    server_pub = _wg("pubkey", stdin=server_priv + "\n")
+
+    udm_priv = _wg("genkey")
+    udm_pub = _wg("pubkey", stdin=udm_priv + "\n")
+
+    # Base then overlay, the same precedence proteus-trusted-egress.sh applies:
+    # the tunnel subnet and MTU are site-settable in either file, and the two
+    # readers must never disagree about which value is in force. The port is
+    # not site-settable — it is fixed in lockstep with nftables.conf's
+    # UDM_TUNNEL_PORT define, and this default exists only so a config that
+    # omits it still renders.
+    env = read_env(opts)
+    mgmt_cidr = env.get("PROTEUS_MGMT_CIDR", "10.0.0.0/24")
+    port = env.get("PROTEUS_UDM_TUNNEL_PORT", "51821")
+    tunnel_cidr = env.get("PROTEUS_UDM_TUNNEL_CIDR", "10.99.99.0/30")
+    raw_mtu = env.get("PROTEUS_UDM_TUNNEL_MTU", "") or "1420"
+    try:
+        mtu = int(raw_mtu)
+    except ValueError:
+        raise RuntimeError(f"PROTEUS_UDM_TUNNEL_MTU={raw_mtu!r} is not a number "
+                           f"(check {opts.proteus_env} and {opts.env_file})") from None
+
+    # Fail here rather than hand over a configuration UniFi will refuse. A VPN
+    # Client with no `DNS` line in [Interface] is rejected by UniFi's own
+    # validator, and it is rejected AFTER the operator has pasted in a private
+    # key this gateway does not store and cannot reissue — so an unset knob has
+    # to stop the pairing, with a message that says which knob and what value.
+    # Deliberately no default: the right answer is the operator's LAN resolver,
+    # which nothing here can guess, and guessing a public one would quietly cost
+    # every trusted host its ad-blocking and its internal names.
+    try:
+        dns = ", ".join(trusted.parse_dns_list(env.get("PROTEUS_UDM_DNS", "")))
+    except ValueError as e:
+        raise RuntimeError(
+            f"PROTEUS_UDM_DNS {e}. UniFi rejects a VPN Client configuration "
+            f"whose [Interface] has no 'DNS = <IP address>' line. Set it to your "
+            f"LAN resolver's address — the one trusted hosts already use, so "
+            f"their ad-blocking and internal names keep working, not a public or "
+            f"in-tunnel resolver — in the web UI under Settings > 'UDM tunnel "
+            f"(trusted-VLAN egress)' > 'DNS server for trusted hosts', or in "
+            f"{opts.proteus_env}") from None
+
+    # procfs first, `ip` only as a fallback — deliberately that way round. This
+    # unit sets RestrictAddressFamilies=AF_UNIX, which denies AF_NETLINK, so in
+    # production `ip` cannot open its socket at all: it exits 1 and pairing died
+    # with "returned non-zero exit status 1". Reading /proc/net/fib_trie needs no
+    # socket. See trusted.mgmt_ip_from_fib_trie for the format and the full why.
+    host = None
+    try:
+        with open(opts.fib_trie) as f:
+            host = trusted.mgmt_ip_from_fib_trie(f.read(), mgmt_cidr)
+    except OSError:
+        pass  # no procfs table, or no permission to read it: try `ip` below
+    if not host:
+        # Kept for anything running this code outside the sandbox, and for a
+        # kernel whose procfs does not carry the table. Its own failure is
+        # swallowed on purpose: a fallback that cannot run is not the operator's
+        # problem to read about, and letting its exception escape is what turned
+        # a misconfigured subnet into an unreadable subprocess error.
+        try:
+            addr_out = subprocess.run(["ip", "-4", "-o", "addr", "show"],
+                                      capture_output=True, text=True,
+                                      check=True, timeout=15).stdout
+        except (OSError, subprocess.SubprocessError):
+            addr_out = ""
+        host = trusted.mgmt_ip_from(addr_out, mgmt_cidr)
+    if not host:
+        # Name the setting, not just the subnet: the usual cause is an unset or
+        # wrong PROTEUS_MGMT_CIDR, whose placeholder default above is one no
+        # real deployment uses.
+        raise RuntimeError(f"no local address inside {mgmt_cidr} "
+                           f"(check PROTEUS_MGMT_CIDR in {opts.proteus_env} "
+                           f"and {opts.env_file})")
+
+    # Render before recording the peer. Everything above can still fail on
+    # configuration the peer has nothing to do with (an unparseable tunnel CIDR,
+    # no management address), and replacing peer.pub first would revoke the
+    # working pairing in exchange for a config the operator never received.
+    conf = trusted.render_udm_conf(udm_private=udm_priv, server_pub=server_pub,
+                                   endpoint=f"{host}:{port}",
+                                   tunnel_cidr=tunnel_cidr, mtu=mtu, dns=dns)
+
+    # 0600 root, and no chown to proteus-ui: the key directory is 0700 root, so
+    # no other user can traverse into it and a group-readable mode here would
+    # only look like access the UI does not have. The one reader is the
+    # reconcile script, which runs as root; the UI learns about pairing from the
+    # broker, not from this file.
+    write_private(os.path.join(key_dir, "peer.pub"), udm_pub + "\n")
+
+    out = {"config": conf, "server_pub": server_pub, "endpoint": f"{host}:{port}"}
+    # Recording the peer changes nothing by itself: proteus-trusted-egress.sh
+    # is what loads it into wg-udm and drops the key it replaces, and it has no
+    # path or timer unit to notice the file on its own. Without this kick the
+    # configuration the operator just pasted into UniFi would not connect, and
+    # the router key it replaced would stay live until the next boot — which
+    # would make re-pairing look like a revocation without being one.
+    # OSError too, not just the subprocess errors: if systemctl is missing from
+    # PATH the exec raises FileNotFoundError, and letting that escape to the
+    # generic guard in handle() would drop the configuration on the floor —
+    # AFTER peer.pub was replaced, so the operator would be left with a tunnel
+    # whose only working config they never received and cannot regenerate.
+    try:
+        systemctl("restart", "proteus-trusted-egress.service")
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        out["_kick_failed"] = True
+    return out
 
 
 def handle(cmd: dict, opts) -> dict:
@@ -138,6 +350,54 @@ def handle(cmd: dict, opts) -> dict:
         write_json(opts.checks_file, {"checks": clean})
         log.info("apply cmd=set-checks n=%d", len(clean))
         return {"ok": True}
+    if c == "set-canaries":
+        ok, reason, clean = ui_logic.validate_canaries({"canaries": cmd.get("canaries")})
+        if not ok:
+            return {"ok": False, "error": reason}
+        write_json(opts.canaries_file, {"canaries": clean})
+        log.info("apply cmd=set-canaries n=%d", len(clean))
+        return {"ok": True}
+    if c == "set-trusted":
+        # Base then overlay: these two CIDRs are the guards that stop a range
+        # swallowing the management subnet or the client VLAN, and the reconcile
+        # script re-checks them with the overlay applied. Validating against the
+        # base alone would let the UI accept a list that the data path then
+        # refuses, silently.
+        env = read_env(opts)
+        ok, reason, clean = trusted.validate(
+            {"trusted": cmd.get("trusted")},
+            env.get("PROTEUS_MGMT_CIDR", ""),
+            env.get("PROTEUS_CLIENT_VLAN_CIDR", ""))
+        if not ok:
+            return {"ok": False, "error": reason}
+        write_json(opts.trusted_file, {"trusted": clean})
+        try:
+            systemctl("restart", "proteus-trusted-egress.service")
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            # The list IS on disk; say so rather than letting this look like
+            # nothing happened, matching how a failed knob kick reports. OSError
+            # covers a missing systemctl, which is a failed kick like any other.
+            return {"ok": False, "error": "saved but proteus-trusted-egress restart failed",
+                    "saved": True}
+        log.info("apply cmd=set-trusted n=%d", len(clean))
+        return {"ok": True}
+    if c == "udm-peer":
+        try:
+            out = udm_pair(opts)
+        except Exception as e:  # noqa: BLE001 — report the cause, never a bare failure
+            return {"ok": False, "error": f"pairing failed: {e}"}
+        # Deliberately does not log the config or any key material.
+        if out.pop("_kick_failed", False):
+            log.info("apply cmd=udm-peer (new UDM key issued, reconcile kick failed)")
+            # The config IS valid and the peer IS recorded — hand both back, or
+            # the operator throws away a usable pairing. What is missing is the
+            # reconcile that makes it live, so name the unit to run.
+            return {"ok": False, "saved": True,
+                    "error": "pairing issued but proteus-trusted-egress restart failed; "
+                             "the new key is recorded, not live — start the unit to apply it",
+                    **out}
+        log.info("apply cmd=udm-peer (new UDM key issued, peer replaced)")
+        return {"ok": True, **out}
     return {"ok": False, "error": "unknown command"}
 
 
@@ -170,6 +430,11 @@ def main() -> None:
     p.add_argument("--flag-file", default=FLAG_FILE)
     p.add_argument("--trigger-dir", default=TRIGGER_DIR)
     p.add_argument("--checks-file", default=CHECKS_FILE)
+    p.add_argument("--canaries-file", default=CANARIES_FILE)
+    p.add_argument("--trusted-file", default=TRUSTED_FILE)
+    p.add_argument("--proteus-env", default=PROTEUS_ENV)
+    p.add_argument("--udm-key-dir", default=UDM_KEY_DIR)
+    p.add_argument("--fib-trie", default=FIB_TRIE)
     opts = p.parse_args()
     if opts.test_socket:
         sock = socket.socket(socket.AF_UNIX)

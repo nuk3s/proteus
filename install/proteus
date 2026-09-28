@@ -169,9 +169,20 @@ screen_apply() {
         local stage="$HERE/.staging"
         info "installing dependencies…"
         install_deps_wrap || { bad "dependency install failed — see: sudo ./install/install.sh --render"; exit 1; }
-        info "rendering config…";        render_all "$stage" >/dev/null
+        # Start from an empty staging dir. render_all only ever adds files, and
+        # apply_files installs every unit it finds there, so a file left by an
+        # earlier run (a unit since dropped from the templates) would ship too.
+        rm -rf "$stage"
+        info "rendering config…"
+        render_all "$stage" >/dev/null \
+            || { bad "rendering failed (see the error above); nothing was installed"; exit 1; }
         info "applying files + network (behind ${NFT_REVERT_SECONDS:-600}s revert)…"
-        apply_files "$stage" >/dev/null && apply_network >/dev/null
+        # This wizard runs without set -e, so each step's status is checked
+        # here; "gateway applied" must mean it was.
+        apply_files "$stage" >/dev/null \
+            || { bad "installing the rendered files failed (see the error above); the new ruleset was not loaded"; exit 1; }
+        apply_network >/dev/null \
+            || { bad "applying the network failed (see the error above); the gateway is NOT applied"; exit 1; }
         ok "gateway applied — kill-switch live, forwarding on."
     fi
     echo
@@ -181,7 +192,12 @@ screen_apply() {
         "the ruleset auto-reverts and nothing sticks."
     echo
     [[ $DEMO == 1 ]] && { beat 1.2; info "new session confirmed ✓ — keeping the ruleset"; beat .8; } \
-        || { pause "reconnected OK? press enter to lock it in (or Ctrl-C to bail)…"; source "$HERE/lib/apply.sh"; confirm 2>/dev/null || true; }
+        || { pause "reconnected OK? press enter to lock it in (or Ctrl-C to bail)…"
+             # A subshell: apply.sh's confirm() would otherwise replace this
+             # wizard's own confirm prompt. Its refusal (the revert already
+             # fired) must stop the wizard, not be swallowed.
+             ( source "$HERE/lib/apply.sh"; confirm ) \
+                 || { bad "the auto-revert already ran — the old ruleset is back. Re-run ./install/proteus to apply again."; exit 1; }; }
 }
 install_deps_wrap() {   # real mode: run install.sh's dep step quietly
     # In a subshell: install.sh sets -e for its own phases, and this wizard

@@ -71,6 +71,8 @@ echo "an authenticated mutating request with a non-object body is rejected, not 
 assert_eq "$(post "${AUTH[@]}" -d '[]' "$U/api/knobs")"   "400" "knobs body [] -> 400"
 assert_eq "$(post "${AUTH[@]}" -d '[]' "$U/api/action")"  "400" "action body [] -> 400"
 assert_eq "$(post "${AUTH[@]}" -d '[]' "$U/api/checks")"  "400" "checks body [] -> 400"
+assert_eq "$(post "${AUTH[@]}" -d '[]' "$U/api/canaries")" "400" "canaries body [] -> 400"
+assert_eq "$(post "${AUTH[@]}" -d '[]' "$U/api/trusted")"  "400" "trusted body [] -> 400"
 
 echo "status survives a torn history row and merges the .meta sidecar"
 assert_eq "$(code "${AUTH[@]}" "$U/api/status")" "200" "status -> 200 despite a corrupt history line"

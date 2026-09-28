@@ -80,6 +80,28 @@ def test_knob_float_accept_reject():
     assert not ui_logic.validate_knob("PROTEUS_SCORE_LAT_COEF", "0_5")[0]
 
 
+def test_udm_dns_knob_takes_ip_addresses_and_nothing_else():
+    # Same parser the pairing uses, so the panel cannot save a value that then
+    # fails at pairing time — which is the whole point of validating here.
+    assert ui_logic.validate_knob("PROTEUS_UDM_DNS", "192.168.1.53")[0]
+    assert ui_logic.validate_knob("PROTEUS_UDM_DNS", "10.0.0.53,10.0.0.54")[0]
+    assert ui_logic.validate_knob("PROTEUS_UDM_DNS", "fd00::53")[0]
+    for bad in ("resolver.internal", "localhost", "10.0.0.53,", "10.0.0.256"):
+        ok, reason = ui_logic.validate_knob("PROTEUS_UDM_DNS", bad)
+        assert not ok and "PROTEUS_UDM_DNS" in reason
+    # These never reach the parser: the shared charset filter stops them first,
+    # which is the point — a space is inert in the rendered config but not in the
+    # overlay, which every script on the box sources.
+    for bad in ("10.0.0.53, 10.0.0.54", "192.168.1.53/32", "$(reboot)"):
+        ok, reason = ui_logic.validate_knob("PROTEUS_UDM_DNS", bad)
+        assert not ok and reason
+    # Shipped empty on purpose: the right answer is site-specific.
+    assert ui_logic.KNOBS["PROTEUS_UDM_DNS"].default == ""
+    # Drawn by the trusted-egress pane, not the generic grouped list.
+    assert ui_logic.KNOBS["PROTEUS_UDM_DNS"].group == "udm"
+    assert "udm" not in dict(ui_logic.KNOB_GROUPS)
+
+
 def test_knob_kick_units():
     assert ui_logic.KNOBS["PROTEUS_SPREAD_BAND"].kick == "proteus-dispatcher.service"
     assert ui_logic.KNOBS["PROTEUS_ROT_THRESHOLD"].kick is None
@@ -376,6 +398,134 @@ def test_choices_knob_schema_json_safe():
     assert wire["PROTEUS_CLIENT_ISOLATION"]["choices"] == ["open", "isolated"]
     # non-choice knobs still carry an (empty) choices field, not a crash
     assert wire["PROTEUS_STREAMING_MIN_MBPS"]["choices"] == []
+
+
+# --- Cloudflare canaries -------------------------------------------------------
+import ledger
+
+
+def test_validate_canaries_accepts_https_list():
+    ok, reason, clean = ui_logic.validate_canaries(
+        {"canaries": [{"url": "https://a.invalid/"}, {"url": "https://b.invalid/x?y=1"}]})
+    assert ok, reason
+    assert clean == [{"url": "https://a.invalid/"}, {"url": "https://b.invalid/x?y=1"}]
+
+
+def test_validate_canaries_rejects_bad_entries():
+    bad = [
+        {"canaries": []},
+        {"canaries": [{"url": "http://a.invalid/"}]},
+        {"canaries": [{"url": "https://a.invalid/ x"}]},
+        {"canaries": [{"url": "https://a.invalid/"}] * 2},
+        {"canaries": [{"url": f"https://h{i}.invalid/"} for i in range(9)]},
+        {"canaries": "https://a.invalid/"},
+        {"canaries": [{"url": "https://a.invalid/;rm"}]},
+        {"canaries": [{"url": "-https://a.invalid/"}]},
+        {"canaries": [{"url": "https://" + "a" * 200 + ".invalid/"}]},
+        {"canaries": [{"url": ["https://a.invalid/"]}]},          # url not a string
+        {"canaries": [{"url": "https://\u0440\u0430ypal.com/"}]},  # Cyrillic homoglyph host
+        # userinfo: reads as discord.com, is fetched from evil.invalid
+        {"canaries": [{"url": "https://discord.com@evil.invalid/"}]},
+    ]
+    for obj in bad:
+        ok, reason, _ = ui_logic.validate_canaries(obj)
+        assert not ok, obj
+        assert reason
+
+
+def test_parse_canaries_falls_back_to_defaults():
+    assert ui_logic.parse_canaries("") == ledger.DEFAULT_CANARIES
+    assert ui_logic.parse_canaries("nope") == ledger.DEFAULT_CANARIES
+    assert ui_logic.parse_canaries('{"canaries":[{"url":"https://a.invalid/"}]}') == ["https://a.invalid/"]
+
+
+def test_builtin_checks_include_canaries_with_tier():
+    out = ui_logic.builtin_checks("advisory", ["https://a.invalid/"])
+    assert out[:len(ui_logic.BUILTIN_CHECKS)] == ui_logic.BUILTIN_CHECKS
+    assert out[-1] == {"url": "https://a.invalid/", "tier": "advisory", "canary": True}
+
+
+def test_cf_knobs_registered_and_validated():
+    for key, good, bad in [
+        ("PROTEUS_CF_TIER", "advisory", "maybe"),
+        ("PROTEUS_CF_FALLBACK", "strict", "none"),
+        ("PROTEUS_LIVECHECK", "off", "yes"),
+        ("PROTEUS_LIVECHECK_FAILS", "3", "0"),
+        ("PROTEUS_LIVECHECK_ROT_COOLDOWN", "3600", "10"),
+        ("PROTEUS_CF_STEPDOWN_RETRY_S", "21600", "60"),
+        ("PROTEUS_CF_QUARANTINE_MIN_EXITS", "8", "1"),
+        ("PROTEUS_MINT_EXPLORE", "0.5", "1.5"),
+        ("PROTEUS_MINT_POOL_TARGET", "20", "0"),
+        ("PROTEUS_MINT_REUSE_MIN_S", "604800", "9999999"),
+    ]:
+        assert ui_logic.validate_knob(key, good) == (True, ""), key
+        assert not ui_logic.validate_knob(key, bad)[0], key
+
+
+def test_slot_summary_cf_field():
+    base = dict(state={"LOGICAL_NAME": "US-XX#1"}, health={}, next_rotation=None, rotating=False, now=0.0)
+    s = ui_logic.slot_summary("proton-1", **base)
+    assert s["cf"] == {"clean": None, "failing": [], "at": None}
+    s = ui_logic.slot_summary("proton-1", cf={"CF_CLEAN": "no", "AT": "17", "FAILING": "a.invalid,b.invalid"}, **base)
+    assert s["cf"] == {"clean": False, "failing": ["a.invalid", "b.invalid"], "at": 17}
+    s = ui_logic.slot_summary("proton-1", cf={"CF_CLEAN": "yes", "AT": "x", "FAILING": ""}, **base)
+    assert s["cf"] == {"clean": True, "failing": [], "at": None}
+
+
+# exit_ip below is an RFC 1918 stand-in, not a real address; only its
+# presence/shape matters to this test.
+def test_ledger_view_survives_a_corrupt_ledger(tmp_path):
+    canaries = tmp_path / "canaries.json"
+    canaries.write_text(json.dumps({"canaries": [{"url": "https://a.invalid/"}]}))
+    led = tmp_path / "exit-ledger.jsonl"
+    # Valid JSON, wrong shape: canaries must be an object and exit_ip a string.
+    # Either one makes ledger.status raise; /api/status must still answer.
+    for bad in ('{"ts":1,"source":"gate","exit_ip":"10.219.3.4","canaries":"boom"}',
+                '{"ts":1,"source":"promote","exit_ip":42}'):
+        led.write_text(bad + "\n")
+        assert ui_logic.ledger_view(str(led), str(canaries), 1, 2, 20, 8) == {
+            "standard": {}, "canaries": [], "pool": {}}
+    # A well-formed ledger still returns the real rollup.
+    led.write_text('{"ts":1,"source":"gate","exit_ip":"10.219.3.4",'
+                   '"canaries":{"a.invalid":"clean"}}\n')
+    out = ui_logic.ledger_view(str(led), str(canaries), 1, 2, 20, 8)
+    assert out["pool"]["known_good"] == 1
+    assert [c["host"] for c in out["canaries"]] == ["a.invalid"]
+    # Missing files degrade to an empty rollup, not an exception.
+    missing = ui_logic.ledger_view(str(tmp_path / "nope"), str(tmp_path / "nope"), 1, 2, 20, 8)
+    assert missing["pool"]["known_good"] == 0
+
+
+# --- trusted egress ----------------------------------------------------------
+def test_trusted_summary_shapes_the_status_block(tmp_path) -> None:
+    """The UI shows the list, whether the tunnel exists, how long since the peer
+    was heard from, and how many pins fall inside a trusted range."""
+    health = tmp_path / "health"
+    health.mkdir()
+    (health / ".udm-tunnel").write_text("HANDSHAKE_AGE_S=42\n")
+    pins = [{"ip": "192.168.7.9", "slot": "proton-1"},
+            {"ip": "172.16.1.50", "slot": "proton-2"}]
+    out = ui_logic.trusted_summary(["192.168.7.0/24"], up=True,
+                                   health_dir=str(health), pins=pins)
+    assert out == {"cidrs": ["192.168.7.0/24"], "tunnel_up": True,
+                   "handshake_age_s": 42, "pinned": 1}
+
+
+def test_trusted_summary_degrades_rather_than_raising(tmp_path) -> None:
+    out = ui_logic.trusted_summary([], up=False, health_dir=str(tmp_path / "nope"), pins=None)
+    assert out == {"cidrs": [], "tunnel_up": False, "handshake_age_s": None, "pinned": 0}
+    bad = tmp_path / "health"
+    bad.mkdir()
+    (bad / ".udm-tunnel").write_text("HANDSHAKE_AGE_S=not-a-number\n")
+    out = ui_logic.trusted_summary(["192.168.7.0/24"], up=True, health_dir=str(bad),
+                                   pins=[{"ip": "junk"}, {"nope": 1}])
+    assert out["handshake_age_s"] is None and out["pinned"] == 0
+    # An interface with no handshake yet writes the key with an empty value, and
+    # a malformed range or a non-list pin block must not reach the caller either.
+    (bad / ".udm-tunnel").write_text("HANDSHAKE_AGE_S=\n")
+    out = ui_logic.trusted_summary(["not-a-cidr"], up=True, health_dir=str(bad), pins="junk")
+    assert out == {"cidrs": ["not-a-cidr"], "tunnel_up": True,
+                   "handshake_age_s": None, "pinned": 0}
 
 
 def test_builtin_checks_match_reputation_probe_script():

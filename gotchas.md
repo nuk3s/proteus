@@ -2,6 +2,39 @@
 
 Non-obvious behaviors we hit during build-out. Each one cost real time; if you're about to make a similar change, read the relevant entry first.
 
+## An empty slot table routes VPN traffic out the uplink
+
+**Symptom (confirmed on the reference gateway with a capture):** every time a slot is rebuilt (promotion, `systemctl restart proteus-proton@…`, a DNS rotation), a burst of client packets leaves the **management uplink** un-tunnelled, still carrying their client-VLAN source address. The window was ~220 ms per rebuild on a healthy run. A rebuild that aborted half way held it open until the next good run, and a stopped slot held it open for as long as it stayed stopped. The upstream router happened to drop the packets as spoofed; nothing on the gateway did.
+
+**Cause.** Policy routing does not stop at a table that has no matching route: `ip rule fwmark N lookup 10N` over an **empty** table 10N simply moves on to the next rule, and ends in `main`, whose default route is the uplink. `vpnns-up.sh` used to delete the fwmark rule and flush the table before rebuilding, and the table empties by itself anyway the moment the old veth is deleted. `vpnns-down.sh` deleted both. The firewall did not catch it either: `client-marked-to-vpn` and `ct state established,related accept` had no output-interface check, and there was no NAT or postrouting guard on the uplink.
+
+Three more paths end the same way, because each leaves a dispatched flow with **no mark at all**, and an unmarked packet routes via `main`:
+- A trusted range removed while one of its flows is established. `prerouting_mangle` no longer restores that flow's mark.
+- A flow the NFQUEUE dispatcher placed. Its verdict sets the packet mark only; conntrack learned the mark from the map entry the dispatcher writes, on the flow's second packet. If that entry was missing by then (insert failed or timed out, map full, a reload or janitor eviction in between), the rest of the flow was unmarked, and an established TCP flow never goes back to the queue.
+- No ruleset. A hand-run `nft flush ruleset`, Debian's stock `systemctl restart nftables` (it flushes before it reloads) or `stop` (it leaves the box flushed), and a ruleset that fails to load at boot all leave it a plain router. Nothing restores any mark. The proteus drop-in for nftables.service removes the flush from restart and stop (see operations.md), but the routing layer below must hold without it.
+
+**Fix: two layers, routing and firewall, each tested on its own.** `tests/rebuild_leak_sim.sh --matrix <pre-fix ref>` runs every scenario against each layer alone.
+1. Routing (`routeguard.sh`), which needs no nftables:
+   - Every slot table ends in `blackhole default metric 4294967295`, installed before any teardown. Rules are **kept** across rebuild and stop, so a slot is either routed through its veth or dropped, never `main`.
+   - One static `not fwmark 0x0/0xffffffff blackhole` rule at pref 32000 catches a mark with no slot rule. Typed without the mask, `not fwmark 0` stores mark 0/mask 0 and matches nothing (`ip rule` then lists it as `not from all blackhole`), so re-run `routeguard.sh` rather than adding it by hand.
+   - The ingress sink: `iif <client iface> lookup 900` and `iif wg-udm lookup 900` at pref 32020, where table 900 is `default dev proteus-null` (a dummy device), with RFC1918 destinations sent to `main` first at pref 32010. It keys on the ingress interface, so it holds for a flow that lost its mark and for a box with no ruleset.
+2. Firewall (`nftables.conf` and its template):
+   - `chain prerouting_ctsave` copies the dispatcher's verdict into conntrack, so a dispatched flow keeps its slot for life.
+   - `chain forward` opens with guards that drop meta-marked, and original-direction ct-marked, packets headed anywhere but `v-proton-*` (counter `marked_leak_fwd`), then `unmarked-client-egress`, which drops unmarked traffic from the client interface or `wg-udm` to a public address. The marked accepts are `oifname "v-proton-*"`-scoped too.
+   - `chain postrouting_guard` is the last line for forwarded and local traffic alike: marked egress is allowed only via `v-proton-*`, the DNS veth and `lo` (counter `marked_leak_post`).
+   - `chain output` drops the box's own ICMP errors about the reply leg of a dispatched flow (`own-icmp-error-for-tunnelled-flow`, counter `own_icmp_err_tunnelled`). When a client leaves the VLAN while a remote keeps sending, the box answers the remote with host-unreachable. Conntrack files that error as RELATED in the original direction with the flow's ct mark, but its meta mark is 0, so with the default `net.ipv4.icmp_errors_use_inbound_ifaddr=0` it routes via `main` out the uplink from the box's own address, quoting the client's VLAN address and port. The rule matches only errors headed off-tunnel: with that sysctl at 1 the error is sourced from the slot's transit address, routes into the slot veth and reaches the remote, and is left alone. Routing cannot see it (mark 0, `iif lo`); without this rule `postrouting_guard` catches it and `marked_leak_post` moves every day for no routing fault.
+
+The firewall cannot cover its own absence, so the no-ruleset case is the routing layer's alone; every other case is closed by either layer on its own.
+
+**Don't regress it:**
+- Never `ip route flush table <slot table>` or `ip rule del` a slot rule in a code path that can run while traffic flows. Delete the specific route (`ip route del default via <transit> table N`), never the sentinel.
+- Sentinels and the catch rule are `blackhole`, not `unreachable`. Both stop the leak, but `unreachable` answers the client with ICMP host-unreachable, and a client TCP stack aborts `connect()` on that at once: a few failed connects on every promotion. `blackhole` drops silently and the client's SYN retransmit lands in the rebuilt tunnel.
+- The ingress sink must be a route to a real device, never `blackhole` or `unreachable`. With `rp_filter` on, a tunnel's reply to a client is validated by looking up its public source as if it had arrived on the client interface, which lands on the pref-32020 rule. A non-unicast answer there drops every tunnel reply.
+- Keep `ct direction original` on the ct-mark guards. Replies to clients carry the flow's ct mark out the client interface (including the client-DNS redirect, whose flow is dispatched before the DNAT) and must pass.
+- `fwmark_reflect` must stay 0 (the installer pins it in `99-proteus.conf`). With it on, the ICMP errors and TCP RSTs the box sends to a client inherit the flow's mark, and policy routing sends them into the slot tunnel instead of straight back out the client interface. The guards do not drop them (a slot veth is an allowed way out), so no counter shows it.
+- Keep `own-icmp-error-for-tunnelled-flow` above `ct state established,related accept` in chain output. Below it, the accept passes the errors and they leave the uplink on any box whose `postrouting_guard` has been edited away.
+- Reload with `nft -f` or `systemctl reload nftables`. `systemctl restart nftables` is only safe while `/etc/systemd/system/nftables.service.d/proteus.conf` is in place: without it, restart flushes the ruleset before reloading and stop leaves none (see operations.md).
+
 ## `type route` hook doesn't reliably reroute on this kernel
 
 **Kernel:** 6.12.74 (Debian 13 trixie).
@@ -44,6 +77,8 @@ Any `nft -f /etc/nftables.conf` flushes @wg_peers and @proton_api. The ruleset *
 
 **After any nft reload**, run both, in this order: reload → repopulate → restart dependent services. `operations.md` → "Deploy a config change to nftables safely" has the full sequence. If you skip it: all WG handshakes start failing silently within a keepalive interval because the kill-switch no longer permits them.
 
+`systemctl restart nftables` and `systemctl reload nftables` do this for you: the proteus drop-in runs `proteus-nft-repopulate.sh` after every load, which queues these two and the refills for `@client_pivot` and `@trusted_src`. A hand-run `nft -f` does not.
+
 ## The netns default resolver would leak, so we bind-mount
 
 Main ns's `/etc/resolv.conf` points at the lab's AdGuard resolver (`10.0.0.22`), which is unreachable from inside a tunnel ns (the kill-switch would drop it, and even if it didn't, using the LAN's resolver for client traffic would be a DNS leak).
@@ -70,7 +105,7 @@ The old form of this entry blamed `tunnel RTT + Quad9 RTT` (~150-200ms) plus TCP
 
 ## SIGHUP to the dispatcher re-reads state, not code
 
-`proteus-dispatcher.service` reloads the instance pool on SIGHUP — but only by re-running `_load_instances()` on the already-imported Python module. Code changes in `dispatcher.py` require a full `systemctl restart`. The line in `journalctl` you want to confirm is "loaded N VPN instance(s): …" after the restart.
+`proteus-dispatcher.service` reloads the instance pool on SIGHUP — but only by re-running `load_instances()` on the already-imported Python module, and not at once: the handler sets a flag, and the next pick or janitor pass does the reload (see `_install_signal_handlers` in `dispatcher.py` and operations.md → "Add or replace a slot"). Code changes in `dispatcher.py` require a full `systemctl restart`. The line in `journalctl` you want to confirm is "loaded N VPN instance(s): …" after the restart.
 
 ## Don't query AbuseIPDB / Scamalytics from the mgmt IP
 
@@ -378,9 +413,9 @@ cosmetic. (`wg-${INSTANCE}` must stay ≤15 chars; the script sanity-checks it.)
 
 ## Staging netns left behind on kill
 
-If `rotate-slot.sh` dies between `vpnns-up.sh ...-s` and the promote-or-cleanup branch, the staging netns stays behind. Symptom: `ip netns list` shows `ns-proton-N-s`, and `ip rule` shows `from 172.31.N.1 lookup 10N` / `fwmark 0x65+N lookup 20N` for the orphan.
+If `rotate-slot.sh` dies between `vpnns-up.sh ...-s` and the promote-or-cleanup branch, the staging netns stays behind. Symptom: `ip netns list` shows `ns-proton-N-s`.
 
-Cleanup: `vpnns-down.sh proton-N-s` handles the netns + state file + standard rules. Verify `ip rule` is clean afterward.
+Cleanup: `vpnns-down.sh proton-N-s` removes the netns, the state file and the staging tunnel route. The two staging rules, `from 172.31.(100+N).1 lookup 20N` and `fwmark 0x(64+N) lookup 20N`, **stay** by design: they point at a table that now holds only the blackhole sentinel (see "An empty slot table routes VPN traffic out the uplink"). Don't delete them. Instead, check the table still has its sentinel: `ip route show table 20N` should print `blackhole default metric 4294967295`.
 
 ## Per-slot persistent WG keys (not one shared session key)
 

@@ -8,12 +8,19 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
+import logging
 import os
 import re
 import threading
 import time
 from dataclasses import asdict, dataclass
+
+import ledger
+import trusted
+
+_log = logging.getLogger(__name__)
 
 PBKDF2_ITERATIONS = 600_000
 SESSION_TTL_S = 24 * 3600
@@ -60,8 +67,8 @@ def verify_session(key: bytes, token: str, now: float | None = None) -> bool:
 @dataclass(frozen=True)
 class Knob:
     key: str
-    group: str          # rotation | gates | proton-dns | network | advanced
-    kind: str           # int | float | str
+    group: str          # rotation | gates | proton-dns | network | advanced | udm
+    kind: str           # int | float | str | iplist
     lo: float | None = None
     hi: float | None = None
     pattern: str | None = None
@@ -74,7 +81,9 @@ class Knob:
     choices: tuple = ()          # if set, value must be one of these (UI: dropdown)
 
 
-# group -> human heading, in display order
+# group -> human heading, in display order. "udm" is deliberately absent: its one
+# knob is drawn by the page's own trusted-egress pane, beside the pairing button
+# it affects, rather than in the generic grouped list.
 KNOB_GROUPS = [
     ("rotation", "Rotation"),
     ("gates", "Quality gates"),
@@ -109,6 +118,34 @@ KNOBS = {k.key: k for k in [
               "but an exit can get blocked later. With this on, live servers are "
               "re-tested about every 15 minutes and swapped out if video stops "
               "working — otherwise they keep serving until their next daily rotation."),
+    Knob("PROTEUS_CF_TIER", "gates", "str", choices=("mandatory", "advisory"),
+         applies="next rotation and next live check", kick="proteus-dispatcher.service",
+         label="Cloudflare canaries", unit="", default="mandatory",
+         help="Canary sites behind Cloudflare are probed from every new exit and from live "
+              "exits. mandatory: an exit that Cloudflare challenges or hard-blocks on any "
+              "canary is never promoted, and a live exit that starts failing is rotated out. "
+              "advisory: verdicts are recorded and shown but never act (shadow mode)."),
+    Knob("PROTEUS_CF_FALLBACK", "gates", "str", choices=("step-down", "strict"),
+         applies="next rotation",
+         label="If no candidate meets the standard", unit="", default="step-down",
+         help="step-down: promote the best candidate that passed everything except the "
+              "canaries, mark it, and retry later. strict: leave the current exit in place "
+              "(the rotation reports all-fail)."),
+    Knob("PROTEUS_LIVECHECK", "gates", "str", choices=("on", "off"), applies="next warmup pass",
+         label="Keep checking canaries after go-live", unit="", default="on",
+         help="Re-test live exits against the canaries and your mandatory checks about "
+              "every 15 minutes and rotate one that keeps failing."),
+    Knob("PROTEUS_LIVECHECK_FAILS", "gates", "int", 1, 10, applies="next warmup pass",
+         label="Live-check failures before rotating", unit="fails", default="2",
+         help="Consecutive failures of one canary or check before the exit is rotated. "
+              "Cloudflare challenges are often transient; two (about 30 minutes) avoids churn."),
+    Knob("PROTEUS_LIVECHECK_ROT_COOLDOWN", "gates", "int", 300, 86400, applies="next warmup pass",
+         label="Min time between live-check rotations", unit="s", default="3600",
+         help="Per exit, shared with the streaming re-check."),
+    Knob("PROTEUS_CF_STEPDOWN_RETRY_S", "gates", "int", 3600, 172800, applies="next warmup pass",
+         label="Retry a stepped-down exit after", unit="s", default="21600",
+         help="An exit promoted below the standard is left alone this long before the "
+              "live check may rotate it again."),
     Knob("PROTEUS_PROTON_COUNTRY", "proton-dns", "str", pattern=r"^[A-Z]{2}$", applies="next rotation",
          label="Exit country", unit="", default="US",
          help="Two-letter country code for newly-minted Proton exit servers (e.g. US, CH, NL)."),
@@ -141,6 +178,14 @@ KNOBS = {k.key: k for k in [
               "(the behaviour before isolation existed, no lockout risk). closed: fall "
               "back to blocking it, so a failure can't silently expose your LAN. "
               "Only bites when isolation is on — with isolation off, both behave the same."),
+    Knob("PROTEUS_UDM_DNS", "udm", "iplist", applies="the next pairing you generate",
+         label="DNS server for trusted hosts", unit="", default="",
+         help="The resolver the UDM tunnel hands to hosts routed through it. Use your own "
+              "LAN resolver — the ad-blocking one those hosts already use — not a public "
+              "or in-tunnel one: trusted hosts send their traffic out through the rotating "
+              "exits but must keep resolving internal names and keep their ad-blocking. "
+              "One IP address, or several separated by commas. There is no default, and "
+              "UniFi will not save a VPN Client without it."),
     Knob("PROTEUS_SCORE_LAT_COEF", "advanced", "float", 0.0, 10.0, applies="next warmup pass",
          label="Latency penalty weight", unit="/ms", default="0.1",
          help="How hard median latency drags a slot's health score down."),
@@ -158,9 +203,30 @@ KNOBS = {k.key: k for k in [
          applies="immediately", kick="proteus-dispatcher.service",
          label="Client stickiness", unit="s", default="21600",
          help="How long a client stays pinned to the same slot before it can be re-spread."),
+    Knob("PROTEUS_CF_QUARANTINE_MIN_EXITS", "advanced", "int", 2, 50, applies="next check",
+         label="Exits before a canary is called site-wide", unit="exits", default="8",
+         help="A canary that no exit has passed across this many distinct exits in 24h is "
+              "quarantined: still probed, but it no longer rejects exits or triggers rotations."),
+    Knob("PROTEUS_MINT_EXPLORE", "advanced", "float", 0.0, 1.0, applies="next rotation",
+         label="Exploration rate", unit="", default="0.5",
+         help="Chance that an odd-numbered rotation attempt tries a server with no history "
+              "once the known-good pool is at target. Below target, exploration is certain."),
+    Knob("PROTEUS_MINT_POOL_TARGET", "advanced", "int", 1, 200, applies="next rotation",
+         label="Known-good exit pool target", unit="exits", default="20",
+         help="How many distinct exits meeting the standard the ledger should hold. "
+              "Below this, rotations keep exploring new servers."),
+    Knob("PROTEUS_MINT_REUSE_MIN_S", "advanced", "int", 0, 2592000, applies="next rotation",
+         label="Min time before reusing an exit IP", unit="s", default="604800",
+         help="Keeps the fleet from cycling through the same few exits. Relaxed only when "
+              "every eligible exit was used within the window."),
 ]}
 
-_VALUE_RE = re.compile(r"[A-Za-z0-9._-]+")   # belt-and-braces: overlay values stay shell-inert
+# Belt-and-braces: overlay values stay shell-inert. `:` and `,` are here for an
+# IPv6 address and for a comma-separated DNS list, and both are inert in an
+# unquoted `KEY=value` line. A SPACE is not, and must never be added: proteus.env
+# and its overlay are SOURCED by every script on the box, so `KEY=a b` would run
+# `b` as a command with `KEY=a` in its environment.
+_VALUE_RE = re.compile(r"[A-Za-z0-9._:,-]+")
 # Plain decimal forms only — bash `(( ... ))` and awk choke on Python-only
 # literals like "5_0" (int with underscore) or "1e1" (float exponent form).
 _INT_RE = re.compile(r"\d+")
@@ -183,6 +249,15 @@ def validate_knob(key: str, value: str) -> tuple[bool, str]:
         n = int(value) if knob.kind == "int" else float(value)
         if not (knob.lo <= n <= knob.hi):
             return False, f"out of range {knob.lo}..{knob.hi}"
+    elif knob.kind == "iplist":
+        # The same parser the pairing itself uses, so a value the UI accepts can
+        # never be one that fails at pairing time. Note _VALUE_RE has already
+        # ruled out whitespace, so what is stored is comma-joined with no spaces
+        # and stays safe for the shell that sources the overlay.
+        try:
+            trusted.parse_dns_list(value)
+        except ValueError as e:
+            return False, f"{key} {e}"
     elif knob.pattern and not re.fullmatch(knob.pattern, value):
         return False, "bad format"
     return True, ""
@@ -277,11 +352,18 @@ class Lockout:
 
 
 def slot_summary(name: str, state: dict, health: dict,
-                 next_rotation: int | None, rotating: bool, now: float) -> dict:
+                 next_rotation: int | None, rotating: bool, now: float,
+                 cf: dict | None = None) -> dict:
     try:
         updated = float(health.get("SCORE_UPDATED_AT") or 0)
     except ValueError:
         updated = 0.0
+    cf = cf or {}
+    cf_clean = {"yes": True, "no": False}.get(cf.get("CF_CLEAN", ""), None)
+    try:
+        cf_at: int | None = int(cf.get("AT", ""))
+    except ValueError:
+        cf_at = None
     return {
         "name": name,
         "status": "down" if not state else health.get("STATUS", "unknown"),
@@ -302,6 +384,9 @@ def slot_summary(name: str, state: dict, health: dict,
         },
         "next_rotation": next_rotation,
         "rotating": rotating,
+        "cf": {"clean": cf_clean,
+               "failing": [h for h in (cf.get("FAILING") or "").split(",") if h],
+               "at": cf_at},
     }
 
 
@@ -374,3 +459,126 @@ def parse_checks(text: str) -> list:
         return clean if ok else []
     except (ValueError, TypeError):
         return []
+
+
+# --- Cloudflare canaries ---------------------------------------------------------
+MAX_CANARIES = ledger.MAX_CANARIES
+
+
+def validate_canaries(obj) -> tuple[bool, str, list]:
+    """Validate {"canaries":[{"url"},...]}: 1..MAX_CANARIES https URLs matching
+    _CHECK_URL_RE, no duplicates. Whole-list: any bad entry rejects the list."""
+    if not isinstance(obj, dict) or not isinstance(obj.get("canaries"), list):
+        return False, 'expected {"canaries": [...]}', []
+    items = obj["canaries"]
+    if not items:
+        return False, "at least one canary is required", []
+    if len(items) > MAX_CANARIES:
+        return False, f"too many canaries (max {MAX_CANARIES})", []
+    clean, seen = [], set()
+    for c in items:
+        if not isinstance(c, dict):
+            return False, "each canary must be an object", []
+        url = str(c.get("url", ""))
+        # "@" is inside _CHECK_URL_RE's charset, but userinfo makes the host the
+        # UI shows (everything before the @) different from the host curl talks
+        # to, so a canary could be listed as one site and probed on another.
+        # ledger.canary_urls drops these too; both gates exist because either
+        # can be the one an operator edits through.
+        if (len(url) > 200 or not url.startswith("https://") or "@" in url
+                or url.startswith("-") or not _CHECK_URL_RE.fullmatch(url)):
+            return False, f"invalid url: {url[:60]!r}", []
+        if url in seen:
+            return False, f"duplicate url: {url[:60]!r}", []
+        seen.add(url)
+        clean.append({"url": url})
+    return True, "", clean
+
+
+def parse_canaries(text: str) -> list[str]:
+    """URLs from a canaries.json string, or the shipped basket when the text is
+    empty, malformed or fails validation. Never raises.
+
+    All-or-nothing, matching the broker's set-canaries validation: one bad entry
+    discards the whole list. The daemon does NOT use this to decide what to
+    display — it calls ledger.canary_urls(), which drops bad entries, truncates
+    to MAX_CANARIES and dedupes, so the panel shows exactly the basket the
+    probes run."""
+    try:
+        ok, _, clean = validate_canaries(json.loads(text or "{}"))
+    except (ValueError, TypeError):
+        return list(ledger.DEFAULT_CANARIES)
+    return [c["url"] for c in clean] if ok else list(ledger.DEFAULT_CANARIES)
+
+
+def builtin_checks(cf_tier: str, canary_urls: list[str]) -> list[dict]:
+    """BUILTIN_CHECKS plus the canaries at the configured tier, for display."""
+    return BUILTIN_CHECKS + [{"url": u, "tier": cf_tier, "canary": True} for u in canary_urls]
+
+
+def ledger_view(records_path: str, canaries_path: str, now: int, slots: int,
+                target: int, min_exits: int) -> dict:
+    """Ledger rollup for /api/status: {"standard","canaries","pool"}.
+
+    The ledger is append-only JSONL written by the probes, not by this daemon,
+    so a record that is valid JSON but the wrong shape ({"canaries":"boom"},
+    a numeric exit_ip) reaches ledger.status and raises. That must degrade the
+    ledger panel, not 500 the whole status endpoint and blank the operator's
+    only view of the gateway — every one of these sections is optional in the
+    page. Empty sections render as "no data".
+    """
+    try:
+        hosts = [ledger.host_of(u) for u in ledger.canary_urls(canaries_path)]
+        return ledger.status(ledger.load(records_path), hosts, now, slots, target, min_exits)
+    except Exception as e:  # noqa: BLE001 — the panel outlives a bad ledger line
+        _log.warning("ledger unreadable (%s): %s", records_path, e)
+        return {"standard": {}, "canaries": [], "pool": {}}
+
+
+# --- trusted-VLAN egress ---------------------------------------------------------
+def trusted_summary(cidrs: list[str], up: bool, health_dir: str, pins) -> dict:
+    """The status block for trusted egress.
+
+    `pinned` counts current pins whose source falls inside a trusted range,
+    which is the one number that answers "is any of this actually being used".
+    Everything here degrades to a null or a zero rather than raising: a status
+    poll must never fail because a status file is being rewritten underneath it.
+    The UI daemon is unprivileged and cannot read the peer key or ask WireGuard
+    anything, so this is assembled from what it can see — the operator's list,
+    the interface's presence, and the age file slot-warmup writes as root.
+    """
+    age = None
+    try:
+        with open(f"{health_dir}/.udm-tunnel") as f:
+            for line in f:
+                if line.startswith("HANDSHAKE_AGE_S="):
+                    # An interface that has never completed a handshake gets an
+                    # empty value, which int() rejects — that is "up but not yet
+                    # heard from", the same null as a missing file.
+                    age = int(line.split("=", 1)[1].strip())
+                    break
+    except (OSError, ValueError):
+        age = None
+    nets = []
+    for c in cidrs:
+        try:
+            nets.append(ipaddress.IPv4Network(c))
+        except ValueError:
+            continue
+    pinned = 0
+    # No trusted ranges is the shipped-dark default, and every pin would then be
+    # parsed into an IPv4Address only to be tested against nothing — a quarter of
+    # a millisecond of the status poll, every poll, for a guaranteed zero.
+    #
+    # The pin list comes from the dispatcher's status JSON, which this daemon
+    # only reads: anything but a list of objects is a file being rewritten or a
+    # file that is wrong, and neither may cost the operator the whole page.
+    for p in pins if (nets and isinstance(pins, list)) else []:
+        try:
+            ip = ipaddress.IPv4Address(str(p.get("ip", "")))
+        except (ValueError, AttributeError):
+            continue
+        if any(ip in n for n in nets):
+            pinned += 1
+    return {"cidrs": list(cidrs), "tunnel_up": bool(up),
+            "handshake_age_s": age, "pinned": pinned}

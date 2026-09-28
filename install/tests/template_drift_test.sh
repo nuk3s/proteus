@@ -28,6 +28,10 @@ assert_eq "$r" ok "sanity: compared $n static unit templates"
 
 echo "every unit in etc/ has a template (the installer ships templates, not etc/)"
 for ref in etc/systemd/system/*; do
+    # Drop-in directories (nftables.service.d/) have no template on purpose:
+    # install_repo_files copies them from etc/ as they are, so there is no second
+    # copy to drift. install/tests/install_repo_files_test.sh pins that.
+    [[ -d "$ref" ]] && continue
     base=$(basename "$ref")
     [[ -f "install/templates/$base.tmpl" ]] && r=ok || r=missing
     assert_eq "$r" ok "$base has install/templates/$base.tmpl"

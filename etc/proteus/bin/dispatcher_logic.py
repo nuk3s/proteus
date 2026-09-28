@@ -144,6 +144,12 @@ def pick_by_score(
 # before this module is imported).
 SPREAD_BAND = float(os.environ.get("PROTEUS_SPREAD_BAND", "40.0"))
 
+# Shadow mode: with PROTEUS_CF_TIER=advisory the Cloudflare verdict is recorded
+# and displayed but never acts, including on new-pin placement. Read at import
+# like SPREAD_BAND (dispatcher.py loads proteus.env / proteus-local.env into the
+# environment first); the UI knob restarts the dispatcher when it changes.
+CF_BIAS = os.environ.get("PROTEUS_CF_TIER", "mandatory") == "mandatory"
+
 
 # How long a playability verdict is trusted. Comfortably longer than the
 # ~16-minute re-check interval, so a slot isn't treated as "unknown" between
@@ -183,24 +189,63 @@ def is_playable(health_dir: str, name: str, now: int,
     return False
 
 
+def is_cf_clean(health_dir: str, name: str, now: int,
+                fresh_seconds: int = PLAYABILITY_FRESH_SECONDS) -> bool:
+    """Last known Cloudflare verdict for a slot. Unknown counts as clean.
+
+    slot-warmup's live_check writes .cf-state.<slot> on every run and
+    rotate-slot.sh writes it on a step-down promotion. Absent, unreadable,
+    malformed or stale all resolve to True for the same reason is_playable
+    does: presuming bad would empty the eligible pool on a monitoring hiccup.
+    """
+    try:
+        with open(f"{health_dir}/.cf-state.{name}") as f:
+            kv = {}
+            for line in f:
+                line = line.strip()
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.split("=", 1)
+                    kv[k] = v
+    except OSError:
+        return True
+    if kv.get("CF_CLEAN", "yes") != "no":
+        return True
+    try:
+        if now - int(kv.get("AT", "0")) > fresh_seconds:
+            return True
+    except ValueError:
+        return True
+    return False
+
+
 def pick_distributed(
     instances: Iterable[tuple[str, int]],
     health_dir: str,
-    pin_counts: dict[int, int],
+    load_counts: dict[int, int],
     *,
     now: int,
     fresh_seconds: int = SCORE_FRESH_SECONDS,
     spread_band: float = SPREAD_BAND,
     prefer_playable: bool = True,
 ) -> tuple[str, int] | None:
-    """Pick a slot for a new pin, spreading load across the good slots.
+    """Pick a slot for a new assignment, spreading load across the good slots.
 
     "Good" = fresh, non-degraded, and scoring within `spread_band` of the best
     fresh score (so a healthy-but-weak slot is excluded). Among those, choose
-    the least-loaded by current pin count (`pin_counts`: mark -> #pins),
-    tie-breaking toward the higher score. This fans new clients out across the
-    strong slots — spreading bandwidth and handing out distinct exit IPs —
-    instead of piling every client onto the single top slot.
+    the least-loaded by `load_counts` (mark -> #entries), tie-breaking toward
+    the higher score. This fans new work out across the strong slots —
+    spreading bandwidth and handing out distinct exit IPs — instead of piling
+    everything onto the single top slot.
+
+    `load_counts` must come from a SINGLE source, because the numbers are only
+    ever compared with each other. The caller has two candidate maps and they
+    are different units: source_pin counts pinned hosts (a handful per slot),
+    vpn_dispatch counts pinned destinations (unbounded, one per address any
+    trusted host reaches). Mixing them makes a slot carrying trusted traffic
+    look permanently most-loaded beside a slot holding four client pins, so it
+    stops receiving client pins entirely and the ranking tracks destination
+    churn instead of load. dispatcher.pick() therefore passes the counts for
+    whichever map the assignment being made will land in.
 
     Returns None if no slot has a fresh, non-degraded score (caller falls back
     to a random healthy pick).
@@ -216,47 +261,90 @@ def pick_distributed(
     if not scored:
         return None
 
-    # Prefer slots that could still stream when last checked. A bot-gated exit
-    # is fine for everything else, so it stays eligible for scoring, routing and
-    # rotation — it is only moved to the back of the queue for NEW pins, which
-    # is the one moment we get to choose without disrupting anybody.
-    #
-    # This narrows ONLY if something survives. If every slot is currently gated,
-    # keep the full set: handing a client a gated exit is worse than nothing,
-    # but handing it nothing at all is worse still.
-    #
-    # Existing pins are untouched by design — they live in the nftables map and
-    # never reach this function. A client already on a slot that goes bad is
-    # fixed by slot-warmup rotating that slot's exit, not by re-pinning it,
-    # which would change its IP mid-session for no gain.
+    # Preference cascade, each step applied only if it leaves at least one slot:
+    # clean of Cloudflare challenges AND playable, then clean, then playable,
+    # then everybody. A challenged or gated exit stays eligible for scoring,
+    # routing and rotation; it is only moved to the back of the queue for NEW
+    # pins. If every slot is bad, keep the full set: a bad exit beats none.
     if prefer_playable:
+        clean = [t for t in scored if is_cf_clean(health_dir, t[0], now)] if CF_BIAS else list(scored)
         playable = [t for t in scored if is_playable(health_dir, t[0], now)]
-        if playable:
+        both = [t for t in clean if t in playable]
+        if both:
+            scored = both
+        elif clean:
+            scored = clean
+        elif playable:
             scored = playable
 
     best = max(score for _, _, score in scored)
     eligible = [(n, m, sc) for (n, m, sc) in scored if sc >= best - spread_band]
-    # Fewest current pins first; among equally-loaded, prefer the higher score.
-    eligible.sort(key=lambda t: (pin_counts.get(t[1], 0), -t[2]))
+    # Fewest current entries first; among equally-loaded, prefer higher score.
+    eligible.sort(key=lambda t: (load_counts.get(t[1], 0), -t[2]))
     name, mark, _ = eligible[0]
     return (name, mark)
 
 
-def is_pinnable_source(ip_str: str, client_cidr: str = "172.16.1.0/24") -> bool:
-    """True if `ip_str` is a real client-VLAN host address worth pinning.
+def is_pinnable_source(ip_str: str, cidrs="172.16.1.0/24") -> bool:
+    """True if `ip_str` is a real host address inside one of `cidrs`.
 
-    Rejects 0.0.0.0 and other off-VLAN sources (e.g. a stray DHCP/broadcast
-    packet that reached the dispatcher), and the network/broadcast addresses of
-    the client subnet, so they don't pollute source_pin with junk entries.
+    `cidrs` is a CIDR string or a sequence of them; a bare string is still
+    accepted so existing callers keep working. Rejects 0.0.0.0 and other
+    off-range sources — a stray DHCP or broadcast packet that reached the
+    dispatcher should not create a junk pin — and each range's own network and
+    broadcast addresses.
+
+    That last guard is skipped for ranges with two addresses or fewer, because a
+    /32 is how a single infra host is trusted without trusting the subnet around
+    it, and its only address is simultaneously the network and the broadcast
+    address. A malformed range is skipped rather than failing the whole check,
+    so one bad entry cannot stop every other source being pinned.
     """
+    if isinstance(cidrs, str):
+        cidrs = (cidrs,)
     try:
         ip = ipaddress.IPv4Address(ip_str)
-        net = ipaddress.IPv4Network(client_cidr)
     except ValueError:
         return False
-    if ip not in net:
+    for cidr in cidrs:
+        try:
+            net = ipaddress.IPv4Network(cidr)
+        except ValueError:
+            continue
+        if ip not in net:
+            continue
+        if net.num_addresses > 2 and ip in (net.network_address, net.broadcast_address):
+            continue
+        return True
+    return False
+
+
+def is_udm_tunnel_source(ip_str: str, tunnel_cidr: str | None) -> bool:
+    """True if `ip_str` sits inside the UDM tunnel subnet.
+
+    The UDM masquerades every packet it pushes into `wg-udm`, so all trusted
+    hosts arrive at proteus wearing the single tunnel address. This predicate
+    therefore means "this packet's source carries no per-host information":
+    the dispatcher must record a destination entry for it and no source pin.
+
+    Why the source pin specifically is forbidden: `prerouting_mangle` consults
+    `@source_pin` before `@vpn_dispatch`, so one pin on the tunnel address
+    would shadow the destination path for every trusted host at once and put
+    the whole trusted VLAN back on a single exit — the exact bug the
+    per-destination dispatch exists to fix. (The ruleset also scopes its source
+    lookup to the client interface; this is the second half of the same rule,
+    on the writer's side, so a stale or hand-added pin cannot be recreated.)
+
+    A None or malformed `tunnel_cidr` returns False rather than raising: with
+    no usable tunnel subnet there is no tunnel traffic to recognise, and the
+    caller falls back to its ordinary pinnable-source check.
+    """
+    if not tunnel_cidr:
         return False
-    return ip not in (net.network_address, net.broadcast_address)
+    try:
+        return ipaddress.IPv4Address(ip_str) in ipaddress.IPv4Network(tunnel_cidr)
+    except ValueError:
+        return False
 
 
 def parse_source_pin_elements(elems: object) -> list[tuple[str, int]]:

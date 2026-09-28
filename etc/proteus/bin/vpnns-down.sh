@@ -9,12 +9,38 @@ VETH_MAIN="v-${INSTANCE}"
 STATE_FILE="/etc/proteus/state/${INSTANCE}.state"
 NETNS_CONF_DIR="/etc/netns/${NS}"
 
+# shellcheck source=/dev/null
+. "$(dirname "${BASH_SOURCE[0]}")/routeguard.sh"
+# First, before anything is removed: the catch rule covers a mark whose slot
+# has no state file (never came up, or already down), and the ingress sink
+# covers a flow that has lost its mark. Non-fatal: teardown must complete.
+rg_catch_ensure || echo "WARN: catch rule not installed" >&2
+rg_sink_ensure || echo "WARN: ingress sink incomplete" >&2
+
 if [[ -r "$STATE_FILE" ]]; then
     # shellcheck disable=SC1090
     . "$STATE_FILE"
-    ip rule del fwmark "${FWMARK:-}" lookup "${RT_TABLE:-}" 2>/dev/null || true
-    ip rule del from "${TRANSIT_MAIN:-0.0.0.0}" lookup "${RT_TABLE:-}" 2>/dev/null || true
-    ip route flush table "${RT_TABLE:-}" 2>/dev/null || true
+    # A stopped slot must fail CLOSED (see routeguard.sh). Existing flows keep
+    # their conntrack mark, and the dispatcher's pins keep handing the mark to
+    # new flows until they expire. Before this fix, the rule and table were
+    # deleted here, so all of that traffic fell through to `main` and left by
+    # the uplink for as long as the slot stayed down. That covered the first
+    # half of every `systemctl restart`, and every rotate-dns.sh swap.
+    # Now:
+    #   - the sentinel goes in first;
+    #   - only the tunnel route is removed (`via` makes the delete specific);
+    #   - the fwmark and source rules are KEPT, pointing at a table that now
+    #     holds only the blackhole sentinel.
+    # vpnns-up.sh re-adds the route, and treats the surviving rules as already
+    # present. Leftover rules for a slot that never comes back are harmless:
+    # they route nothing anywhere.
+    if [[ -n "${RT_TABLE:-}" ]]; then
+        rg_sentinel_ensure "$RT_TABLE" \
+            || echo "WARN: sentinel not installed in table $RT_TABLE; relying on the catch rule and firewall" >&2
+        if [[ -n "${TRANSIT_NS:-}" ]]; then
+            ip route del default via "$TRANSIT_NS" table "$RT_TABLE" 2>/dev/null || true
+        fi
+    fi
     if [[ -n "${WG_ENDPOINT_IP:-}" ]]; then
         nft "delete element inet filter wg_peers { ${WG_ENDPOINT_IP} }" 2>/dev/null || true
     fi

@@ -368,3 +368,155 @@ def test_degraded_still_excluded_regardless_of_playability(tmp_path):
     got = dispatcher_logic.pick_distributed(
         [("proton-1", 1), ("proton-2", 2)], str(tmp_path), {}, now=1000)
     assert got == ("proton-2", 2)          # degraded loses even to a gated slot
+
+
+# --- Cloudflare verdict bias ---------------------------------------------------
+from dispatcher_logic import is_cf_clean, pick_distributed
+
+
+def _cf(p: Path, clean: str, at: int, failing: str = "") -> None:
+    p.write_text(f"CF_CLEAN={clean}\nAT={at}\nFAILING={failing}\n")
+
+
+def _pl(p: Path, playable: str, at: int) -> None:
+    p.write_text(f"PLAYABLE={playable}\nAT={at}\n")
+
+
+def test_is_cf_clean_fails_open(tmp_path: Path) -> None:
+    now = 1_800_000_000
+    assert is_cf_clean(str(tmp_path), "proton-1", now)                       # no file
+    (tmp_path / ".cf-state.proton-1").write_text("garbage\n")
+    assert is_cf_clean(str(tmp_path), "proton-1", now)                       # malformed
+    _cf(tmp_path / ".cf-state.proton-1", "no", now - 7200)
+    assert is_cf_clean(str(tmp_path), "proton-1", now)                       # stale "no"
+    (tmp_path / ".cf-state.proton-1").write_text("CF_CLEAN=no\nAT=abc\n")
+    assert is_cf_clean(str(tmp_path), "proton-1", now)                       # bad timestamp
+    _cf(tmp_path / ".cf-state.proton-1", "no", now - 60, "discord.com")
+    assert not is_cf_clean(str(tmp_path), "proton-1", now)                   # fresh "no"
+    _cf(tmp_path / ".cf-state.proton-1", "yes", now - 60)
+    assert is_cf_clean(str(tmp_path), "proton-1", now)
+
+
+def _three_equal_slots(tmp_path: Path, now: int):
+    for n in ("proton-1", "proton-2", "proton-3"):
+        _write_state(tmp_path / f"{n}.state", "ok", 80.0, now)
+    return [("proton-1", 1), ("proton-2", 2), ("proton-3", 3)]
+
+
+def test_pick_prefers_clean_and_playable_then_clean_then_playable(tmp_path: Path) -> None:
+    now = 1_800_000_000
+    inst = _three_equal_slots(tmp_path, now)
+    # 1: challenged + playable, 2: clean + gated, 3: clean + playable
+    _cf(tmp_path / ".cf-state.proton-1", "no", now - 10, "discord.com")
+    _pl(tmp_path / ".playability-state.proton-2", "no", now - 10)
+    assert pick_distributed(inst, str(tmp_path), {}, now=now) == ("proton-3", 3)
+    # drop slot 3: clean beats playable
+    inst2 = inst[:2]
+    assert pick_distributed(inst2, str(tmp_path), {}, now=now) == ("proton-2", 2)
+    # only challenged-but-playable and challenged-and-gated: playable wins
+    _cf(tmp_path / ".cf-state.proton-2", "no", now - 10, "discord.com")
+    assert pick_distributed(inst2, str(tmp_path), {}, now=now) == ("proton-1", 1)
+
+
+def test_pick_keeps_full_set_when_every_slot_is_challenged_and_gated(tmp_path: Path) -> None:
+    now = 1_800_000_000
+    inst = _three_equal_slots(tmp_path, now)
+    for n in ("proton-1", "proton-2", "proton-3"):
+        _cf(tmp_path / f".cf-state.{n}", "no", now - 10, "discord.com")
+        _pl(tmp_path / f".playability-state.{n}", "no", now - 10)
+    assert pick_distributed(inst, str(tmp_path), {2: 0, 1: 5, 3: 5}, now=now) == ("proton-2", 2)
+
+
+def test_pick_cf_bias_only_narrows_within_scored_slots(tmp_path: Path) -> None:
+    now = 1_800_000_000
+    inst = _three_equal_slots(tmp_path, now)
+    _write_state(tmp_path / "proton-3.state", "degraded", 99.0, now)      # degraded stays out
+    _cf(tmp_path / ".cf-state.proton-1", "no", now - 10, "discord.com")
+    assert pick_distributed(inst, str(tmp_path), {}, now=now) == ("proton-2", 2)
+
+
+def test_cf_bias_is_off_in_advisory_tier(tmp_path: Path, monkeypatch) -> None:
+    """Shadow mode records verdicts but never acts, including on new-pin placement."""
+    now = 1_800_000_000
+    inst = _three_equal_slots(tmp_path, now)
+    _cf(tmp_path / ".cf-state.proton-1", "no", now - 10, "discord.com")
+    _cf(tmp_path / ".cf-state.proton-2", "no", now - 10, "discord.com")
+    monkeypatch.setattr(dispatcher_logic, "CF_BIAS", False)
+    assert pick_distributed(inst, str(tmp_path), {3: 5, 1: 0, 2: 0}, now=now) == ("proton-1", 1)
+    monkeypatch.setattr(dispatcher_logic, "CF_BIAS", True)
+    assert pick_distributed(inst, str(tmp_path), {3: 5, 1: 0, 2: 0}, now=now) == ("proton-3", 3)
+
+
+# --- pinning trusted sources -------------------------------------------------
+def test_is_pinnable_source_accepts_a_sequence_of_ranges() -> None:
+    cidrs = ["172.16.1.0/24", "192.168.7.0/24", "10.99.99.0/30"]
+    assert is_pinnable_source("172.16.1.50", cidrs)
+    assert is_pinnable_source("192.168.7.9", cidrs)
+    assert is_pinnable_source("10.99.99.2", cidrs)
+    assert not is_pinnable_source("10.44.0.1", cidrs)
+    assert not is_pinnable_source("0.0.0.0", cidrs)
+    assert not is_pinnable_source("not-an-ip", cidrs)
+
+
+def test_is_pinnable_source_still_takes_a_bare_string() -> None:
+    """Existing callers and tests pass one CIDR; that must keep working."""
+    assert is_pinnable_source("172.16.1.50", "172.16.1.0/24")
+    assert not is_pinnable_source("192.168.7.9", "172.16.1.0/24")
+
+
+def test_is_pinnable_source_rejects_network_and_broadcast_per_range() -> None:
+    cidrs = ["172.16.1.0/24", "192.168.7.0/24"]
+    for junk in ("172.16.1.0", "172.16.1.255", "192.168.7.0", "192.168.7.255"):
+        assert not is_pinnable_source(junk, cidrs), junk
+
+
+def test_is_pinnable_source_handles_a_single_host_range() -> None:
+    """A /32 is how one infra host is trusted without trusting its subnet. Its
+    only address is both network and broadcast, so the junk-address guard must
+    not swallow it."""
+    assert is_pinnable_source("172.20.0.150", ["172.20.0.150/32"])
+    assert not is_pinnable_source("172.20.0.151", ["172.20.0.150/32"])
+    assert is_pinnable_source("10.99.99.2", ["10.99.99.2/31"])
+
+
+def test_is_pinnable_source_skips_malformed_ranges_without_failing_the_rest() -> None:
+    assert is_pinnable_source("192.168.7.9", ["not-a-cidr", "192.168.7.0/24"])
+
+
+# --- recognising the masqueraded tunnel source -------------------------------
+from dispatcher_logic import is_udm_tunnel_source
+
+
+def test_is_udm_tunnel_source_matches_every_address_in_the_subnet() -> None:
+    """Both tunnel endpoints count. The UDM's own .2 is what production sees,
+    but nothing about the rule depends on which end sent the packet: any source
+    inside the tunnel is a source the router already rewrote."""
+    for ip in ("10.99.99.1", "10.99.99.2"):
+        assert is_udm_tunnel_source(ip, "10.99.99.0/30"), ip
+
+
+def test_is_udm_tunnel_source_rejects_client_vlan_and_trusted_hosts() -> None:
+    """The client VLAN keeps per-source pinning; only tunnel traffic loses it.
+
+    A trusted host's own address is included deliberately: if a future router
+    stops masquerading, those packets arrive with real per-host sources and
+    should be pinned normally rather than caught by this predicate."""
+    for ip in ("172.16.1.50", "192.168.7.9", "8.8.8.8"):
+        assert not is_udm_tunnel_source(ip, "10.99.99.0/30"), ip
+
+
+def test_is_udm_tunnel_source_is_false_without_a_usable_tunnel_cidr() -> None:
+    """dispatcher.UDM_TUNNEL_CIDR is None when the env value failed validation,
+    and a malformed literal must not raise on the packet path — an exception in
+    handle() aborts before the packet is verdicted."""
+    assert not is_udm_tunnel_source("10.99.99.2", None)
+    assert not is_udm_tunnel_source("10.99.99.2", "")
+    assert not is_udm_tunnel_source("10.99.99.2", "not-a-cidr")
+    assert not is_udm_tunnel_source("not-an-ip", "10.99.99.0/30")
+
+
+def test_is_udm_tunnel_source_follows_a_relocated_tunnel() -> None:
+    """PROTEUS_UDM_TUNNEL_CIDR is site-settable, so the check reads the
+    configured subnet rather than a baked-in 10.99.99.0/30."""
+    assert is_udm_tunnel_source("10.98.98.2", "10.98.98.0/30")
+    assert not is_udm_tunnel_source("10.99.99.2", "10.98.98.0/30")

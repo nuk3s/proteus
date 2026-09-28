@@ -15,6 +15,17 @@ define UI_MGMT_EXTRA = ${UI_MGMT_EXTRA}
 # Pointing UNBOUND_UPSTREAM at a public resolver makes this rule redundant
 # (public destinations never match the RFC1918 accept) but never wrong.
 define PROTON_DNS = ${UNBOUND_UPSTREAM}
+# UDP port wg-udm listens on for the UDM's WireGuard VPN Client.
+#
+# FIXED, not a per-site setting, and deliberately not an installer placeholder:
+# this define, the same one in etc/nftables.conf, and PROTEUS_UDM_TUNNEL_PORT in
+# proteus-trusted-egress.sh are three independent copies of one number, and
+# nothing renders any of them from another. Setting the environment variable
+# alone moves the listener to a port this chain drops, which presents as a UDM
+# that simply will not connect. Change all three, or none; a test asserts they
+# agree. (The tunnel SUBNET and MTU have no such twin and are site-settable in
+# proteus.env or the proteus-local.env overlay.)
+define UDM_TUNNEL_PORT = 51821
 
 table inet filter {
     # Destination -> fwmark lookup. Populated by the NFQUEUE dispatcher.
@@ -66,6 +77,59 @@ table inet filter {
         flags interval
     }
 
+    # Source ranges accepted from the UDM tunnel. Empty means the trusted-egress
+    # feature is off, and every rule referencing it below becomes a no-op that
+    # reproduces the pre-feature behaviour exactly.
+    #
+    # Deliberately not seeded here, and deliberately without a boot seed file of
+    # the kind @client_pivot has: for that set the fail direction is a policy
+    # question, but here "we have not reconciled yet" can only safely mean "no
+    # trusted sources", so an unreconciled boot is a boot with the feature off.
+    #
+    # `auto-merge`: this set holds up to eight operator ranges plus the tunnel
+    # subnet, and an operator listing overlapping ranges (a /24 and a /32 inside
+    # it) is a legitimate thing to do, not a mistake. Without auto-merge, an
+    # `interval` set REJECTS overlapping elements outright, and the repopulate
+    # runs after the flush — so a rejected add would leave the set, and the
+    # whole feature, silently empty. @client_pivot never hit this because it
+    # only ever holds exactly one range. Overlap must never be able to empty
+    # the gate.
+    set trusted_src {
+        type ipv4_addr
+        flags interval
+        auto-merge
+    }
+
+    # Marked-egress guard counters. A packet with a nonzero mark (meta or
+    # conntrack) is VPN traffic, and the ONLY interfaces it may leave by are
+    # the slot tunnel veths. Policy routing is the first line and fails closed
+    # on its own (routeguard.sh), so in steady state neither counter moves.
+    # Two operator actions raise marked_leak_fwd by design, because each
+    # leaves an established trusted flow briefly without its mark: a full
+    # `nft -f` reload (@trusted_src is empty until proteus-trusted-egress.sh
+    # repopulates it) and removing a trusted range. Any other increase means a
+    # marked packet was routed somewhere other than a slot veth, and one of
+    # these rules stopped it from leaving with its client source address.
+    # Inspect with
+    #   nft list counters table inet filter
+    counter marked_leak_fwd {
+        comment "forward: marked traffic routed off-tunnel, dropped"
+    }
+    counter marked_leak_post {
+        comment "postrouting: marked traffic leaving a non-tunnel iface, dropped"
+    }
+    # The box's own ICMP errors about the reply leg of a dispatched flow that
+    # would have left off-tunnel, dropped in chain output (see the rule there).
+    # This one moves in normal operation, whenever a client leaves the VLAN
+    # while a remote is still sending, and is not a leak signal: it counts
+    # packets that were stopped, by design. One caveat: on a box whose client
+    # or wg-udm MTU is below the tunnel MTU (1420), a value that climbs
+    # steadily can mean PMTU errors (fragmentation needed) the remote never
+    # got; the rule's comment says how to route those into the tunnel instead.
+    counter own_icmp_err_tunnelled {
+        comment "output: box ICMP error about a tunnelled flow, off-tunnel, dropped"
+    }
+
     chain input {
         type filter hook input priority filter; policy drop;
 
@@ -94,6 +158,8 @@ ${UI_CLIENT_RULE}
         iifname "${MGMT_IFACE}" ip saddr $LAN_MGMT  udp dport 53 counter accept comment "mgmt-dns"
         iifname "${MGMT_IFACE}" ip saddr $LAN_MGMT  tcp dport 53 counter accept comment "mgmt-dns-tcp"
 
+        iifname "${MGMT_IFACE}" ip saddr $LAN_MGMT udp dport $UDM_TUNNEL_PORT counter accept comment "udm-tunnel"
+
         counter log prefix "nft-input-dropped " level debug comment "input-dropped"
     }
 
@@ -109,9 +175,15 @@ ${UI_CLIENT_RULE}
         # bail out before the queue detour.
         meta nfproto != ipv4 counter return comment "non-ipv4-guard"
 
-        # Only touch traffic entering from the client VLAN with a non-RFC1918 destination.
-        iifname != "${CLIENT_IFACE}" return
-        ip saddr != $CLIENT_VLAN return
+        # Only touch traffic from a dispatchable origin with a non-RFC1918 destination.
+        # Two dispatchable origins: the isolated client VLAN, and trusted sources
+        # arriving through the UDM tunnel. `iifname` rather than `iif` is
+        # load-bearing — `iif` resolves to an interface index when the ruleset
+        # loads, so it would fail to load on any box that has not paired a UDM,
+        # and this file opens with `flush ruleset`.
+        iifname != { "${CLIENT_IFACE}", "wg-udm" } return
+        iifname "${CLIENT_IFACE}" ip saddr != $CLIENT_VLAN return
+        iifname "wg-udm" ip saddr != @trusted_src return
         ip daddr $RFC1918 return
         ip daddr { 127.0.0.0/8, 169.254.0.0/16, 224.0.0.0/4, 240.0.0.0/4 } return
 
@@ -121,20 +193,58 @@ ${UI_CLIENT_RULE}
         meta mark set ct mark
         meta mark != 0x0 return
 
-        # 2. NEW: per-source pin (TV-style stable per-client routing).
-        meta mark set ip saddr map @source_pin
-        meta mark != 0x0 ct mark set meta mark return
+        # 2. Per-source pin (TV-style stable per-client routing) — client VLAN
+        #    ONLY, and the interface match is the whole point.
+        #
+        #    The UDM masquerades everything it pushes into wg-udm, so every
+        #    trusted host arrives here as the one tunnel address (10.99.99.2 by
+        #    default). A source lookup on that address carries no per-host
+        #    information whatsoever: the first trusted packet pins the tunnel
+        #    address to one slot and every trusted host on every VLAN then
+        #    shares that single exit forever. Per-host exits are simply not
+        #    available while the router NATs — the information is gone before
+        #    the packet reaches us.
+        #
+        #    So tunnel traffic skips this rule and falls through to the
+        #    destination lookup below, which spreads distinct destinations
+        #    across all the slots. Client-VLAN traffic is untouched: those
+        #    hosts arrive with their real addresses and keep per-source pinning.
+        iifname "${CLIENT_IFACE}" meta mark set ip saddr map @source_pin
+        iifname "${CLIENT_IFACE}" meta mark != 0x0 ct mark set meta mark return
 
-        # 3. Per-destination stickiness fallback (covers the brief window after
-        #    a full nftables reload where source_pin is empty but conntrack
-        #    isn't yet populated).
+        # 3. Per-destination dispatch. For the client VLAN this is a fallback
+        #    (it covers the brief window after a full nftables reload where
+        #    source_pin is empty but conntrack isn't yet populated). For
+        #    wg-udm it is the PRIMARY path, per rule 2 — which is why the
+        #    dispatcher's degraded-slot janitor evicts from this map too.
         meta mark set ip daddr map @vpn_dispatch
         meta mark != 0x0 ct mark set meta mark return
 
         # 4. Brand-new (unpinned source AND unmapped destination): dispatcher decides.
-        #    "bypass" means if no daemon is listening, the packet is dropped by
-        #    default policy later — the safe behavior for our kill-switch.
+        #    "bypass" means if no daemon is listening, the packet goes on
+        #    unmarked and chain forward drops it at unmarked-client-egress (that
+        #    counter climbs): the safe behavior for our kill-switch.
         ct state new counter queue num 0 bypass
+    }
+
+    # Saves the dispatcher's verdict in conntrack. prerouting_mangle's last
+    # rule hands a brand-new flow to the NFQUEUE dispatcher, and the verdict
+    # sets the PACKET mark only. The packet then re-enters this hook at the
+    # next chain, which is this one; the rest of prerouting_mangle is skipped.
+    # Without this rule the flow's conntrack mark stayed 0 until the map entry
+    # the dispatcher writes was there for the flow's second packet. When that
+    # entry was missing (the insert failed or timed out, the map was full, a
+    # reload or a janitor eviction landed in between) the rest of the flow
+    # arrived unmarked. TCP never re-enters the queue once established (the
+    # queue rule is `ct state new`), so the flow routed via `main` and was
+    # accepted as established: out the uplink with its client source address.
+    # Saved here, a dispatched flow keeps its slot for life, like a pinned one.
+    # `ct mark 0x0` means only the queue path writes: the restore, pin and
+    # dispatch rules in prerouting_mangle already set both marks.
+    chain prerouting_ctsave {
+        type filter hook prerouting priority mangle + 1; policy accept;
+
+        iifname { "${CLIENT_IFACE}", "wg-udm" } meta mark != 0x0 ct mark 0x0 ct mark set meta mark comment "save-dispatch-verdict"
     }
 
     # Client DNS capture: clients on the VLAN may point at any resolver (the
@@ -155,18 +265,73 @@ ${UI_CLIENT_RULE}
 
         tcp flags syn tcp option maxseg size set rt mtu
 
+        # Marked-egress guard: VPN traffic leaves through a rotating-slot veth
+        # or not at all. These guards come FIRST, ahead of every accept
+        # below, the ct-established one included. That makes the established
+        # accept, and the two marked accepts further down, safe for marked
+        # traffic by construction. The rules hold however the packet got its
+        # route: a slot rebuild, a failed rebuild, a stopped slot, a promotion.
+        # Policy routing fails closed on its own (routeguard.sh); this is the
+        # firewall's independent copy of the same invariant.
+        #  - meta mark: every client/trusted packet that dispatch has marked,
+        #    new or established (prerouting_mangle restores it from conntrack).
+        #  - ct mark, ORIGINAL direction only: a flow that was dispatched but
+        #    whose packet arrives unmarked. That happens when its source has
+        #    since been dropped from @trusted_src, because prerouting_mangle
+        #    returns before restoring the mark. Such a packet used to route
+        #    via `main` and was accepted as established. REPLY-direction
+        #    packets (slot -> client) legitimately carry the flow's ct mark
+        #    out the client iface / wg-udm, so they are exempt.
+        # Only "v-proton-*": client traffic never belongs in the DNS tunnel.
+        # Each guard is a rate-limited log rule, then the counted drop, so a
+        # burst (see the counter notes above) cannot flood the kernel log.
+        meta mark != 0x0 oifname != "v-proton-*" limit rate 5/second burst 20 packets log prefix "nft-marked-leak " level warn comment "marked-off-tunnel-log"
+        meta mark != 0x0 oifname != "v-proton-*" counter name "marked_leak_fwd" drop comment "marked-off-tunnel"
+        ct direction original ct mark != 0x0 oifname != "v-proton-*" limit rate 5/second burst 20 packets log prefix "nft-marked-leak " level warn comment "ctmarked-off-tunnel-log"
+        ct direction original ct mark != 0x0 oifname != "v-proton-*" counter name "marked_leak_fwd" drop comment "ctmarked-off-tunnel"
+
+        # Traffic from a dispatch origin to a public address that carries NO
+        # mark. Every legitimate packet of that kind is marked, by
+        # prerouting_mangle or by the dispatcher's verdict (saved to conntrack
+        # by prerouting_ctsave). An unmarked one is a dispatched flow that lost
+        # its mark, a packet the queue let through with no dispatcher running
+        # (`bypass`), or a source outside the client VLAN / @trusted_src. The
+        # first used to leave by the uplink through the ct-established accept
+        # below. Not one of the must-not-move counters: dispatcher downtime
+        # raises it by design.
+        iifname { "${CLIENT_IFACE}", "wg-udm" } meta mark 0x0 ip daddr != $RFC1918 counter drop comment "unmarked-client-egress"
+
         # Ordered before ct-state-invalid drop: UniFi routes mgmt->VLAN directly,
         # so we see only the return half (SYN-ACK with no SYN in our conntrack =
         # invalid). Accept legit client-VLAN->private transit first, then drop.
         # Gated on @client_pivot (see the set above): full = open, empty = isolated.
+        # Never marked: prerouting_mangle returns on an RFC1918 destination
+        # before any mark is set, so the guard above cannot touch this path.
         iifname "${CLIENT_IFACE}" ip saddr @client_pivot ip daddr $RFC1918 oifname "${MGMT_IFACE}" counter accept comment "client-to-private"
 
         ct state invalid counter drop
+        # Unscoped on purpose: every marked packet that reaches this line is
+        # headed into a slot veth (the guard above saw to that). The rest is
+        # unmarked: replies to clients, the LAN pivot, and so on.
         ct state established,related accept
 
         # Marked path: client VLAN -> anywhere, via a VPN namespace veth.
-        # Policy routing (ip rule fwmark N lookup 100+N) has already selected the right veth.
-        iifname "${CLIENT_IFACE}" meta mark != 0x0 counter accept comment "client-marked-to-vpn"
+        # Policy routing (ip rule fwmark N lookup 100+N) has already selected the
+        # right veth. The oifname match restates the guard, so this accept is
+        # correct even if the guard above is ever reordered.
+        iifname "${CLIENT_IFACE}" meta mark != 0x0 oifname "v-proton-*" counter accept comment "client-marked-to-vpn"
+
+        # Same path for trusted sources arriving through the UDM tunnel. The
+        # saddr recheck is redundant with the mark (only a gated packet can have
+        # one) and kept anyway: it means one flushed set turns the feature off
+        # for new flows here. Established ones are handled by the
+        # "ctmarked-off-tunnel" guard above.
+        iifname "wg-udm" ip saddr @trusted_src meta mark != 0x0 oifname "v-proton-*" counter accept comment "trusted-marked-to-vpn"
+
+        # A UniFi Traffic Route scoped to all destinations rather than to
+        # Internet sends LAN traffic down the tunnel, where it would die in the
+        # policy drop below with nothing to explain why. Name it in the log.
+        iifname "wg-udm" ip daddr $RFC1918 counter log prefix "nft-trusted-lan " level debug drop comment "trusted-to-lan"
 
         counter log prefix "nft-fwd-dropped " level debug comment "forward-dropped"
     }
@@ -177,7 +342,13 @@ ${UI_CLIENT_RULE}
     chain output_route {
         type route hook output priority mangle; policy accept;
 
-        meta skuid "unbound" meta mark set ${DNS_FWMARK_HEX} comment "route-unbound-via-dns-tunnel"
+        # `ct direction original`: only what unbound itself originates, i.e. its
+        # upstream queries. unbound accept()s client TCP connections after it
+        # drops privileges, so those sockets belong to uid unbound as well.
+        # Without this match its TCP ANSWERS to clients were marked, routed into
+        # the DNS tunnel and dropped there, and client DNS over TCP (truncated
+        # or large answers) timed out.
+        meta skuid "unbound" ct direction original meta mark set ${DNS_FWMARK_HEX} comment "route-unbound-via-dns-tunnel"
     }
 
     # Kill-switch. Only applies to packets originating in the MAIN namespace.
@@ -194,13 +365,17 @@ ${UI_CLIENT_RULE}
         #
         # unbound's upstream ($PROTON_DNS) is an RFC1918 address, so the generic
         # RFC1918 accept would happily let a query leave in cleartext over the
-        # mgmt LAN. That is not hypothetical: vpnns-up.sh deletes the fwmark rule
-        # and flushes the DNS route table on every rotation, and re-adds the
-        # transit IP to the veth before it re-adds the route, so unbound can bind
-        # and send while the mark lookup falls through to `main` (-> default via
-        # the mgmt iface). Observed twice in 30 days on the reference gateway,
-        # harmless only because the old upstream was public and hit this chain's
-        # default drop. With an RFC1918 upstream that safety disappears.
+        # mgmt LAN. That is not hypothetical: vpnns-up.sh used to delete the
+        # fwmark rule and flush the DNS route table on every rotation, and re-add
+        # the transit IP to the veth before it re-added the route, so unbound
+        # could bind and send while the mark lookup fell through to `main`
+        # (-> default via the mgmt iface). Observed twice in 30 days on the
+        # reference gateway, harmless only because the old upstream was public
+        # and hit this chain's default drop. Routing now fails closed during that
+        # window (routeguard.sh: rules kept, blackhole sentinel in the DNS
+        # table), and chain postrouting_guard drops any marked packet leaving a
+        # non-tunnel interface. This rule stays as the DNS-specific belt, with
+        # its own log prefix.
         #
         # Above ct-established because conntrack keys on the 5-tuple: a flow that
         # established over the tunnel stays ESTABLISHED after the route flips.
@@ -231,6 +406,30 @@ ${UI_CLIENT_RULE}
         # with the two kill-switch drops above.
         meta skuid "unbound" meta mark ${DNS_FWMARK_HEX} oifname "v-${DNS_INSTANCE}" counter accept comment "unbound-dns-egress"
 
+        # The box's own ICMP errors about the reply leg of a dispatched flow (host
+        # unreachable once a client has left the VLAN, time exceeded,
+        # fragmentation needed) are RELATED in the ORIGINAL direction and carry
+        # the flow's ct mark. Their meta mark is 0. With the kernel default
+        # net.ipv4.icmp_errors_use_inbound_ifaddr=0 the error has no source
+        # address yet when it is routed, so no slot rule matches: it routes via
+        # main to the uplink, from this box's own address, quoting the remote's
+        # port and the client's VLAN address and port. That is what this rule
+        # stops. The established,related accept below would pass them, and
+        # routeguard.sh cannot see them (mark 0, iif lo). Dropping them loses
+        # nothing: sent from this box's address rather than the exit's, they
+        # could never be matched to the flow at the remote.
+        # With icmp_errors_use_inbound_ifaddr=1 the error is sourced from the
+        # slot's transit address (the reply leg arrived on its veth), follows
+        # that address's `from` rule into v-proton-N, is NATed in the namespace
+        # and does reach the remote, where it can matter: a PMTU error when a
+        # client-side MTU is below the tunnel's 1420, for one. The oifname match
+        # leaves errors routed into a slot veth alone. To get that, set
+        # net.ipv4.icmp_errors_use_inbound_ifaddr=1 in a sysctl.d file of its
+        # own: the installer rewrites 99-proteus.conf.
+        # Placed here so marked_leak_post keeps its meaning ("routing failed"),
+        # which these would otherwise trip daily.
+        ct state related ct direction original ct mark != 0x0 meta l4proto icmp oifname != "v-proton-*" counter name "own_icmp_err_tunnelled" drop comment "own-icmp-error-for-tunnelled-flow"
+
         ct state established,related accept
         ct state invalid counter drop
 
@@ -257,6 +456,36 @@ ${UI_CLIENT_RULE}
         oifname "${MGMT_IFACE}" tcp dport 443 ip daddr @proton_api counter accept comment "proton-api"
 
         counter log prefix "nft-output-dropped " level debug comment "output-dropped"
+    }
+
+    # Last line before the wire, for forwarded and locally generated traffic
+    # alike: a packet with a nonzero mark may leave only by a slot tunnel veth.
+    # The forward-chain guard only sees forwarded packets. This chain also sees
+    # the box's own marked traffic (unbound, mark ${DNS_FWMARK_HEX}), and it
+    # keeps the invariant even if chain forward is ever edited into letting
+    # marked traffic through.
+    #  - v-proton-*: the rotating slots (and their staging twins);
+    #  - v-${DNS_INSTANCE}: the DNS tunnel, for unbound's own marked queries;
+    #  - lo: can't leave the box.
+    # `ct direction original` for the ct-mark rule, as in chain forward: replies
+    # to a dispatched flow carry its ct mark out the client iface or wg-udm
+    # legitimately.
+    # That includes the client-DNS redirect, whose flow is dispatched before the
+    # DNAT sends it to unbound, and the box's ICMP errors TO a client about a
+    # dispatched flow. Its errors about the reply leg go the other way (original
+    # direction, toward the remote). Chain output drops the ones headed
+    # off-tunnel (own-icmp-error-for-tunnelled-flow), so those never reach this
+    # chain; the ones routed into a slot veth pass the v-proton-* accept below.
+    chain postrouting_guard {
+        type filter hook postrouting priority filter; policy accept;
+
+        oifname "lo" accept
+        oifname "v-proton-*" accept
+        oifname "v-${DNS_INSTANCE}" accept
+        meta mark != 0x0 limit rate 5/second burst 20 packets log prefix "nft-marked-leak-post " level warn comment "marked-egress-guard-log"
+        meta mark != 0x0 counter name "marked_leak_post" drop comment "marked-egress-guard"
+        ct direction original ct mark != 0x0 limit rate 5/second burst 20 packets log prefix "nft-marked-leak-post " level warn comment "ctmarked-egress-guard-log"
+        ct direction original ct mark != 0x0 counter name "marked_leak_post" drop comment "ctmarked-egress-guard"
     }
 }
 

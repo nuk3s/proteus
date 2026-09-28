@@ -21,6 +21,48 @@ dig @172.16.1.5 +short example.com A
 
 # Kill-switch drop counter (should be near-zero in steady state)
 sudo nft list chain inet filter output | grep output-dropped
+
+# Marked-egress guards. In steady state neither counter moves. Two operator
+# actions raise marked_leak_fwd by design, because each briefly leaves an
+# established trusted flow without its mark: a full `nft -f` reload, and
+# removing a trusted range. Any other increase means a VPN-bound packet was
+# routed somewhere other than a slot veth and the firewall stopped it; routing
+# should have stopped it first. `sudo journalctl -k | grep nft-marked-leak`
+# shows which interface (logging is rate-limited to 5 lines a second).
+# own_icmp_err_tunnelled is NOT a leak signal: it counts the box's own ICMP
+# errors about a tunnelled flow (a client left while a remote kept sending)
+# that would have left off-tunnel, dropped in chain output by design. It moves
+# in normal operation. One exception: on a box whose client or wg-udm MTU is
+# below the tunnel MTU (1420), a value that climbs steadily can mean PMTU
+# errors the remote never got. The rule's comment in /etc/nftables.conf says
+# how to route those into the tunnel instead.
+sudo nft list counters table inet filter
+
+# Fail-closed routing (routeguard.sh): the catch rule, the ingress sink, and a
+# blackhole sentinel at the end of every table a mark rule points at (listed
+# after the real default route while the slot is up).
+# The catch rule is `not fwmark 0x0/0xffffffff blackhole`. A line reading
+# "not from all blackhole" (no "fwmark 0") is that rule typed without the mask:
+# the kernel stored mark 0/mask 0, which matches nothing. Re-run
+# routeguard.sh, which adds the masked rule; don't type it in by hand.
+ip rule show pref 32000                  # "not from all fwmark 0 blackhole"
+ip rule show pref 32020                  # "iif <client iface> lookup 900", "iif wg-udm lookup 900" ([detached] until wg-udm exists)
+ip route show table 900                  # "default dev proteus-null"
+for t in $(ip rule show | awk '/fwmark/ && /lookup/ {print $NF}' | sort -un); do
+    echo "table $t: $(ip route show table "$t" | tr '\n' ';')"
+done
+
+# The ingress sink transmits nothing while nftables is loaded: chain forward
+# drops unmarked client egress (unmarked-client-egress) before the sink's
+# device ever sends it, and the box's own traffic never matches the sink's
+# iif-keyed rules. So watch the DELTA, not the value: note TX packets now and
+# compare later. Growth means packets got past chain forward to the sink (no
+# ruleset, or an edited one). A proteus-null created before routeguard.sh
+# turned IPv6 off on it can carry a nonzero baseline from router
+# solicitations. Do NOT delete and recreate proteus-null to reset the count:
+# deleting it removes table 900's route, and the sink falls through to main
+# until routeguard.sh runs again.
+ip -s link show proteus-null             # TX packets: same as your last reading
 ```
 
 ## Web UI
@@ -74,23 +116,39 @@ Always stage a revert timer before swapping the live ruleset. Fifteen minutes is
 # 1. Snapshot known-good
 sudo cp /etc/nftables.conf /etc/nftables.conf.pre-change
 
-# 2. Arm the revert (cancels itself if we succeed)
+# 2. Arm the revert (cancels itself if we succeed). It copies the old file
+#    back over /etc/nftables.conf, loads it, and repopulates exactly as step 4
+#    does. Restoring the file matters as much as the load: step 3 overwrites
+#    it, so a revert that only reloaded the ruleset would leave the new file
+#    for the next boot to load. And a revert that fires unattended must not
+#    leave @trusted_src empty or the client pivot in the wrong mode.
 sudo systemctl reset-failed nft-revert.timer nft-revert.service 2>/dev/null || true
-sudo systemd-run --unit=nft-revert --on-active=900 \
-    /usr/sbin/nft -f /etc/nftables.conf.pre-change
+sudo systemd-run --unit=nft-revert --on-active=900 /bin/sh -c \
+    'cp /etc/nftables.conf.pre-change /etc/nftables.conf && /usr/sbin/nft -f /etc/nftables.conf && { /etc/proteus/bin/repopulate-wg-peers.sh; systemctl restart proteus-proton-api-whitelist.service; systemctl restart proteus-client-isolation.service; /etc/proteus/bin/proteus-trusted-egress.sh; }'
 
 # 3. Apply the new ruleset
 sudo cp /path/to/new.conf /etc/nftables.conf
 sudo nft -f /etc/nftables.conf
 
-# 4. Repopulate sets that flush ruleset empties
+# 4. Repopulate what `flush ruleset` empties (the same list install/lib/apply.sh runs)
 sudo /etc/proteus/bin/repopulate-wg-peers.sh
-sudo systemctl start proteus-proton-api-whitelist.service
+sudo systemctl restart proteus-proton-api-whitelist.service
+sudo systemctl restart proteus-client-isolation.service   # re-asserts the isolation MODE over the boot seed
+sudo /etc/proteus/bin/proteus-trusted-egress.sh           # @trusted_src has no seed at all
 
 # 5. Test. If good:
 sudo systemctl stop nft-revert.timer
-# If bad, it reverts itself at T+15min. Don't manually hurry that.
+# If bad, it reverts itself at T+15min: the old file is back in place and
+# loaded. Don't manually hurry that.
 ```
+
+A full reload also empties `@source_pin` and `@vpn_dispatch`. Established flows keep their slot (the mark lives in conntrack), but a client's next new flow is dispatched afresh and may get a different exit. Between steps 3 and 4 an established trusted flow has no mark and is dropped, which is what `marked_leak_fwd` counts. To change a few chains without either effect, load a delta file with no `flush ruleset` that runs `flush chain inet filter <chain>` and then redefines only those chains; sets and maps keep their contents. The revert in step 2 still reloads the whole old file, so if it fires you get both effects once.
+
+`systemctl restart nftables` and `systemctl reload nftables` are safe on a box with the proteus drop-in, `/etc/systemd/system/nftables.service.d/proteus.conf` (the installer puts it there; `systemctl cat nftables` shows it last). Debian's stock unit runs `nft flush ruleset` as its ExecStop, so a stock restart, including the try-restart the nftables package runs on upgrade, leaves the box with no ruleset until the reload finishes, and with none at all if the reload fails. The drop-in clears that ExecStop. A restart or reload is then a single `nft -f /etc/nftables.conf`, and because the file starts with `flush ruleset` the kernel either swaps in the whole new ruleset or, if the file fails to load, keeps the old one with its sets intact.
+
+After a successful load, `proteus-nft-repopulate.sh` queues the four refills from step 4 as their units: `proteus-wg-peers`, `proteus-client-isolation`, `proteus-proton-api-whitelist` and `proteus-trusted-egress`. They start as systemctl returns and run in the background, so the sets stay empty until each one finishes, and a failure shows in that unit's status and the journal rather than in systemctl's exit code: `journalctl -u nftables -u 'proteus-*' --since -5min`. Everything above about a full reload still applies: client pins are gone, and each client's next flow may get a different exit. With the new file in place, `sudo systemctl reload nftables` does steps 3 and 4 in one command, but a delta file is still the better tool for a small change. The helper queues nothing while `systemctl is-system-running` reports `initializing`, `stopping`, or `maintenance`. At boot, `initializing` is where the first load normally lands, and none of the refill units has run yet: the enabled ones start in their boot order, `vpnns-up.sh` adds each slot's endpoint to `@wg_peers` as the slot comes up, and the whitelist timer fills `@proton_api` (`OnBootSec=5min`, plus up to 30 minutes of `RandomizedDelaySec`) unless a slot rotation starts the whitelist service first. In rescue or emergency mode, run step 4 by hand if you need the sets.
+
+With the drop-in, `systemctl stop nftables` leaves the ruleset loaded, and so does shutdown. The unit is inactive after a stop all the same, and the next start of any unit with `Wants=nftables.service` starts it again: a full load of whatever `/etc/nftables.conf` holds at that moment, then the refill. The four refill units all want it, so a web UI save (it restarts `proteus-trusted-egress`), the whitelist timer and every slot rotation (`rotate-slot.sh` starts the whitelist service) each trigger that load. Don't leave nftables stopped: run `sudo systemctl start nftables` once you are done. If you edit `/etc/nftables.conf` while it is stopped, whichever start comes next, yours or one of theirs, loads the new file with no revert timer armed, so arm one (steps 1 and 2) before you edit. If you really need the box with no ruleset, run `sudo nft flush ruleset` yourself. (The ingress sink in `routeguard.sh` keeps client traffic off the uplink even with no ruleset, but the box has no firewall while it lasts.) A box without the drop-in, such as one built by hand, still has Debian's behaviour: there, use `nft -f` and never `systemctl restart` or `stop`.
 
 See `gotchas.md` → "nftables safety revert" for why not to rely on `nft -c` alone.
 
@@ -116,9 +174,18 @@ sudo /etc/proteus/bin/proton-mint --slot proton-3 --out-dir /etc/proteus/wg/prot
 # Bring it up (or replace what's live)
 sudo /etc/proteus/bin/vpnns-up.sh proton-3 /etc/proteus/wg/proton/auto/proton-3-<latest>.conf
 
-# Tell dispatcher to re-read state
-sudo systemctl kill -s HUP proteus-dispatcher.service
+# Tell dispatcher to re-read state (main process only: the default
+# --kill-who=all would also HUP its nft children and ExecStartPre)
+sudo systemctl kill --kill-who=main --signal=HUP proteus-dispatcher.service
 ```
+
+The signal handler only sets a flag. The next new flow or the janitor's next
+pass (at most 60 s) applies it, so the "loaded N VPN instance(s)" log line can
+lag the signal by up to a minute on a quiet VLAN. Each pick applies a pending
+reload before it chooses, so a flow that arrives after the signal normally
+gets the new list. For an instant it may not: a pick already under way when
+the signal lands, or one that arrives while the janitor is mid-reload, uses
+the previous list for that one decision.
 
 ## Force a rotation now (bypass the timer)
 
@@ -183,8 +250,9 @@ ip route show table $((100+N))
 # Is @wg_peers up-to-date?
 sudo nft list set inet filter wg_peers
 
-# Which slot is each client pinned to? (source_pin is the one that matters;
-# vpn_dispatch is the per-destination fallback)
+# Which slot is each client pinned to? source_pin holds client-VLAN hosts;
+# vpn_dispatch is their per-destination fallback, and the ONLY map for trusted
+# traffic from wg-udm (the router masquerades, so it dispatches per destination)
 sudo nft list map inet filter source_pin
 sudo nft list map inet filter vpn_dispatch | head -30
 
@@ -198,19 +266,18 @@ sudo /etc/proteus/bin/repopulate-wg-peers.sh
 # Wipe everything related to slot N and bring it back from scratch
 sudo /etc/proteus/bin/vpnns-down.sh proton-N
 sudo /etc/proteus/bin/vpnns-up.sh proton-N /etc/proteus/wg/proton/auto/proton-N.conf
-sudo systemctl kill -s HUP proteus-dispatcher.service
+sudo systemctl kill --kill-who=main --signal=HUP proteus-dispatcher.service
 ```
 
 If a *staging* instance (`proton-N-s`) got orphaned because `rotate-slot.sh` was killed mid-attempt:
 
 ```bash
 sudo /etc/proteus/bin/vpnns-down.sh proton-N-s
-ip rule | grep "from 172.31.$((100+N)).1"   # should be empty; if not:
-sudo ip rule del from "172.31.$((100+N)).1" lookup $((200+N))
-sudo ip rule del fwmark $((0x64+N)) lookup $((200+N))
 ```
 
 (Note the index math: staging index = `100 + slot_idx`, so fwmark `0x65..0x69` and table `201..205` for slots 1..5.)
+
+A slot's two `ip rule`s **stay behind on purpose**, for staging and live slots alike. Live slot N has `from 172.31.N.1` at pref 400+N and `fwmark 0xN` at pref 500+N, both looking up table 100+N; its staging twin `proton-N-s` has `from 172.31.$((100+N)).1` at pref 500+N and `fwmark $((0x64+N))` at pref 600+N, looking up table 200+N. `vpnns-down.sh` leaves them pointing at a table that holds only `blackhole default`, so a stopped slot's traffic fails closed instead of falling through to `main`. Don't delete them by hand. If you do anyway, marked traffic falls to the `pref 32000 not fwmark 0x0/0xffffffff blackhole` catch rule, which is also closed, but you have removed one of the routing layer's defences for that slot. Never `ip route flush table 10N`/`20N`: an empty table is exactly the fall-through the fix removed. If a table ever lacks its sentinel, run `sudo /etc/proteus/bin/routeguard.sh 10N` (it also re-asserts the catch rule and the ingress sink).
 
 ## Rebuild dispatcher after code changes
 
@@ -307,7 +374,7 @@ Typical causes in order of likelihood:
 
 1. `@wg_peers` got flushed by an `nft -f` without a follow-up `repopulate-wg-peers.sh`. Run it.
 2. All five slots failed rotation in the same window. Check `journalctl -u 'proteus-rotate-slot@*'` — the old slots should still be up since a failed rotation leaves the incumbent exit in place, but if Proton's API is throwing 500s your mints are failing. Re-bootstrap SSO if auth errors; wait out API issues.
-3. Dispatcher crashed. `sudo systemctl status proteus-dispatcher`. `bypass` on the NFQUEUE rule means packets without a dispatcher are dropped by default policy — this is the safe behavior, not a bug.
+3. Dispatcher crashed. `sudo systemctl status proteus-dispatcher`. `bypass` on the NFQUEUE rule means that with no dispatcher listening, a new flow's first packet goes on unmarked, and chain forward drops it at `unmarked-client-egress` (that rule's counter climbs while the dispatcher is down) — this is the safe behavior, not a bug.
 4. UniFi IPS rule dropping SSH / client traffic from upstream. Toggle it off at the controller to confirm. The VM is not at fault — don't blame the kill-switch without evidence of output-chain drops.
 
 ## Before reporting success after a change

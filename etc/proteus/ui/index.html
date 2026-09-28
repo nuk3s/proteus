@@ -50,9 +50,9 @@ margin:26px 0 10px;display:flex;align-items:center;gap:10px}
 display:flex;flex-direction:column;gap:9px;transition:border-color .15s}
 .exit:hover{border-color:var(--border)}
 .exit.rot{border-color:var(--amber);background:var(--card2)}
-.exit .top{display:flex;align-items:center;gap:9px}
-.exit .name{color:var(--dim);letter-spacing:1px}
-.exit .score{margin-left:auto;color:var(--mut);font-size:11px}
+.exit .top{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.exit .name{color:var(--dim);letter-spacing:1px;white-space:nowrap}
+.exit .score{margin-left:auto;color:var(--mut);font-size:11px;white-space:nowrap}
 .exit .server{font-size:19px;color:var(--amber);letter-spacing:.5px;line-height:1.15}
 .exit .host{color:var(--mut);font-size:11px;word-break:break-all}
 .exit .host b{color:var(--mossL);font-weight:normal}
@@ -113,6 +113,18 @@ text-overflow:ellipsis;max-width:42%}
 letter-spacing:.5px}
 .tbadge.mand{color:var(--warn);border-color:var(--warn)}
 .tbadge.adv{color:var(--mut)}
+.cfb{font-size:10px;border:1px solid var(--hair);padding:1px 6px;margin-left:6px;
+text-transform:uppercase;letter-spacing:.5px;white-space:nowrap;max-width:100%;
+overflow:hidden;text-overflow:ellipsis;cursor:default}
+.cfb.ok{color:var(--mut)}
+.cfb.bad{color:var(--warn);border-color:var(--warn)}
+.bannerw{border:1px solid var(--warn);color:var(--warn);padding:6px 10px;margin:8px 0;font-size:12px}
+.cstat{color:var(--dim);font-size:10px;white-space:nowrap}
+.cstat.q{color:var(--warn)}
+.tconf{background:var(--ground);border:1px solid var(--border);color:var(--mossL);
+padding:8px;font:11px/1.5 ui-monospace,monospace;white-space:pre;overflow-x:auto;margin-top:8px;
+user-select:all}
+.tsec{color:var(--warn);font-size:11px;margin-top:6px}
 .xbtn{color:var(--mut);border-color:var(--hair);padding:3px 8px}
 .xbtn:hover{color:var(--bad);border-color:var(--bad)}
 .ccontrols{display:flex;align-items:center;gap:8px;margin-top:9px}
@@ -150,6 +162,7 @@ padding:8px 12px;font:inherit;width:280px;text-align:center}
 
   <div id="overview">
     <div class="sumbar" id="sumbar"></div>
+    <div id="cfbanner" class="hidden"></div>
     <div class="sec">exit servers</div>
     <div class="grid" id="exits"></div>
     <div class="sec">dns tunnel</div>
@@ -166,6 +179,10 @@ padding:8px 12px;font:inherit;width:280px;text-align:center}
 <script>
 "use strict";
 let S=null,timer=null,knobsDrawn=false;
+/* Set while a generated pairing is on screen. That block holds a private key
+   the gateway does not store and cannot reissue identically, so it must outlive
+   every redraw of the settings pane until the operator dismisses it. */
+let pairingShown=false;
 let TOKEN=localStorage.getItem("proteus_token")||"";
 const $=id=>document.getElementById(id);
 const el=(tag,cls,text)=>{const e=document.createElement(tag);
@@ -176,7 +193,7 @@ const api=(p,o={})=>fetch(p,{...o,headers:{"Content-Type":"application/json",
 function setToken(t){TOKEN=t||"";if(t)localStorage.setItem("proteus_token",t);
   else localStorage.removeItem("proteus_token");}
 function show(auth){$("login").classList.toggle("hidden",auth);
-  $("app").classList.toggle("hidden",!auth);if(!auth)knobsDrawn=false;}
+  $("app").classList.toggle("hidden",!auth);if(!auth){knobsDrawn=false;pairingShown=false;}}
 function loggedOut(){setToken("");show(false);}
 async function login(){
   const r=await api("/api/login",{method:"POST",body:JSON.stringify({passphrase:$("pw").value})});
@@ -221,6 +238,12 @@ function renderSummary(){
     ["auto-rotation", sys.paused?"PAUSED":"on", sys.paused?"warn":"ok"],
     ["clients", clients?`${clients} pinned`:"none pinned", null],
   ];
+  const pool=S.pool||{},std=S.standard||{};
+  if(pool.target!=null)parts.push(["known-good exits",`${pool.known_good}/${pool.target} · ${pool.distinct_exits_7d} distinct 7d`,pool.known_good>=pool.target?"ok":"warn"]);
+  if(std.size!=null)parts.push(["cloudflare standard",std.attainable?`${std.size} canaries · ${std.tier}`:"not attainable",std.attainable?"ok":"warn"]);
+  const tr=S.trusted||{};
+  if(tr.cidrs&&tr.cidrs.length)parts.push(["udm tunnel",
+    tr.tunnel_up?(tr.pinned||0)+" pinned":"down", tr.tunnel_up?"ok":"bad"]);
   sb.replaceChildren();
   parts.forEach(([k,v,tone],i)=>{
     if(i)sb.append(el("span","dim","·"));
@@ -230,6 +253,10 @@ function renderSummary(){
     st.append(val);
     sb.append(st);
   });
+  const b=$("cfbanner");const msgs=[];
+  if(std.size!=null&&!std.attainable)msgs.push(`Cloudflare standard not attainable: ${std.passing_exits_24h} exit(s) met it in 24h; canary rotations are on hold.`);
+  (S.canary_stats||[]).filter(c=>c.quarantined).forEach(c=>msgs.push(`${c.host} blocks every exit seen (${c.exits_seen_24h}); quarantined until one passes.`));
+  b.className=msgs.length?"bannerw":"hidden";b.textContent=msgs.join("  ");
 }
 
 function metric(v,l){const m=el("div","m");m.append(el("span","v",v),el("span","l",l));return m;}
@@ -239,6 +266,17 @@ function exitCard(s){
   const top=el("div","top");
   top.append(healthDot(s),el("span","name",s.name));
   if(s.health&&s.health.score!=null)top.append(el("span","score","health "+Math.round(+s.health.score)));
+  if(s.cf&&s.cf.clean===false){
+    // A flagged exit can name three or more hosts, and a host list is one
+    // unbreakable token: as a flex item it refuses to shrink below min-content,
+    // so it shoved the name/score aside and spilled out of the card. Show the
+    // count and hang the list off the tooltip.
+    const f=s.cf.failing||[];
+    const cb=el("span","cfb bad",f.length?`cf ${f.length} flagged`:"cf challenged");
+    if(f.length)cb.title="Cloudflare flagged this exit on: "+f.join(", ");
+    top.append(cb);
+  }
+  else if(s.cf&&s.cf.clean===true)top.append(el("span","cfb ok","cf ok"));
   c.append(top);
   // server
   c.append(el("div","server",s.rotating?"rotating…":serverName(s)));
@@ -325,7 +363,11 @@ function renderPanels(){
 function render(){
   if(!S)return;
   renderSummary();renderExits();renderDns();renderPanels();
-  if(!knobsDrawn){renderKnobs();knobsDrawn=true;}
+  // renderKnobs replaceChildren()s the whole settings pane, which is where a
+  // generated pairing is displayed — and "save ranges" sits directly above
+  // "generate pairing", so a save (or the five-second poll that follows it)
+  // would otherwise wipe out the operator's only copy of the config.
+  if(!knobsDrawn&&!pairingShown){renderKnobs();knobsDrawn=true;}
 }
 
 /* --- settings / knobs --- */
@@ -346,6 +388,7 @@ function renderKnobs(){
   pb.addEventListener("click",()=>{act_action(S.system.paused?"resume":"pause");knobsDrawn=false;});
   pc.append(pb);prow.append(pl,pc,ph);pg.append(prow);root.append(pg);
   renderChecks(root);
+  renderTrusted(root);
   // grouped knobs
   const groups={};k.schema.forEach(s=>{(groups[s.group]??=[]).push(s)});
   for(const g of ["rotation","gates","proton-dns","network","advanced"]){
@@ -393,7 +436,11 @@ function renderKnobs(){
 }
 
 /* --- health checks editor --- */
-const hostOf=u=>{try{return new URL(u).host}catch(e){return String(u||"").replace(/^https?:\/\//,"").replace(/\/.*$/,"")}};
+/* Must agree with ledger.host_of and checklib's cf_host: those are what key
+   the canary stats this looks up. new URL().host lowercases and keeps the
+   port, so it missed the stats for any canary written with a port or a
+   capital letter. */
+const hostOf=u=>String(u||"").replace(/^https?:\/\//,"").split(/[/?#:]/)[0];
 function tierBadge(t){return el("span",t==="mandatory"?"tbadge mand":"tbadge adv",t)}
 function tierSelect(sel){
   const s=el("select");
@@ -425,7 +472,7 @@ function renderChecks(root){
   // built-in (read-only)
   g.append(el("div","subh","Built-in (read-only)"));
   const bl=el("div","clist");
-  (c.builtin||[]).forEach(x=>{
+  (c.builtin||[]).filter(x=>!x.canary).forEach(x=>{
     const r=el("div","crow ro");
     r.append(el("span","curl",hostOf(x.url)));
     if(x.body)r.append(el("span","bodynote","must contain: "+x.body));
@@ -433,6 +480,30 @@ function renderChecks(root){
     bl.append(r);
   });
   g.append(bl);
+  // Cloudflare canaries (editable): judged only on Cloudflare's verdict.
+  g.append(el("div","subh","Cloudflare canaries"));
+  g.append(el("div","kh","Sites behind Cloudflare, probed from every new exit and from live exits. "+
+    "A challenge page or a 1xxx block on any of them flags the exit. The tier is the "+
+    "\u201cCloudflare canaries\u201d setting under Quality gates. Pass rate is over distinct exits in the last 24h."));
+  const stats={};(S.canary_stats||[]).forEach(x=>stats[x.host]=x);
+  const cl=el("div","clist");
+  const addCanaryRow=(url)=>{
+    const row=el("div","crow");row.dataset.canary="1";
+    const inp=el("input");inp.value=url||"";inp.placeholder="https://example.com/";inp.spellcheck=false;
+    const st=stats[hostOf(url)];
+    const note=el("span","cstat"+(st&&st.quarantined?" q":""),
+      st?(st.quarantined?`quarantined · 0/${st.exits_seen_24h} exits`:
+          (st.pass_rate_24h==null?"no data yet":`${Math.round(st.pass_rate_24h*100)}% of ${st.exits_seen_24h} exits`)):"no data yet");
+    const rm=el("button","xbtn","remove");rm.addEventListener("click",()=>row.remove());
+    row.append(inp,note,rm);cl.append(row);
+  };
+  ((S.checks&&S.checks.canaries)||[]).forEach(addCanaryRow);
+  g.append(cl);
+  const cc=el("div","ccontrols");
+  const cadd=el("button",null,"+ add canary");cadd.addEventListener("click",()=>addCanaryRow(""));
+  const csave=el("button","primary","save canaries");const cmsg=el("span","msg");
+  csave.addEventListener("click",()=>saveCanaries(cl,cmsg));
+  cc.append(cadd,csave,cmsg);g.append(cc);
   // custom (editable)
   g.append(el("div","subh","Your checks"));
   const list=el("div","clist");
@@ -470,6 +541,137 @@ async function saveChecks(list,msg){
   if(r.ok){msg.textContent="✓ saved";msg.className="msg ok";knobsDrawn=false;}
   else{msg.textContent="✗ "+(j.error??"error");msg.className="msg bad";}
 }
+async function saveCanaries(list,msg){
+  const canaries=[];
+  for(const row of list.querySelectorAll(".crow[data-canary]")){
+    const raw=row.querySelector("input").value.trim();
+    if(!raw)continue;
+    canaries.push({url:/^https?:\/\//.test(raw)?raw:"https://"+raw});
+  }
+  const r=await api("/api/canaries",{method:"POST",body:JSON.stringify({canaries})});
+  if(r.status===401)return loggedOut();
+  const j=await r.json().catch(()=>({}));
+  if(r.ok){msg.textContent="✓ saved";msg.className="msg ok";knobsDrawn=false;}
+  else{msg.textContent="✗ "+(j.error??"error");msg.className="msg bad";}
+}
+/* --- trusted-VLAN egress --- */
+function renderTrusted(root){
+  const t=(S.trusted||{cidrs:[]});
+  const g=el("div","kgroup");
+  g.append(el("div","gh","UDM tunnel (trusted-VLAN egress)"));
+  const state=t.tunnel_up
+    ?(t.handshake_age_s==null?"tunnel up, peer not heard from yet"
+       :"tunnel up, last handshake "+dur(t.handshake_age_s)+" ago")
+    :"tunnel not configured";
+  g.append(el("div","kh",state+" · "+(t.pinned||0)+" pinned device(s) in a trusted range. "+
+    "Ranges listed here MAY use the rotating exits; which devices actually do is chosen in "+
+    "UniFi under Settings → Routing → Traffic Routes."));
+  const list=el("div","clist");
+  const addRow=(cidr)=>{
+    const row=el("div","crow");row.dataset.trusted="1";
+    const inp=el("input");inp.value=cidr||"";inp.placeholder="e.g. 192.168.7.0/24";inp.spellcheck=false;
+    const rm=el("button","xbtn","remove");rm.addEventListener("click",()=>row.remove());
+    row.append(inp,rm);list.append(row);
+  };
+  (t.cidrs||[]).forEach(addRow);
+  g.append(list);
+  const c1=el("div","ccontrols");
+  const add=el("button",null,"+ add range");add.addEventListener("click",()=>addRow(""));
+  const save=el("button","primary","save ranges");const msg=el("span","msg");
+  save.addEventListener("click",()=>saveTrusted(list,msg));
+  c1.append(add,save,msg);g.append(c1);
+
+  g.append(el("div","subh","Pairing"));
+  g.append(el("div","kh","Generate a WireGuard configuration, then add it in UniFi under "+
+    "Settings → VPN → VPN Client. It will then appear as a selectable egress in Traffic Routes."));
+  /* The DNS knob lives here, next to the button that bakes it into a config,
+     rather than in the grouped knob list below (its group is "udm", which that
+     loop skips). Label and help come from the schema so there is one wording.
+     Saving goes through setKnob, which deliberately does NOT set knobsDrawn —
+     a redraw here would be free now but is exactly what the pairingShown guard
+     exists to prevent, and the value is read fresh at generate time anyway. */
+  const dk=((S.knobs&&S.knobs.schema)||[]).find(s=>s.key==="PROTEUS_UDM_DNS")||{};
+  const dcur=((S.knobs&&S.knobs.values)||{})["PROTEUS_UDM_DNS"];
+  const drow=el("div","knob");
+  drow.append(el("div","kl",dk.label||"DNS server for trusted hosts"));
+  const dinp=el("input");dinp.value=(dcur!=null?dcur:"");dinp.spellcheck=false;
+  dinp.placeholder="e.g. 192.168.1.53";
+  const derr=el("span","msg");
+  const dbtn=el("button",null,"apply");
+  dbtn.addEventListener("click",()=>{
+    // Whitespace is rejected by the broker's value filter (the overlay is
+    // sourced by shell), so normalise "a, b" to "a,b" instead of failing on it.
+    dinp.value=dinp.value.replace(/\s+/g,"");
+    setKnob("PROTEUS_UDM_DNS",false,dinp,derr);
+  });
+  const dkc=el("div","kc");dkc.append(dinp,dbtn,derr);drow.append(dkc);
+  drow.append(el("div","kh",dk.help||"The resolver trusted hosts keep using. Set it to your "+
+    "LAN resolver so ad-blocking and internal names keep working."));
+  if(!dcur)drow.append(el("div","warnk","⚠ Not set — pairing will fail until it is. "+
+    "UniFi rejects a VPN Client with no DNS line."));
+  g.append(drow);
+  const c2=el("div","ccontrols");
+  const gen=el("button",null,"generate pairing");const gmsg=el("span","msg");
+  const out=el("div");
+  gen.addEventListener("click",()=>genPairing(out,gmsg));
+  c2.append(gen,gmsg);g.append(c2,out);
+  root.append(g);
+}
+
+async function saveTrusted(list,msg){
+  const trusted=[];
+  for(const row of list.querySelectorAll(".crow[data-trusted]")){
+    const v=row.querySelector("input").value.trim();
+    if(v)trusted.push({cidr:v});
+  }
+  const r=await api("/api/trusted",{method:"POST",body:JSON.stringify({trusted})});
+  if(r.status===401)return loggedOut();
+  const j=await r.json().catch(()=>({}));
+  if(r.ok){msg.textContent="✓ saved";msg.className="msg ok";knobsDrawn=false;}
+  else{msg.textContent="✗ "+(j.error??"error");msg.className="msg bad";}
+}
+
+/* The pairing is a POST because the reply carries the router's private key: it
+   must never be a URL that can be re-fetched, bookmarked or cached. The file is
+   built here from that one response rather than downloaded from a second
+   endpoint, for the same reason. */
+async function genPairing(out,msg){
+  msg.textContent="working…";msg.className="msg";
+  const r=await api("/api/udm-peer",{method:"POST",body:"{}"});
+  if(r.status===401)return loggedOut();
+  const j=await r.json().catch(()=>({}));
+  out.replaceChildren();pairingShown=false;
+  if(!r.ok){msg.textContent="✗ "+(j.error??"error");msg.className="msg bad";}
+  else{msg.textContent="✓ generated";msg.className="msg ok";}
+  // A failed reconcile still hands back a usable config (the key is recorded but
+  // not live), and it cannot be generated again identically — so show whatever
+  // came back, and only stop if there is nothing to show.
+  if(!j.config)return;
+  pairingShown=true;   // nothing redraws this pane until "done, hide this"
+  out.append(el("div","tsec","⚠ This contains a private key. It is shown once and is not "+
+    "stored on the gateway. Generating another pairing replaces this one and drops the tunnel "+
+    "until the new configuration is saved in UniFi. The settings pane stops refreshing "+
+    "until you hide it; the overview above keeps updating."));
+  out.append(el("div","tconf",j.config));
+  const dl=el("button",null,"download proteus-udm.conf");
+  dl.addEventListener("click",()=>{
+    const blob=new Blob([j.config],{type:"text/plain"});
+    const url=URL.createObjectURL(blob);
+    // In the document, clicked, then removed: a detached anchor is ignored by
+    // some browsers, and revoking the object URL in the same tick can cancel
+    // the download that click just started.
+    const a=el("a");a.href=url;a.download="proteus-udm.conf";
+    document.body.append(a);a.click();a.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  });
+  const done=el("button",null,"done, hide this");
+  done.addEventListener("click",()=>{
+    out.replaceChildren();msg.textContent="";msg.className="msg";
+    pairingShown=false;knobsDrawn=false;   // let the pane redraw with fresh status
+  });
+  const c=el("div","ccontrols");c.append(dl,done);out.append(c);
+}
+
 async function setKnob(key,kicks,inp,err){
   if(kicks&&!confirm("This restarts the dispatcher. Devices already connected keep their assigned exit — pins live in the kernel and survive. Brand-new connections may fail for about a second. Continue?"))return;
   const r=await api("/api/knobs",{method:"POST",body:JSON.stringify({key,value:inp.value.trim()})});

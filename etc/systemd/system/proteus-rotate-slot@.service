@@ -7,5 +7,6 @@ Requires=proteus-dispatcher.service
 [Service]
 Type=oneshot
 ExecStart=/etc/proteus/bin/rotate-slot.sh %i
-TimeoutStartSec=5min
+# The script stops itself at ROTATION_DEADLINE_S (25 min) plus at most one in-flight attempt and one step-down; this is the backstop.
+TimeoutStartSec=45min
 Nice=10

@@ -10,16 +10,22 @@ WireGuard interface creation follows the wireguard.com/netns pattern: `ip link a
 
 Inbound flow from `ens19`:
 
-1. **prerouting_mangle** (priority mangle, -150). Filters out the packets we don't touch (non-IPv4, non-client-VLAN, private destinations, multicast, etc.).
+1. **prerouting_mangle** (priority mangle, -150). Filters out the packets we don't touch (non-IPv4, not from the client VLAN or a trusted source on `wg-udm`, private destinations, multicast, etc.).
 2. If the packet already has a ct mark → copy to meta mark, return. Flows stay on their tunnel even if the map entries expired.
 3. Else look up `ip saddr map @source_pin` (the per-client pin). Hit → use that mark, save to ct mark, return. This is what makes every flow from one device leave through the same exit.
 4. Else look up `ip daddr map @vpn_dispatch` (per-destination fallback). Hit → same.
-5. Miss + `ct state new` → **NFQUEUE 0**. The dispatcher picks a slot (`pick_distributed`, below), pins the source in `@source_pin` for `PROTEUS_PIN_TTL_S` (default 6h), records `(daddr, mark)` in `@vpn_dispatch` (12h), sets the mark, re-injects.
+5. Miss + `ct state new` → **NFQUEUE 0**. The dispatcher picks a slot (`pick_distributed`, below), pins the source in `@source_pin` for `PROTEUS_PIN_TTL_S` (default 6h), records `(daddr, mark)` in `@vpn_dispatch` (12h), sets the mark, re-injects. The verdict sets the packet mark; `chain prerouting_ctsave`, the next chain on the hook, copies it into the ct mark so the rest of the flow keeps it even if the map insert failed.
 6. After mark is set, `ip rule fwmark 0xN lookup 10N` routes to the per-slot veth → into `ns-proton-N` → out `wg0` (MASQUERADE on wg0 in the ns).
 
-The dispatcher re-reads the slot list on SIGHUP (rotate-slot.sh sends one after every promotion). The handler only sets a flag; the reload happens at the next pick, because the handler can fire while the dispatcher already holds its own lock (see `_install_signal_handlers` in `dispatcher.py`).
+Trusted traffic arriving on `wg-udm` (see Trusted-VLAN egress below) takes the same path minus step 3: the router masquerades, so every trusted host shares one source address and a pin would carry nothing. It dispatches per destination, `@vpn_dispatch` is its primary map, and the dispatcher writes it no source pin. Each decision is balanced against the map it lands in.
+
+The dispatcher re-reads the slot list on SIGHUP (rotate-slot.sh sends one after every promotion). The handler only sets a flag; the reload happens at the next pick or janitor pass, because the handler can fire while the dispatcher already holds its own lock (see `_install_signal_handlers` in `dispatcher.py`).
 
 Return traffic follows the ct state established,related accept on the forward chain.
+
+**VPN-bound traffic fails closed.** A dispatched packet leaves by its slot veth or not at all, including mid-rebuild, after a failed rebuild, while a slot is stopped, and with no ruleset loaded. Two layers enforce it (see `gotchas.md` → "An empty slot table routes VPN traffic out the uplink"):
+- **Routing** (`routeguard.sh`, armed by `vpnns-up.sh`/`vpnns-down.sh`, the dispatcher's `ExecStartPre` and the installer). Every slot table ends in `blackhole default metric 4294967295`, below the real `default via <veth>`. The slot's rules persist across rebuild and stop. A static `pref 32000 not fwmark 0x0/0xffffffff blackhole` catches marks with no slot rule (typed without the mask, the kernel stores mark 0/mask 0 and the rule matches nothing; `routeguard.sh` adds it correctly, so re-run that rather than adding it by hand). The ingress sink (pref 32010/32020, table 900 → dummy `proteus-null`) sends anything from the client interface or `wg-udm` that reaches it with a public destination to a dummy device instead of `main`, with or without nftables. An empty table would otherwise let the rule walk fall through to `main`.
+- **Firewall.** `chain prerouting_ctsave` saves the dispatcher's verdict in conntrack. `chain forward` opens with drops for meta-marked, and original-direction ct-marked, packets whose `oifname` is not `v-proton-*` (counter `marked_leak_fwd`), and for unmarked client/trusted traffic to a public address (`unmarked-client-egress`), ahead of every accept, the ct-established one included. `chain postrouting_guard` allows marked egress only via `v-proton-*`, the DNS veth and `lo`, for forwarded and locally generated packets alike (counter `marked_leak_post`). `chain output` drops the box's own ICMP errors about a tunnelled flow's reply leg that would leave off-tunnel: they carry the flow's ct mark but, with the default `net.ipv4.icmp_errors_use_inbound_ifaddr=0`, route via `main` (counter `own_icmp_err_tunnelled`). Errors routed into a slot veth are left alone.
 
 ## The kill-switch
 
@@ -38,7 +44,14 @@ Return traffic follows the ct state established,related accept on the forward ch
 
 Anything else is counter-logged (`nft-output-dropped`) and dropped. Packets generated *inside* a VPN netns traverse that ns's own output chain (policy accept), not this one.
 
-Two explicit drops sit **above** those accepts, because the DNS upstream (`10.2.0.1`) is RFC1918 and would otherwise be covered by the `$RFC1918` accept: `unbound-dns-killswitch` (uid `unbound`, daddr `10.2.0.1`, leaving anything but `v-dns-6`) and `unbound-upstream-tunnel-only` (uid `unbound`, dport 53/853 off `v-dns-6` — keyed on destination port so replies to clients are untouched, and upstream-agnostic if the forwarder ever changes). They precede `ct state established,related accept` because conntrack keys on the 5-tuple: a flow that established over the tunnel would stay ESTABLISHED after a route flip.
+Three explicit drops sit **above** `ct state established,related accept` and every accept after it:
+
+- `unbound-dns-killswitch` (uid `unbound`, daddr `10.2.0.1`, leaving anything but `v-dns-6`) and `unbound-upstream-tunnel-only` (uid `unbound`, original direction, dport 53/853 off `v-dns-6`; upstream-agnostic if the forwarder ever changes, and `ct direction original` keeps replies to clients untouched). The DNS upstream (`10.2.0.1`) is RFC1918 and would otherwise be covered by the `$RFC1918` accept. They precede the ct-established accept because conntrack keys on the 5-tuple: a flow that established over the tunnel would stay ESTABLISHED after a route flip.
+- `own-icmp-error-for-tunnelled-flow`: the box's own ICMP errors about the reply leg of a dispatched flow, when they would leave by anything but a slot veth (see the Routing section above). As RELATED packets they would otherwise pass the ct-established accept.
+
+The unbound egress accept (`unbound-dns-egress`) also sits above the ct-established accept, right after the two DNS drops.
+
+After `chain output` comes `chain postrouting_guard`, which sees locally generated and forwarded packets alike: anything with a nonzero meta mark, or an original-direction ct mark, leaving by an interface other than `v-proton-*`, the DNS veth or `lo` is dropped (counter `marked_leak_post`). For the box's own traffic that covers unbound's marked queries if routing ever sends them elsewhere.
 
 ## Reputation gating (rotation)
 
@@ -55,9 +68,59 @@ Two tiers:
 - **Advisory** (block → flag, don't fail):
   - `www.reddit.com/.json` — Reddit 403s a large fraction of Proton streaming exits by **policy, not reputation**. Treating this as mandatory would fail most candidates.
 
-Each probe rotates through 5 user agents (Chrome/Windows, Safari/Mac, Firefox/Linux, Safari/iPhone, Chrome/Android) to avoid UA-based heuristic blocks. Before any probe runs, the script issues a single warmup `HEAD https://proton.me/` through the staging netns so the first real probe doesn't catch Proton's 25–35s exit-side cold window — without that, transient cold-catches falsely fail otherwise-good exits.
+Each probe rotates through 5 user agents (Chrome/Windows, Safari/Mac, Firefox/Linux, Safari/iPhone, Chrome/Android) to avoid UA-based heuristic blocks. The Cloudflare canaries and the YouTube playability probe are the exceptions: their UA is pinned, because their verdict depends on which site variant answers. Before any probe runs, the script issues a single warmup `HEAD https://proton.me/` through the staging netns so the first real probe doesn't catch Proton's 25–35s exit-side cold window — without that, transient cold-catches falsely fail otherwise-good exits.
 
 `rotate-slot.sh` does **mint-retry with N=5 attempts per rotation**. First passer is promoted. All-fail = leave the old slot alone; next timer fire tries again. AbuseIPDB is reserved as a fallback if empirical probes prove insufficient later.
+
+### Cloudflare canaries, live checks and the exit ledger
+
+Added 2026-09. Status-code probes cannot see a Cloudflare challenge, and a
+challenge is what a client on a bad exit actually experiences. So:
+
+- Every probe (built-in and custom) now classifies Cloudflare's own verdict from
+  the response: `cf-mitigated: challenge` is a challenge page, an `error code:
+  1NNN` body is a hard block (1015 rate limit, 1006 to 1008 IP ban, 1020 site
+  rule), and a response without a `cf-ray` header is not Cloudflare at all and
+  is skipped rather than judged. `BLOCK` lines say which.
+- A built-in canary basket (`/etc/proteus/canaries.json`, default discord,
+  digitalocean, patreon) is probed with a pinned desktop user agent and
+  fixed headers so verdicts compare across exits and over time. Measured
+  2026-09-03 from five gate-approved US exits: discord and digitalocean passed
+  all five, patreon three, udemy two. udemy left the default basket on
+  2026-09-04: it challenges about 90% of Proton exits and flags rejected and
+  accepted candidates at the same rate, so it costs a probe per exit and tells
+  the two apart no better than a coin. `PROTEUS_CF_TIER` makes the basket
+  mandatory (default) or advisory (shadow mode: recorded, never acts).
+- `slot-warmup.sh` re-runs the canaries and the mandatory custom checks on
+  promoted slots (one slot every 20 passes, offset from the streaming check) and
+  rotates a slot after two consecutive failures of one check, behind a shared
+  per-slot cooldown. It never touches the health score or existing pins; the
+  dispatcher only steers new pins away via `.cf-state.<slot>`. Each live check
+  runs as its own oneshot unit, `proteus-livecheck@<slot>.service` (started
+  from the warmup pass with `--no-block`), so a slow canary run never stalls
+  the ten-second warmup, and it skips itself while that slot is rotating.
+- Every verdict lands in `/etc/proteus/state/exit-ledger.jsonl`, keyed by exit
+  and entry IP. `proton-mint` uses it: load is a filter, not a ranking; odd
+  rotation attempts explore servers with no history until the known-good pool
+  reaches `PROTEUS_MINT_POOL_TARGET`; exits promoted within
+  `PROTEUS_MINT_REUSE_MIN_S` are set aside; the least recently promoted exit is
+  drawn first, preferring a /24 no sibling holds. `proteus-cf-report` prints
+  pass rates, attainability, diversity and the agreement table used to
+  calibrate the basket against an operator's own checks.
+- The ledger also decides when strictness would be self-defeating. A canary no
+  exit passes across 8 distinct exits is quarantined (probed, not counted). When
+  fewer exits than slots met the standard in 24 h the standard is "not
+  attainable" and canary-triggered live rotations pause. When a rotation
+  exhausts its verdict attempts, it steps down to the best candidate that
+  passed everything except the canaries, marks it, and retries six hours later
+  (`PROTEUS_CF_FALLBACK=strict` restores the old all-fail behaviour).
+- `rotate-slot.sh` now counts only verdict failures against `MAX_ATTEMPTS`;
+  mint errors, endpoint collisions and staging or egress transients no longer
+  burn an attempt (the loop is bounded at 14 iterations regardless). With
+  transients no longer charged to it, the verdict budget went from 5 to 8 on
+  2026-09-04. Rotation now
+  has a 25-minute wall-clock deadline of its own and an exit trap that tears
+  down the staging tunnel, and the unit's start timeout is 45 minutes.
 
 ## Health-aware dispatch (Tier 1)
 
@@ -77,6 +140,68 @@ LAST_ROT_TRIGGER_AT=<unix-ts>
 `dispatcher.py` picks a slot for each new client via `pick_distributed`: it takes the fresh, non-degraded slots scoring within `SPREAD_BAND` (default 40) of the current best — "slots that don't suck" — and assigns the **least-loaded** of those by current pin count, tie-breaking toward the higher score. This fans clients out across the strong slots (spreading bandwidth and handing each a distinct exit IP) instead of piling everyone onto the single top-scored slot. If no slot has a fresh score it falls back to a healthy random pick; if all are DEGRADED it rides the full pool with a warning. Only real client-VLAN sources are pinned (`is_pinnable_source` drops stray 0.0.0.0/off-VLAN packets). Existing sticky-map entries are unaffected (a source already pinned to slot N stays until its pin TTL expires or the janitor evicts it on degrade).
 
 Effect: a transient ALL_FAIL window on one slot stops affecting NEW clients within ~10s of the warmup detecting it, and load spreads across the healthy slots as clients connect.
+
+## Trusted-VLAN egress (added 2026-09)
+
+The isolated client VLAN is not the only way to reach the rotating exits. A host
+on an ordinary VLAN can egress through them while keeping its own address, its
+own VLAN and its own local DNS, with the choice of *which* hosts made in the
+upstream router's UI rather than here.
+
+The upstream router (a UniFi gateway) cannot point a policy route at a LAN next
+hop — its Traffic Routes select a WAN, a VPN tunnel or a local network, and
+nothing else. So proteus presents itself as a WireGuard **VPN client target**:
+it runs a WireGuard server on `wg-udm` (default `10.99.99.0/30`, UDP 51821, MTU
+1420), the router connects to it exactly as it would to a commercial VPN
+provider, and that connection then appears as a selectable egress in Traffic
+Routes, per network or per device.
+
+- **Ingress.** `prerouting_mangle` accepts two origins: the client VLAN on its
+  own interface, and sources inside `@trusted_src` arriving on `wg-udm`. The set
+  is empty unless configured, so an unpaired box behaves exactly as it did
+  before the feature existed. `iifname` is used rather than `iif` so the ruleset
+  loads on a box where the tunnel does not exist.
+- **Dispatch.** Per destination, not per source: the router masquerades, so
+  every trusted host arrives as the tunnel address. `@source_pin` is skipped
+  for `wg-udm` and each new destination gets a `@vpn_dispatch` entry (12h),
+  with the same health-aware placement as the client VLAN.
+- **Return.** Replies leave through the tunnel via routing table 110, selected by
+  an `ip rule` on destination alone. Two higher-priority rules keep that from
+  capturing traffic it should not: one pins packets *originating* on proteus to
+  the main table, the other pins the client VLAN **to that destination** — a rule
+  per trusted range, source and destination both. The first keeps proteus'
+  replies to a trusted VLAN (web UI, SSH) on the management interface instead of
+  the tunnel; it fixes the reply route only. Whether a trusted VLAN may reach the
+  UI at all is the input chain's call: `proteus-ui-mgmt` accepts `LAN_MGMT` plus
+  the one CIDR in `UI_MGMT_EXTRA` on the management interface, so a trusted VLAN
+  that should reach the UI goes in `UI_MGMT_EXTRA`. That traffic must also arrive
+  on the management interface: a UniFi Traffic Route scoped to all destinations
+  (not just Internet) sends it in through `wg-udm` instead, where the input chain
+  drops it. The second rule keeps a client-VLAN host's transit to a trusted VLAN
+  going out the management interface instead of into the tunnel.
+  Scoping the second by destination is what keeps it from matching all
+  client-VLAN egress: a source-only rule would resolve on `main`'s default route
+  and stop evaluation before the `fwmark` rules that select a slot's table, so
+  client traffic would leave over the WAN with the VPN skipped.
+- **MTU.** 1420 to match the Proton tunnels, so the forward chain's existing
+  `rt mtu` MSS clamp produces the right value in both directions. This also
+  covers for the router, which does not clamp on its own VPN-client interfaces.
+- **Boundaries.** The range list is validated to be private, to avoid the client
+  VLAN, and to avoid the management subnet unless it names a single host — the
+  guard that stops an operator routing the subnet holding the gateway into a
+  tunnel. Traffic from the tunnel to an RFC1918 destination is dropped and
+  logged as `nft-trusted-lan`, because the cause is a Traffic Route scoped to
+  all destinations rather than to Internet.
+- **Pairing.** Generated in the web UI under Settings, downloaded as a `.conf`,
+  and pasted into the router. The router's private key is rendered once and
+  never stored on the gateway; re-pairing issues a new one and invalidates the
+  old. A paired box raises the tunnel even with an empty range list, so the peer
+  can be confirmed and the arriving source addresses observed before anything is
+  routed — until a range is added, nothing is forwarded and no route or policy
+  rule exists. An unpaired box has no interface at all.
+
+Example ranges in this document use `192.168.7.0/24` and `10.99.99.0/30`; the
+shipped default list is empty.
 
 ## Auto-rotation of persistently bad slots (Tier 2)
 
@@ -101,7 +226,7 @@ Two mechanisms steer unbound's upstream queries into the dns-6 tunnel:
 
 *Why both?* The route-hook reroute didn't work on this kernel (see `gotchas.md`). The source-IP rule is the reliable steering; the mark-stamp is retained purely so the kill-switch rule can require a three-way match for the accept.
 
-`dns-6` is not part of the client-traffic rotation pool — the dispatcher's `_load_instances()` filters on `^proton-\d+$`. DNS survives slot rotation cleanly because it rides its own independent tunnel.
+`dns-6` is not part of the client-traffic rotation pool — the dispatcher's `load_instances()` (in `dispatcher_logic.py`) filters on `^proton-\d+$`. DNS survives slot rotation cleanly because it rides its own independent tunnel.
 
 `dns-6` has its own separate rotation trigger: `proteus-dns-latency.timer` fires every 15 min, measures a UDP `. NS` query from `ns-dns-6` to `10.2.0.1`, and calls `rotate-dns.sh` if the query time exceeds 150ms. The cooldown in `rotate-dns.sh` (1h) prevents thrashing when no available exit has a good path. The threshold is sized to the target: the old 300ms figure assumed a TCP transaction over a ~220ms Quad9 path and could never fire against an 11-16ms in-tunnel resolver, which would have retired health-driven DNS rotation without anyone noticing. Worst measured exit was 71ms, so 150 leaves roughly 2x headroom. The cold-DNS experience is dominated by tunnel RTT × qname-minimisation steps, so a faster exit directly shortens first-hit latency for users.
 
@@ -111,17 +236,17 @@ Per-netns resolv.conf files (`/etc/netns/ns-proton-N/resolv.conf`) still point a
 
 `proteus-rotate-slot@proton-N.timer` (daily + 12h jitter, persistent) → `rotate-slot.sh N`:
 
-1. For attempt in 1..5:
+1. For attempt in 1..8 (verdict attempts; at most 14 iterations in total):
    1. `proton-mint --slot proton-N-s --out-dir /etc/proteus/wg/proton/auto` → writes a fresh WG config using a brand-new keypair and a Proton API-registered peer selection.
    2. `vpnns-up.sh proton-N-s <conf> $((100 + N))` — stage under name `proton-N-s`, index `100+N` (so staging slots use fwmark `0x65..0x69`, table `201..205`, veth `v-proton-N-s`/`v-proton-N-s-ns` — fits in 15-char kernel veth name limit because the suffix is `-s`, not `-new`).
    3. Wait for handshake (poll `wg show` up to 30s).
-   4. Egress probe: `ip netns exec ns-proton-N-s curl https://checkip.amazonaws.com --retry 3 --retry-all-errors --retry-delay 2 --max-time 12` (picked because Amazon doesn't rate-limit and returns the exit IP as plaintext — no TLS chain or JSON parsing to add a failure mode).
+   4. Egress probe: `ip netns exec ns-proton-N-s curl https://1.1.1.1/cdn-cgi/trace --retry 3 --retry-all-errors --retry-delay 2 --max-time 12`, parsing the exit IP out of the `ip=` line. The URL is an IP literal so the probe needs no resolver: a staging namespace resolves through the tunnel it is testing, and on some exits that resolver does not answer, which used to fail the probe on name resolution and burn the whole retry budget for a reason unrelated to the exit. (It replaced `checkip.amazonaws.com` on 2026-09-04.)
    5. `reputation-probe.sh ns-proton-N-s` — tiered verdict.
    6. Pass → `break`; Fail → cleanup staging (`vpnns-down.sh proton-N-s`, `rm` config), sleep, retry.
-2. If no passer after 5 attempts → log + exit 2. Old slot untouched.
+2. If no passer after 8 verdict attempts (or 14 iterations, or the 25-minute deadline) → log + exit 2. Old slot untouched.
 3. On passer:
-   1. `vpnns-up.sh proton-N <new_conf>` — replace the live slot in place. Same fwmark/table/transit means `@vpn_dispatch` entries are still valid.
-   2. `systemctl kill -s HUP proteus-dispatcher` — re-read state (pool names haven't changed, just endpoint).
+   1. `vpnns-up.sh proton-N <new_conf>` — replace the live slot in place. Same fwmark/table/transit means `@vpn_dispatch` entries are still valid. During the sub-second rebuild the slot's traffic hits the blackhole sentinel and is dropped silently (clients retransmit into the rebuilt tunnel), never routed out the uplink.
+   2. `systemctl kill --kill-who=main --signal=HUP proteus-dispatcher.service` — re-read state (pool names haven't changed, just endpoint). `--kill-who=main` because the default, `all`, also signals the dispatcher's `nft` children and its `routeguard.sh` ExecStartPre, which SIGHUP kills.
    3. Prune old `/etc/proteus/wg/proton/auto/proton-N-*.conf` except the two most recent.
 
 **Endpoint-collision dedup**: after mint, `rotate-slot.sh` parses the new
@@ -162,8 +287,11 @@ Conntrack provides the mid-stream safety: if a long-lived flow exists when the m
 ## Web UI
 
 `proteus-ui.service` is an unprivileged Python-stdlib TLS daemon (`ThreadingHTTPServer` wrapped in
-an `ssl.SSLContext`) listening on `UI_PORT` (default 8443), reachable only from the mgmt LAN and
-the client VLAN. It runs as system user `proteus-ui` with an empty `CapabilityBoundingSet` and
+an `ssl.SSLContext`) listening on `UI_PORT` (default 8443). Who reaches it is decided by the input
+chain: `proteus-ui-mgmt` accepts `LAN_MGMT` plus `UI_MGMT_EXTRA` (one extra CIDR, e.g. a trusted
+VLAN) on the management interface, and `proteus-ui-client` adds the client VLAN only when the
+installer renders it (`UI_CLIENT_VLAN_ACCESS=yes`; the default is `no`). Nothing accepts the UI port
+on `wg-udm`. It runs as system user `proteus-ui` with an empty `CapabilityBoundingSet` and
 `NoNewPrivileges=yes`, and never writes production state directly: it reads the per-slot
 `.state`/`.meta` files, the slot-health files, and the `/run/proteus` snapshots
 (`dispatcher-status.json`, `rotation-history.jsonl`) through group membership, and reads timer
@@ -186,7 +314,7 @@ no `CAP_CHOWN` needed on either side.
 
 ## Boot ordering
 
-`nftables.service` loads ruleset → `proteus-dns-tunnel.service` brings up dns-6 → `unbound.service` starts (Before relationship) → `proteus-proton@proton-{1..5}.service` bring up the rotating slots (each `ExecStart=vpnns-up.sh %i /etc/proteus/wg/proton/auto/%i.conf`, Before=`proteus-dispatcher.service`) → `proteus-dispatcher.service` binds NFQUEUE 0 with the 5-slot pool loaded. `proteus-proton-api-whitelist.service` and `repopulate-wg-peers.sh` refresh the sets that `flush ruleset` empties. `proteus-slot-warmup.timer` starts 45s after boot (once the pool is up) and fires every 10s to keep Proton's exit-side flow state warm.
+`nftables.service` loads ruleset → `proteus-dns-tunnel.service` brings up dns-6 → `unbound.service` starts (Before relationship) → `proteus-proton@proton-{1..5}.service` bring up the rotating slots (each `ExecStart=vpnns-up.sh %i /etc/proteus/wg/proton/auto/%i.conf`, Before=`proteus-dispatcher.service`) → `proteus-dispatcher.service` binds NFQUEUE 0 with the 5-slot pool loaded. `proteus-proton-api-whitelist.service` and `repopulate-wg-peers.sh` refresh the sets that `flush ruleset` empties. nftables.service also carries the proteus drop-in (`nftables.service.d/proteus.conf`): stop runs no flush, and after every start or reload `proteus-nft-repopulate.sh` queues the set refills. At boot the helper normally sees `initializing` and queues nothing, leaving the refills to the boot order; its job is a later `systemctl restart` or `reload`, including the package's try-restart on upgrade. `proteus-slot-warmup.timer` starts 45s after boot (once the pool is up) and fires every 10s to keep Proton's exit-side flow state warm.
 
 `proteus-ui-apply.socket` is `WantedBy=sockets.target`, independent of the dispatch chain above:
 it just listens, so it's always ready even before the broker service itself has run once.

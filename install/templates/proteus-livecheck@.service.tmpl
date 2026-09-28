@@ -1,0 +1,11 @@
+[Unit]
+Description=Proteus live check (Cloudflare canaries + mandatory checks) for slot %i
+After=proteus-dispatcher.service
+
+[Service]
+Type=oneshot
+ExecStart=/etc/proteus/bin/slot-warmup.sh --live-check %i
+TimeoutStartSec=15min
+Nice=10
+StandardOutput=null
+StandardError=journal

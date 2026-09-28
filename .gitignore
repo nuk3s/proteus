@@ -20,3 +20,10 @@ install/.staging/
 
 # Runtime custom health-check list (operator URLs)
 etc/proteus/checks.json
+
+# Git worktrees for isolated feature work
+.worktrees/
+
+# Per-machine Claude Code state. settings.local.json records this box's
+# permission grants and names lab hosts, so it would trip the publish gate.
+.claude/

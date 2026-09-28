@@ -1,0 +1,29 @@
+[Unit]
+Description=Reconcile proteus trusted-VLAN egress with trusted.json
+# The @trusted_src set this populates is declared in nftables.conf, so the
+# ruleset must load first. Running early is safe: the script logs and leaves
+# the feature off rather than half-applying it.
+After=nftables.service
+Wants=nftables.service
+# Retry a transient failure — most importantly a lock timeout, where the save the
+# operator just made would otherwise stay unapplied. Bound it: two of the script's
+# exit-1 paths (a broken trusted.py, not running as root) are permanent, and
+# without a limit those would respawn every RestartSec forever, writing an error to
+# the journal each time instead of settling into a visible `failed`.
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+ExecStart=/etc/proteus/bin/proteus-trusted-egress.sh
+RemainAfterExit=no
+StandardOutput=null
+StandardError=journal
+# A lock timeout (another copy still reconciling) exits 1 with the save
+# unapplied; give the other copy a chance to finish and retry once rather than
+# leaving that save dropped until a human reads `systemctl status`.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

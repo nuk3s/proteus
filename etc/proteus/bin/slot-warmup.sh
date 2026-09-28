@@ -87,8 +87,32 @@ PLAYABILITY_FAILS_BEFORE_ROTATE="${PROTEUS_PLAYABILITY_FAILS:-2}"
 # yields a playable exit by construction (rotate-slot.sh won't promote one that
 # fails the gate), so this only throttles the all-fail case — where no candidate
 # in 5 tries was playable and retrying immediately would just burn Proton API
-# mints for nothing.
+# mints for nothing. The stamp file (.live-lastrot.<slot>) is shared with the
+# live checks below, so two different watches cannot rotate one slot twice in
+# quick succession.
 PLAYABILITY_ROT_COOLDOWN="${PROTEUS_PLAYABILITY_ROT_COOLDOWN:-3600}"
+
+# --- live checks: Cloudflare canaries + mandatory custom checks ----------------
+# The playability watch, generalised. The candidate gate's Cloudflare canaries
+# and the operator's mandatory custom checks are re-run on promoted slots, one
+# slot per LIVECHECK_EVERY_N_PASSES round-robin, and a slot that keeps failing
+# one of them is rotated out. Same rules as playability: never touches
+# FAIL_STREAK/STATUS (degrading a challenged exit would evict its pins), two
+# consecutive failures before acting, one shared per-slot cooldown for every
+# live-triggered rotation. Canary-triggered rotations are additionally held
+# while the ledger says the standard is not attainable fleet-wide, and inside
+# a slot's step-down retry window. Design:
+# architecture.md, "Cloudflare canaries, live checks and the exit ledger"
+LIVECHECK="${PROTEUS_LIVECHECK:-on}"                                  # on|off
+LIVECHECK_EVERY_N_PASSES=20
+LIVECHECK_FAILS_BEFORE_ROTATE="${PROTEUS_LIVECHECK_FAILS:-2}"
+LIVECHECK_ROT_COOLDOWN="${PROTEUS_LIVECHECK_ROT_COOLDOWN:-3600}"
+CF_STEPDOWN_RETRY_S="${PROTEUS_CF_STEPDOWN_RETRY_S:-21600}"
+STATE_DIR="${PROTEUS_STATE_DIR:-/etc/proteus/state}"
+RUN_DIR="${PROTEUS_RUN_DIR:-/run/proteus}"
+# probe(), cf_probe_canary, cf_canaries, custom_checks and the ledger wrappers.
+# shellcheck source=/dev/null
+. "$(dirname "${BASH_SOURCE[0]}")/checklib.sh"
 
 # shellcheck source=/dev/null
 source /etc/proteus/bin/scoring.sh
@@ -209,7 +233,7 @@ EOF
 playability_check() {
     local inst=$1 ns="ns-$1"
     local fails_file="$HEALTH_DIR/.playability-fails.$inst"
-    local last_rot_file="$HEALTH_DIR/.playability-lastrot.$inst"
+    local last_rot_file="$HEALTH_DIR/.live-lastrot.$inst"
     local fails=0 body ok=0
     [[ -r "$fails_file" ]] && fails=$(<"$fails_file")
 
@@ -254,7 +278,7 @@ playability_check() {
     _write_verdict no
     (( fails < PLAYABILITY_FAILS_BEFORE_ROTATE )) && return 0
 
-    if [[ -f /etc/proteus/state/rotation-paused ]]; then
+    if [[ -f "$STATE_DIR/rotation-paused" ]]; then
         logger -t "$LOG_TAG" "$inst playability rotation suppressed (paused)"
         return 0
     fi
@@ -268,9 +292,179 @@ playability_check() {
     echo "$now" > "$last_rot_file.tmp" && mv "$last_rot_file.tmp" "$last_rot_file"
     echo 0 > "$fails_file.tmp" && mv "$fails_file.tmp" "$fails_file"
     logger -t "$LOG_TAG" "$inst playability rotation triggered (fails=$fails)"
-    mkdir -p /run/proteus && echo health > "/run/proteus/$inst"
+    mkdir -p "$RUN_DIR" && echo playability > "$RUN_DIR/$inst"
     systemctl start --no-block "proteus-rotate-slot@$inst.service" || \
         logger -t "$LOG_TAG" "$inst playability rotation failed to start"
+}
+
+_meta_get() { # <inst> <key> from the display sidecar (untrusted data: read, never sourced)
+    awk -F= -v k="$2" '$1==k {print $2; exit}' "$STATE_DIR/$1.meta" 2>/dev/null
+}
+
+# _live_fail <inst> <checkid> <why>: bump the per-check streak. Returns 0 when
+# the streak has reached the rotation threshold; the caller decides whether
+# the trigger is allowed right now.
+_live_fail() {
+    local inst=$1 id=$2 why=$3 fails=0
+    # Separate declaration: bash 5.3 does not expose a local to later
+    # assignments in the SAME local command ("inst: unbound variable" under -u).
+    local f="$HEALTH_DIR/.livecheck-fails.$inst.$id"
+    [[ -r "$f" ]] && fails=$(<"$f")
+    fails=$((fails + 1))
+    echo "$fails" > "$f.tmp" && mv "$f.tmp" "$f"
+    if [[ "$why" == "transport" ]]; then
+        logger -t "$LOG_TAG" "$inst live check $id unreachable (${fails}/${LIVECHECK_FAILS_BEFORE_ROTATE})"
+    else
+        logger -t "$LOG_TAG" "$inst live check $id FAIL ($why) (${fails}/${LIVECHECK_FAILS_BEFORE_ROTATE})"
+    fi
+    (( fails >= LIVECHECK_FAILS_BEFORE_ROTATE ))
+}
+
+_live_ok() { # <inst> <checkid>
+    local inst=$1 id=$2
+    local f="$HEALTH_DIR/.livecheck-fails.$inst.$id"
+    if [[ -r "$f" && "$(<"$f")" != "0" ]]; then
+        logger -t "$LOG_TAG" "$inst live check $id recovered"
+    fi
+    echo 0 > "$f.tmp" && mv "$f.tmp" "$f"
+}
+
+# Re-run the Cloudflare canaries and the mandatory custom checks on a PROMOTED
+# slot. Writes .cf-state.<inst> (dispatcher bias) and a live ledger record on
+# every run; triggers a rotation only after LIVECHECK_FAILS_BEFORE_ROTATE
+# consecutive failures of one check and every gate below passes.
+live_check() {
+    local inst=$1 ns="ns-$1" now url host cls r entry_exit_ip
+    local canaries="" checks="" failing="" active_hosts="" n_active=0 n_clean=0
+    local trigger="" custom_bad=0 c_tier c_url c_body
+    # A slot mid-rotation has no stable exit — the netns is being rebuilt and any
+    # verdict would describe the outgoing one. systemd serialises repeat starts
+    # of this unit but knows nothing about the rotation unit, so ask.
+    if systemctl is-active --quiet "proteus-rotate-slot@$inst.service"; then
+        logger -t "$LOG_TAG" "$inst live check skipped: rotation in progress"
+        return 0
+    fi
+    now=$(date +%s)
+    # The exit these verdicts will describe. A full basket takes minutes, which
+    # is long enough for a health-triggered rotation to replace it underneath us.
+    entry_exit_ip=$(_meta_get "$inst" EXIT_IP)
+
+    while IFS= read -r url; do
+        [[ -n "$url" ]] || continue
+        host=$(cf_host "$url")
+        cls=$(cf_probe_canary "$ns" "$url")
+        canaries="$canaries${canaries:+,}$host=$cls"
+        [[ "$cls" == "not-cloudflare" ]] && continue
+        # Quarantined: probed (that is how it recovers) but never counted, and
+        # any count from before the quarantine goes with it.
+        cf_quarantined "$host" && { _live_ok "$inst" "cf:$host"; continue; }
+        n_active=$((n_active + 1)); active_hosts="$active_hosts${active_hosts:+,}$host"
+        case "$cls" in
+            clean) n_clean=$((n_clean + 1)); _live_ok "$inst" "cf:$host" ;;
+            # Reachability is the warmup health path's job: it degrades a slot
+            # whose exit is dead. Count the streak so the log shows it, but never
+            # rotate on it and never let it colour the verdict — a lost socket
+            # says nothing about the exit's Cloudflare standing, and calling it a
+            # failure would drop the exit out of ledger.pool() for 24h.
+            transport)
+                   _live_fail "$inst" "cf:$host" transport ;;
+            *)     failing="$failing${failing:+,}$host"
+                   _live_fail "$inst" "cf:$host" "$cls" && trigger="${trigger:-cf-canary}" ;;
+        esac
+    done < <(cf_canaries)
+
+    # Mandatory custom checks, through the same probe() the gate uses.
+    # shellcheck disable=SC2034  # NS is what probe() in checklib.sh reads.
+    local NS=$ns
+    # shellcheck disable=SC2034  # c_tier is already filtered by custom_checks.
+    while IFS=$'\t' read -r c_tier c_url c_body; do
+        [[ -n "$c_url" ]] || continue
+        host=$(cf_host "$c_url")
+        r=$(probe "custom:${host:0:40}" "$c_url" '[23][0-9][0-9]' "${c_body:-}")
+        # Same rule as the canaries, matched on the raw probe line before
+        # result_class collapses transport-fail into a plain "error".
+        if [[ "$r" == ERROR*transport-fail ]]; then
+            checks="$checks${checks:+,}custom:$host=transport"
+            _live_fail "$inst" "custom:$host" transport
+            continue
+        fi
+        cls=$(result_class "$r"); cls=${cls#* }
+        checks="$checks${checks:+,}custom:$host=$cls"
+        case "$cls" in
+            clean|skip) _live_ok "$inst" "custom:$host" ;;
+            *)          custom_bad=1
+                        _live_fail "$inst" "custom:$host" "$cls" && trigger="custom-check" ;;
+        esac
+    done < <(custom_checks mandatory)
+
+    # A rotation that started while we were probing has already replaced the
+    # exit, so everything above describes an IP this slot no longer holds.
+    # Publishing it would bias the dispatcher against a fresh exit and file the
+    # old exit's verdict in the ledger under the new one; the next scheduled
+    # check re-measures in a few minutes, so drop the run instead. The counters
+    # already bumped stay: rotation clears them on promotion anyway.
+    if systemctl is-active --quiet "proteus-rotate-slot@$inst.service" \
+       || [[ "$(_meta_get "$inst" EXIT_IP)" != "$entry_exit_ip" ]]; then
+        logger -t "$LOG_TAG" "$inst live check discarded: exit changed during the run"
+        return 0
+    fi
+
+    # Verdict for the dispatcher, written on every run (a client picking a slot
+    # right now cares about the last observation, not about whether we act).
+    local v=yes; [[ -n "$failing" ]] && v=no
+    printf 'CF_CLEAN=%s\nAT=%s\nFAILING=%s\n' "$v" "$now" "$failing" > "$HEALTH_DIR/.cf-state.$inst.tmp" \
+        && mv "$HEALTH_DIR/.cf-state.$inst.tmp" "$HEALTH_DIR/.cf-state.$inst"
+    # The ledger verdict is what mint reads, so in advisory tier a canary must
+    # not reach it: a fail would take the exit out of the known-good pool for
+    # 24h and let shadow canaries pick exits after all. The operator's own
+    # mandatory checks are never gated by the tier. .cf-state above is display
+    # data (the dispatcher ignores it in advisory) and stays as measured.
+    local verdict=pass
+    if (( custom_bad )) || { [[ "$CF_TIER" == "mandatory" && -n "$failing" ]]; }; then verdict=fail; fi
+    ledger_record --source live --slot "$inst" --verdict "$verdict" \
+        --exit-ip "$entry_exit_ip" \
+        --entry-ip "$(_health_get "$STATE_DIR/$inst.state" WG_ENDPOINT_IP)" \
+        --logical "$(_meta_get "$inst" LOGICAL_NAME)" \
+        --canaries "$canaries" --checks "$checks" --standing "$n_clean" --of "$n_active"
+
+    [[ -n "$trigger" ]] || return 0
+    if [[ -f "$STATE_DIR/rotation-paused" ]]; then
+        logger -t "$LOG_TAG" "$inst live-check rotation suppressed (paused)"; return 0
+    fi
+    if [[ "$trigger" == "cf-canary" ]]; then
+        # Shadow mode: PROTEUS_CF_TIER=advisory records and displays canary verdicts
+        # but never acts on them. The operator's own mandatory checks are not gated.
+        if [[ "$CF_TIER" != "mandatory" ]]; then
+            logger -t "$LOG_TAG" "$inst canary failing but PROTEUS_CF_TIER=$CF_TIER (shadow mode); not rotating"
+            # Reset the canary streaks: otherwise they climb for days in shadow
+            # mode and the first check after a flip to mandatory rotates every
+            # slot at once. A flip should need two fresh failures like any slot.
+            rm -f "$HEALTH_DIR/.livecheck-fails.$inst.cf:"*
+            return 0
+        fi
+        local sd=0
+        [[ -r "$HEALTH_DIR/.stepdown-at.$inst" ]] && sd=$(<"$HEALTH_DIR/.stepdown-at.$inst")
+        if (( now - sd < CF_STEPDOWN_RETRY_S )); then
+            logger -t "$LOG_TAG" "$inst below standard since step-down; retry in $((CF_STEPDOWN_RETRY_S - (now - sd)))s"
+            return 0
+        fi
+        if ! cf_attainable "$active_hosts" "$(live_slot_count)"; then
+            logger -t "$LOG_TAG" "$inst canary failing but the standard is not attainable fleet-wide; not rotating"
+            return 0
+        fi
+    fi
+    local last=0 lf="$HEALTH_DIR/.live-lastrot.$inst"
+    [[ -r "$lf" ]] && last=$(<"$lf")
+    if (( now - last < LIVECHECK_ROT_COOLDOWN )); then
+        logger -t "$LOG_TAG" "$inst live-check rotation on cooldown ($((now - last))s < ${LIVECHECK_ROT_COOLDOWN}s)"
+        return 0
+    fi
+    echo "$now" > "$lf.tmp" && mv "$lf.tmp" "$lf"
+    rm -f "$HEALTH_DIR/.livecheck-fails.$inst."*
+    logger -t "$LOG_TAG" "$inst live-check rotation triggered ($trigger)"
+    mkdir -p "$RUN_DIR" && echo "$trigger" > "$RUN_DIR/$inst"
+    systemctl start --no-block "proteus-rotate-slot@$inst.service" || \
+        logger -t "$LOG_TAG" "$inst live-check rotation failed to start"
 }
 
 # Resolve the warmup target without touching any slot's tunnel: local unbound
@@ -376,6 +570,20 @@ warm_dns6() {
         >/dev/null 2>&1 || true
 }
 
+# One-slot entrypoint for proteus-livecheck@<slot>.service. A canary basket can
+# take minutes, so the live check runs as its own unit rather than inside the
+# 10s warmup pass, which systemd cannot start again until the previous one
+# exits — a slow check there would stall every slot's warmup and age the health
+# files past the dispatcher's freshness window.
+if [[ "${1:-}" == "--live-check" ]]; then
+    if [[ "${2:-}" =~ ^proton-[0-9]+$ ]]; then
+        live_check "$2"
+        exit 0
+    fi
+    echo "usage: ${0##*/} --live-check <proton-N>" >&2
+    exit 1
+fi
+
 # Bump the persisted pass counter and decide which slot (if any) gets the
 # throughput probe this pass.
 [[ -r "$PASS_COUNTER_FILE" ]] && pass_counter=$(<"$PASS_COUNTER_FILE") || pass_counter=0
@@ -401,6 +609,34 @@ if [[ "$PLAYABILITY_CHECK" == "on" ]]; then
     pl_slot=$(pick_throughput_slot "$((pass_counter + 10))" "$PLAYABILITY_EVERY_N_PASSES" "$slot_list")
 fi
 
+# Offset by 5 more passes: throughput fires at pass%60==0, playability at
+# pass%20==10, live checks at pass%20==15, so no slot ever gets two heavy
+# probes in one pass.
+lc_slot=""
+if [[ "$LIVECHECK" == "on" ]]; then
+    lc_slot=$(pick_throughput_slot "$((pass_counter + 5))" "$LIVECHECK_EVERY_N_PASSES" "$slot_list")
+fi
+
+# The web UI runs unprivileged and cannot ask WireGuard anything, so record the
+# UDM tunnel's liveness here, where we are already root once every pass. Absent
+# interface means the feature is off and the file is removed, so a stale age can
+# never outlive the tunnel.
+if [[ -e /sys/class/net/wg-udm ]]; then
+    _hs=$(wg show wg-udm latest-handshakes 2>/dev/null | awk '{print $2; exit}')
+    # Shape first, then value. `[[ x -gt 0 ]]` evaluates x as arithmetic, where a
+    # non-numeric word is a variable NAME — and under this script's `set -u` an
+    # unset one aborts the whole pass, so an unexpected line from `wg` would cost
+    # every slot its warmup and its health write, not just this file.
+    if [[ "${_hs:-}" =~ ^[0-9]+$ ]] && (( _hs > 0 )); then
+        printf 'HANDSHAKE_AGE_S=%s\n' "$(( $(date +%s) - _hs ))" > "$HEALTH_DIR/.udm-tunnel.tmp"
+    else
+        printf 'HANDSHAKE_AGE_S=\n' > "$HEALTH_DIR/.udm-tunnel.tmp"
+    fi
+    mv "$HEALTH_DIR/.udm-tunnel.tmp" "$HEALTH_DIR/.udm-tunnel"
+else
+    rm -f "$HEALTH_DIR/.udm-tunnel"
+fi
+
 # One resolution per pass, shared by every warm_one job below.
 WARMUP_IP=$(_warmup_ip)
 
@@ -414,4 +650,7 @@ done
 warm_dns6 &
 # Backgrounded like the rest: a slow YouTube fetch must not delay the pass.
 [[ -n "$pl_slot" ]] && playability_check "$pl_slot" &
+# Not backgrounded here: its own unit, so a long canary run cannot hold the pass
+# open. systemd serialises repeat starts for the same slot by itself.
+[[ -n "$lc_slot" ]] && systemctl start --no-block "proteus-livecheck@$lc_slot.service"
 wait

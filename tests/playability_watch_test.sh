@@ -49,7 +49,7 @@ run_check() { # run_check <body-file|""> [fails-seed]
   BODY_FILE="$body" HEALTH_DIR="$TMP/health" LOG_TAG=slot-warmup \
   PROTEUS_PLAYABILITY_FAILS=2 PROTEUS_PLAYABILITY_ROT_COOLDOWN="${COOLDOWN:-3600}" \
   bash -c '
-    HEALTH_DIR='"$TMP"'/health; LOG_TAG=slot-warmup
+    HEALTH_DIR='"$TMP"'/health; LOG_TAG=slot-warmup; STATE_DIR='"$TMP"'/state; RUN_DIR='"$TMP"'/run
     PLAYABILITY_UA=ua; PLAYABILITY_URL=http://x/; PLAYABILITY_TIMEOUT_S=5
     PLAYABILITY_MUST_CONTAIN='"'"'"playabilityStatus":{"status":"OK"'"'"'
     PLAYABILITY_FAILS_BEFORE_ROTATE=2
@@ -77,7 +77,7 @@ assert_eq "$(rotations)" "1" "second failure -> rotation triggered"
 assert_eq "$(fails)" "0" "counter reset after triggering"
 grep -q 'bot-gated' "$LOGGER_LOG" && r=ok || r=fail
 assert_eq "$r" ok "bot-gating named in the log, not just 'failed'"
-grep -q "^health$" "$TMP/run/proton-1" 2>/dev/null || true
+assert_eq "$(cat "$TMP/run/proton-1" 2>/dev/null)" "playability" "trigger file names the playability watch"
 
 echo "recovery clears the counter"
 run_check "$OK_BODY" 1
@@ -94,14 +94,14 @@ assert_eq "$r" ok "unreachable is distinguished from bot-gated in the log"
 
 echo "cooldown throttles repeat rotations"
 : > "$SYSTEMCTL_LOG"
-echo "$(date +%s)" > "$TMP/health/.playability-lastrot.proton-1"
+echo "$(date +%s)" > "$TMP/health/.live-lastrot.proton-1"
 run_check "$GATED" 1     # would otherwise hit the threshold and rotate
 assert_eq "$(rotations)" "0" "within cooldown -> no rotation"
 grep -q 'on cooldown' "$LOGGER_LOG" && r=ok || r=fail
 assert_eq "$r" ok "cooldown is logged"
 
 echo "the pause flag suppresses it like every other rotation path"
-: > "$SYSTEMCTL_LOG"; rm -f "$TMP/health/.playability-lastrot.proton-1"
+: > "$SYSTEMCTL_LOG"; rm -f "$TMP/health/.live-lastrot.proton-1"
 mkdir -p "$TMP/state"
 if [[ -w /etc/proteus/state ]] 2>/dev/null; then echo "  - skipped (would touch real state dir)"; else
   # the function reads a fixed path; assert the guard exists in the source instead
