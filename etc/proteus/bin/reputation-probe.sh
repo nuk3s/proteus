@@ -111,18 +111,21 @@ advisory_results+=( "$(probe reddit     "https://www.reddit.com/.json"          
 
 # --- Cloudflare canaries -------------------------------------------------------
 # The shipped basket (or canaries.json), judged purely on Cloudflare's own
-# verdict via cf_probe_canary. Tier comes from PROTEUS_CF_TIER; a canary the
-# ledger shows as site-wide (quarantined) is demoted to advisory for this run
-# so it cannot wedge rotation; a canary that is no longer on Cloudflare is
-# SKIPped and counts for nothing. STANDING is clean/active over the canaries
-# that are part of the standard right now.
+# verdict via cf_probe_canary. With CF_TIER=mandatory (the default) an active
+# canary gates: one challenge or 1xxx block fails the exit. With any other
+# CF_TIER an active canary is advisory: it is reported, and it never fails
+# the exit. A canary the ledger shows as site-wide (quarantined) is advisory
+# for this run in both tiers so it cannot wedge rotation; a canary that is no
+# longer on Cloudflare is SKIPped and counts for nothing. STANDING is
+# clean/active over the canaries that are part of the standard right now, in
+# both tiers.
 canary_lines=()
 canary_active=0; canary_clean=0
 while IFS= read -r c_url; do
     [[ -n "$c_url" ]] || continue
     c_host=$(cf_host "$c_url")
     cls=$(cf_probe_canary "$NS" "$c_url")
-    canary_lines+=( "$c_host $cls" )
+    c_note=""
     case "$cls" in
         clean)          r="PASS cf:$c_host" ;;
         challenge)      r="BLOCK cf:$c_host cf-challenge" ;;
@@ -149,8 +152,12 @@ while IFS= read -r c_url; do
             advisory_results+=( "$r" )
         fi
     else
+        # The trailer marks a quarantined canary, because it does not count
+        # toward the standard. A not-cloudflare class says that on its own.
+        if [[ "$cls" != "not-cloudflare" ]]; then c_note=" quarantined"; fi
         advisory_results+=( "$r" )
     fi
+    canary_lines+=( "$c_host $cls$c_note" )
 done < <(cf_canaries)
 
 # Custom operator checks (rotation-only, in this staging netns). checklib's
@@ -190,7 +197,8 @@ for r in "${advisory_results[@]}"; do echo "$r"; done
 a_block=$(count BLOCK "${advisory_results[@]}")
 
 # BASELINE: the verdict the non-canary mandatory set would give on its own.
-# rotate-slot.sh's step-down promotes only candidates whose baseline passes.
+# Informational: the rotation log shows whether an exit failed on the canaries
+# alone. Nothing promotes on it.
 baseline_results=()
 for r in "${mandatory_results[@]}"; do
     [[ "$r" == *" cf:"* ]] || baseline_results+=( "$r" )
@@ -203,9 +211,11 @@ if (( b_block > 0 || b_error >= MAX_MANDATORY_ERRORS || b_pass < MIN_MANDATORY_P
     baseline=FAIL
 fi
 
-# Machine-readable trailer for rotate-slot.sh (ledger + step-down). One CANARY
-# line per canary, one CHECK line per non-canary result, then STANDING and
-# BASELINE. Keep these formats stable; tests and the ledger depend on them.
+# Machine-readable trailer for rotate-slot.sh (ledger and the promotion
+# verdict). One CANARY line per canary ("CANARY <host> <class>", with a fourth
+# token "quarantined" when the canary does not count toward the standard), one
+# CHECK line per non-canary result, then STANDING and BASELINE. Keep these
+# formats stable; tests and the ledger depend on them.
 for l in "${canary_lines[@]}"; do echo "CANARY $l"; done
 for r in "${mandatory_results[@]}" "${advisory_results[@]}"; do
     [[ "$r" == *" cf:"* ]] && continue

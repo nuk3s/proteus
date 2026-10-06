@@ -439,20 +439,19 @@ def test_parse_canaries_falls_back_to_defaults():
     assert ui_logic.parse_canaries('{"canaries":[{"url":"https://a.invalid/"}]}') == ["https://a.invalid/"]
 
 
-def test_builtin_checks_include_canaries_with_tier():
-    out = ui_logic.builtin_checks("advisory", ["https://a.invalid/"])
-    assert out[:len(ui_logic.BUILTIN_CHECKS)] == ui_logic.BUILTIN_CHECKS
-    assert out[-1] == {"url": "https://a.invalid/", "tier": "advisory", "canary": True}
+def test_builtin_checks_list_canaries_at_the_cf_tier():
+    for tier in ("mandatory", "advisory"):
+        out = ui_logic.builtin_checks(tier, ["https://a.invalid/"])
+        assert out[:len(ui_logic.BUILTIN_CHECKS)] == ui_logic.BUILTIN_CHECKS
+        assert out[-1] == {"url": "https://a.invalid/", "tier": tier, "canary": True}
 
 
 def test_cf_knobs_registered_and_validated():
     for key, good, bad in [
         ("PROTEUS_CF_TIER", "advisory", "maybe"),
-        ("PROTEUS_CF_FALLBACK", "strict", "none"),
         ("PROTEUS_LIVECHECK", "off", "yes"),
         ("PROTEUS_LIVECHECK_FAILS", "3", "0"),
         ("PROTEUS_LIVECHECK_ROT_COOLDOWN", "3600", "10"),
-        ("PROTEUS_CF_STEPDOWN_RETRY_S", "21600", "60"),
         ("PROTEUS_CF_QUARANTINE_MIN_EXITS", "8", "1"),
         ("PROTEUS_MINT_EXPLORE", "0.5", "1.5"),
         ("PROTEUS_MINT_POOL_TARGET", "20", "0"),
@@ -460,6 +459,56 @@ def test_cf_knobs_registered_and_validated():
     ]:
         assert ui_logic.validate_knob(key, good) == (True, ""), key
         assert not ui_logic.validate_knob(key, bad)[0], key
+
+
+def test_cf_tier_knob_is_the_require_cf_ok_switch():
+    k = ui_logic.KNOBS["PROTEUS_CF_TIER"]
+    assert (k.label, k.default, k.choices) == ("Require cf ok", "mandatory", ("mandatory", "advisory"))
+    assert k.group == "gates" and k.kick == "proteus-dispatcher.service"
+    keys = [x for x in ui_logic.KNOBS if ui_logic.KNOBS[x].group == "gates"]
+    cf = [x for x in keys if "CF" in x or "LIVECHECK" in x]
+    assert cf[0] == "PROTEUS_CF_TIER"                      # first CF knob in Quality gates
+    assert "\u2014" not in k.help and "advisory" in k.help and "mandatory" in k.help
+
+
+def test_cf_tier_helper_one_rule():
+    # Same rule as checklib.sh (${PROTEUS_CF_TIER:-mandatory}): unset or empty is mandatory.
+    for value, want in [(None, "mandatory"), ("", "mandatory"), ("mandatory", "mandatory"),
+                        ("advisory", "advisory"), ("bogus", "advisory")]:
+        assert ui_logic.cf_tier(value) == want, value
+
+
+def test_ledger_view_advisory_scores_the_standard_like_the_report(tmp_path):
+    canaries = tmp_path / "canaries.json"
+    canaries.write_text(json.dumps({"canaries": [{"url": "https://a.invalid/"}]}))
+    led = tmp_path / "exit-ledger.jsonl"
+    now = 1_800_000_000
+    # Thirteen distinct exits pass the verdict; twelve are challenged on the canary and
+    # one is clean (so the canary is not quarantined). Thirteen gate records in 24 h make
+    # the ledger deep enough to judge attainability.
+    led.write_text("".join(
+        json.dumps({"ts": now - 10, "source": "gate", "exit_ip": f"10.219.3.{i}", "verdict": "pass",
+                    "canaries": {"a.invalid": "clean" if i == 13 else "challenge"}}) + "\n"
+        for i in range(1, 14)))
+    args = (str(led), str(canaries), now, 2, 20, 8)
+    strict = ui_logic.ledger_view(*args)
+    assert strict["standard"]["size"] == 1 and strict["standard"]["attainable"] is False
+    assert strict["standard"]["passing_exits_24h"] == 1 and strict["pool"]["known_good"] == 1
+    assert ui_logic.ledger_view(*args, "mandatory") == strict
+    for tier in ("advisory", "bogus"):
+        adv = ui_logic.ledger_view(*args, tier)
+        assert adv["standard"]["size"] == 0 and adv["standard"]["attainable"] is True, tier
+        assert adv["standard"]["passing_exits_24h"] == 13 and adv["pool"]["known_good"] == 13, tier
+        # Canary stats and quarantine still use the full basket.
+        assert [c["host"] for c in adv["canaries"]] == ["a.invalid"]
+        assert adv["canaries"] == strict["canaries"]
+        assert adv["pool"]["target"] == 20
+
+
+def test_removed_cf_knobs_are_gone():
+    for key in ("PROTEUS_CF_FALLBACK", "PROTEUS_CF_STEPDOWN_RETRY_S"):
+        assert key not in ui_logic.KNOBS, key
+        assert ui_logic.validate_knob(key, "x")[0] is False
 
 
 def test_slot_summary_cf_field():

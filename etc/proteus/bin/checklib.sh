@@ -13,11 +13,11 @@ LEDGER_PY="${PROTEUS_LEDGER_PY:-$CHECKLIB_DIR/ledger.py}"
 LEDGER_FILE="${PROTEUS_LEDGER_FILE:-/etc/proteus/state/exit-ledger.jsonl}"
 CANARIES_FILE="${PROTEUS_CANARIES_FILE:-/etc/proteus/canaries.json}"
 CHECKS_FILE="${PROTEUS_CHECKS_FILE:-/etc/proteus/checks.json}"
-# mandatory|advisory. The _OVERRIDE form exists for rotate-slot.sh's step-down
-# re-probe: it must win even when proteus-local.env (sourced earlier by the
-# caller) pins PROTEUS_CF_TIER=mandatory.
+# "Require cf ok": mandatory (the default) or advisory. Any value other than
+# mandatory is advisory. In advisory the canaries run and are recorded and
+# shown, and nothing acts on their verdict.
 # shellcheck disable=SC2034
-CF_TIER="${PROTEUS_CF_TIER_OVERRIDE:-${PROTEUS_CF_TIER:-mandatory}}"
+CF_TIER="${PROTEUS_CF_TIER:-mandatory}"
 CF_QUARANTINE_MIN_EXITS="${PROTEUS_CF_QUARANTINE_MIN_EXITS:-8}"
 CF_PROBE_TIMEOUT_S="${PROTEUS_CF_PROBE_TIMEOUT_S:-15}"
 PER_PROBE_TIMEOUT="${PER_PROBE_TIMEOUT:-40}"
@@ -83,9 +83,9 @@ cf_canaries() { python3 "$LEDGER_PY" canaries --file "$CANARIES_FILE" 2>/dev/nul
 # cf_quarantined <host> -> 0 when the ledger says the canary is site-wide.
 # ledger.py answers 0 (quarantined) or 1 (not); any other status means the tool
 # itself failed (no python3, ledger.py crashed or unreadable). That is NOT a
-# "not quarantined" answer: treat it as quarantined so the canary is demoted to
-# advisory and a broken ledger can never wedge rotation — but say so on stderr,
-# because a silent demotion looks exactly like a healthy run.
+# "not quarantined" answer: treat it as quarantined so the canary is not counted
+# this run and a broken ledger can never wedge rotation. Say so on stderr,
+# because a silent skip looks exactly like a healthy run.
 cf_quarantined() {
     local rc=0
     python3 "$LEDGER_PY" quarantined --path "$LEDGER_FILE" --host "$1" \
@@ -94,7 +94,7 @@ cf_quarantined() {
         0) return 0 ;;
         1) return 1 ;;
     esac
-    echo "checklib: quarantine lookup failed for $1 (rc=$rc); demoting to advisory" >&2
+    echo "checklib: quarantine lookup failed for $1 (rc=$rc); not counted this run" >&2
     return 0
 }
 

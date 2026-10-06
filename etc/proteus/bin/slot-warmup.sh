@@ -96,18 +96,24 @@ PLAYABILITY_ROT_COOLDOWN="${PROTEUS_PLAYABILITY_ROT_COOLDOWN:-3600}"
 # The playability watch, generalised. The candidate gate's Cloudflare canaries
 # and the operator's mandatory custom checks are re-run on promoted slots, one
 # slot per LIVECHECK_EVERY_N_PASSES round-robin, and a slot that keeps failing
-# one of them is rotated out. Same rules as playability: never touches
-# FAIL_STREAK/STATUS (degrading a challenged exit would evict its pins), two
-# consecutive failures before acting, one shared per-slot cooldown for every
-# live-triggered rotation. Canary-triggered rotations are additionally held
-# while the ledger says the standard is not attainable fleet-wide, and inside
-# a slot's step-down retry window. Design:
-# architecture.md, "Cloudflare canaries, live checks and the exit ledger"
+# one of them is rotated out. "cf ok" is required by default
+# (PROTEUS_CF_TIER=mandatory, read in checklib.sh): the first flagged canary
+# writes CF_CLEAN=no and the dispatcher gives the slot no new clients from that
+# moment. The slot gets a quick second check at the next turn
+# (livecheck_quick_slots) and a confirmed flag rotates it. PROTEUS_CF_TIER=advisory
+# records and shows the canaries only: CF_CLEAN is still written for the tunnel
+# card, but a flag does not fail the exit in the ledger, gets no quick check and
+# rotates nothing. The mandatory custom checks act in both tiers. Same rules as
+# playability otherwise: never touches FAIL_STREAK/STATUS (degrading a
+# challenged exit would evict its pins), two consecutive failures before
+# acting, one shared per-slot cooldown for every live-triggered rotation.
+# Canary-triggered rotations are also held while the ledger says the standard
+# is not attainable fleet-wide. Design: architecture.md, "Cloudflare canaries,
+# live checks and the exit ledger"
 LIVECHECK="${PROTEUS_LIVECHECK:-on}"                                  # on|off
 LIVECHECK_EVERY_N_PASSES=20
 LIVECHECK_FAILS_BEFORE_ROTATE="${PROTEUS_LIVECHECK_FAILS:-2}"
 LIVECHECK_ROT_COOLDOWN="${PROTEUS_LIVECHECK_ROT_COOLDOWN:-3600}"
-CF_STEPDOWN_RETRY_S="${PROTEUS_CF_STEPDOWN_RETRY_S:-21600}"
 STATE_DIR="${PROTEUS_STATE_DIR:-/etc/proteus/state}"
 RUN_DIR="${PROTEUS_RUN_DIR:-/run/proteus}"
 # probe(), cf_probe_canary, cf_canaries, custom_checks and the ledger wrappers.
@@ -329,18 +335,31 @@ _live_ok() { # <inst> <checkid>
     echo 0 > "$f.tmp" && mv "$f.tmp" "$f"
 }
 
+# True while slot $1 has a rotation running. `systemctl is-active` exits 3 for
+# a oneshot unit that is still running ("activating"), so read the state it
+# prints, not its exit status.
+_rotating() {
+    case "$(systemctl is-active "proteus-rotate-slot@$1.service" 2>/dev/null)" in
+        active|activating|deactivating|reloading) return 0 ;;
+    esac
+    return 1
+}
+
 # Re-run the Cloudflare canaries and the mandatory custom checks on a PROMOTED
-# slot. Writes .cf-state.<inst> (dispatcher bias) and a live ledger record on
-# every run; triggers a rotation only after LIVECHECK_FAILS_BEFORE_ROTATE
-# consecutive failures of one check and every gate below passes.
+# slot. Writes .cf-state.<inst> in both tiers (the tunnel card shows it; the
+# dispatcher's cf ok rule reads it in mandatory) when the run
+# observed every active canary or flagged one, and a live ledger record on every
+# run; triggers a rotation only after LIVECHECK_FAILS_BEFORE_ROTATE consecutive
+# failures of one check and every gate below passes.
 live_check() {
     local inst=$1 ns="ns-$1" now url host cls r entry_exit_ip
     local canaries="" checks="" failing="" active_hosts="" n_active=0 n_clean=0
     local trigger="" custom_bad=0 c_tier c_url c_body
+    local n_unreached=0
     # A slot mid-rotation has no stable exit — the netns is being rebuilt and any
     # verdict would describe the outgoing one. systemd serialises repeat starts
     # of this unit but knows nothing about the rotation unit, so ask.
-    if systemctl is-active --quiet "proteus-rotate-slot@$inst.service"; then
+    if _rotating "$inst"; then
         logger -t "$LOG_TAG" "$inst live check skipped: rotation in progress"
         return 0
     fi
@@ -354,7 +373,9 @@ live_check() {
         host=$(cf_host "$url")
         cls=$(cf_probe_canary "$ns" "$url")
         canaries="$canaries${canaries:+,}$host=$cls"
-        [[ "$cls" == "not-cloudflare" ]] && continue
+        # Off Cloudflare: not counted. A streak from when it was on Cloudflare
+        # goes too, or it would pin the slot at the threshold until promotion.
+        [[ "$cls" == "not-cloudflare" ]] && { _live_ok "$inst" "cf:$host"; continue; }
         # Quarantined: probed (that is how it recovers) but never counted, and
         # any count from before the quarantine goes with it.
         cf_quarantined "$host" && { _live_ok "$inst" "cf:$host"; continue; }
@@ -367,6 +388,7 @@ live_check() {
             # says nothing about the exit's Cloudflare standing, and calling it a
             # failure would drop the exit out of ledger.pool() for 24h.
             transport)
+                   n_unreached=$((n_unreached + 1))
                    _live_fail "$inst" "cf:$host" transport ;;
             *)     failing="$failing${failing:+,}$host"
                    _live_fail "$inst" "cf:$host" "$cls" && trigger="${trigger:-cf-canary}" ;;
@@ -403,55 +425,59 @@ live_check() {
     # old exit's verdict in the ledger under the new one; the next scheduled
     # check re-measures in a few minutes, so drop the run instead. The counters
     # already bumped stay: rotation clears them on promotion anyway.
-    if systemctl is-active --quiet "proteus-rotate-slot@$inst.service" \
+    if _rotating "$inst" \
        || [[ "$(_meta_get "$inst" EXIT_IP)" != "$entry_exit_ip" ]]; then
         logger -t "$LOG_TAG" "$inst live check discarded: exit changed during the run"
         return 0
     fi
 
-    # Verdict for the dispatcher, written on every run (a client picking a slot
-    # right now cares about the last observation, not about whether we act).
-    local v=yes; [[ -n "$failing" ]] && v=no
-    printf 'CF_CLEAN=%s\nAT=%s\nFAILING=%s\n' "$v" "$now" "$failing" > "$HEALTH_DIR/.cf-state.$inst.tmp" \
-        && mv "$HEALTH_DIR/.cf-state.$inst.tmp" "$HEALTH_DIR/.cf-state.$inst"
-    # The ledger verdict is what mint reads, so in advisory tier a canary must
-    # not reach it: a fail would take the exit out of the known-good pool for
-    # 24h and let shadow canaries pick exits after all. The operator's own
-    # mandatory checks are never gated by the tier. .cf-state above is display
-    # data (the dispatcher ignores it in advisory) and stays as measured.
+    # Verdict for the dispatcher. A flag is written at once: from now on the
+    # dispatcher gives the slot no new clients. "cf ok" needs an observation, so
+    # a run that flagged nothing but could not reach a canary leaves the
+    # previous verdict (or the lack of one) in place.
+    local v=""
+    if [[ -n "$failing" ]]; then
+        v=no
+    elif (( n_unreached == 0 )); then
+        v=yes
+    fi
+    if [[ -n "$v" ]]; then
+        printf 'CF_CLEAN=%s\nAT=%s\nFAILING=%s\n' "$v" "$now" "$failing" > "$HEALTH_DIR/.cf-state.$inst.tmp" \
+            && mv "$HEALTH_DIR/.cf-state.$inst.tmp" "$HEALTH_DIR/.cf-state.$inst"
+    fi
+    # The ledger verdict is what mint reads. In advisory a canary must not reach
+    # it: a fail takes the exit out of the known-good pool for 24h, so the
+    # canaries would steer the draw after all. The operator's own mandatory
+    # checks fail the exit in both tiers. .cf-state above is written the same
+    # way in both tiers.
     local verdict=pass
-    if (( custom_bad )) || { [[ "$CF_TIER" == "mandatory" && -n "$failing" ]]; }; then verdict=fail; fi
+    if (( custom_bad )) || { [[ "$CF_TIER" == "mandatory" && -n "$failing" ]]; }; then
+        verdict=fail
+    fi
     ledger_record --source live --slot "$inst" --verdict "$verdict" \
         --exit-ip "$entry_exit_ip" \
         --entry-ip "$(_health_get "$STATE_DIR/$inst.state" WG_ENDPOINT_IP)" \
         --logical "$(_meta_get "$inst" LOGICAL_NAME)" \
         --canaries "$canaries" --checks "$checks" --standing "$n_clean" --of "$n_active"
 
+    # In advisory nothing acts on a canary. Clear the canary streaks on every
+    # run, so a later switch to mandatory starts from zero and needs two fresh
+    # failures. This comes before the pause gate, so a pause keeps no streak.
+    # A custom-check trigger goes on to the gates below.
+    if [[ "$CF_TIER" != "mandatory" ]]; then
+        rm -f "$HEALTH_DIR/.livecheck-fails.$inst.cf:"*
+        if [[ "$trigger" == "cf-canary" ]]; then
+            logger -t "$LOG_TAG" "$inst canary failing but cf ok is not required (PROTEUS_CF_TIER=$CF_TIER); not rotating"
+            return 0
+        fi
+    fi
     [[ -n "$trigger" ]] || return 0
     if [[ -f "$STATE_DIR/rotation-paused" ]]; then
         logger -t "$LOG_TAG" "$inst live-check rotation suppressed (paused)"; return 0
     fi
-    if [[ "$trigger" == "cf-canary" ]]; then
-        # Shadow mode: PROTEUS_CF_TIER=advisory records and displays canary verdicts
-        # but never acts on them. The operator's own mandatory checks are not gated.
-        if [[ "$CF_TIER" != "mandatory" ]]; then
-            logger -t "$LOG_TAG" "$inst canary failing but PROTEUS_CF_TIER=$CF_TIER (shadow mode); not rotating"
-            # Reset the canary streaks: otherwise they climb for days in shadow
-            # mode and the first check after a flip to mandatory rotates every
-            # slot at once. A flip should need two fresh failures like any slot.
-            rm -f "$HEALTH_DIR/.livecheck-fails.$inst.cf:"*
-            return 0
-        fi
-        local sd=0
-        [[ -r "$HEALTH_DIR/.stepdown-at.$inst" ]] && sd=$(<"$HEALTH_DIR/.stepdown-at.$inst")
-        if (( now - sd < CF_STEPDOWN_RETRY_S )); then
-            logger -t "$LOG_TAG" "$inst below standard since step-down; retry in $((CF_STEPDOWN_RETRY_S - (now - sd)))s"
-            return 0
-        fi
-        if ! cf_attainable "$active_hosts" "$(live_slot_count)"; then
-            logger -t "$LOG_TAG" "$inst canary failing but the standard is not attainable fleet-wide; not rotating"
-            return 0
-        fi
+    if [[ "$trigger" == "cf-canary" ]] && ! cf_attainable "$active_hosts" "$(live_slot_count)"; then
+        logger -t "$LOG_TAG" "$inst canary failing but the standard is not attainable fleet-wide; not rotating"
+        return 0
     fi
     local last=0 lf="$HEALTH_DIR/.live-lastrot.$inst"
     [[ -r "$lf" ]] && last=$(<"$lf")
@@ -465,6 +491,63 @@ live_check() {
     mkdir -p "$RUN_DIR" && echo "$trigger" > "$RUN_DIR/$inst"
     systemctl start --no-block "proteus-rotate-slot@$inst.service" || \
         logger -t "$LOG_TAG" "$inst live-check rotation failed to start"
+}
+
+# Slots that get a live check at this turn besides the round-robin one: a slot
+# with no Cloudflare verdict yet (a reboot or a promotion that could not see
+# every canary), and a slot whose flag no second check has confirmed. A verdict
+# file that does not say CF_CLEAN=yes counts as no verdict, as in the
+# dispatcher and the UI, so a malformed file gets a quick check. The
+# dispatcher already keeps new clients off a flagged slot; this confirms the
+# flag (and rotates the slot) or clears it in one turn instead of a full round.
+# Both cases stop at the canary streak threshold. A flagged slot there waits on
+# a rotation gate (cooldown, attainability, pause) or kept a flag that a later
+# unreachable canary could not clear. A slot with no verdict there has a canary
+# it cannot reach, and an unreachable canary must not cost a quick check at
+# every turn. Either way the slot gets its normal turn only. Transport results
+# count in the same streak; promotion and reboot clear it. A rotating slot is
+# never quick: its live check would only log "skipped".
+livecheck_quick_slots() { # <slot_list>
+    local inst f c n max
+    for inst in $1; do
+        _rotating "$inst" && continue
+        f="$HEALTH_DIR/.cf-state.$inst"
+        [[ -e "$f" ]] && grep -qx 'CF_CLEAN=yes' "$f" 2>/dev/null && continue
+        max=0
+        for c in "$HEALTH_DIR/.livecheck-fails.$inst.cf:"*; do
+            [[ -r "$c" ]] || continue
+            n=$(<"$c")
+            [[ "$n" =~ ^[0-9]+$ ]] || continue
+            (( n > max )) && max=$n
+        done
+        (( max < LIVECHECK_FAILS_BEFORE_ROTATE )) && echo "$inst"
+    done
+    return 0
+}
+
+# The slots to live-check at this turn: the round-robin slot first, then each
+# quick slot, each once. Each runs as its own proteus-livecheck@ unit. Quick
+# slots only when cf ok is required: in advisory nothing acts on a flag, so a
+# quick check has no use.
+livecheck_turn_slots() { # <round-robin slot> <slot_list>
+    {
+        echo "$1"
+        if [[ "$CF_TIER" == "mandatory" ]]; then livecheck_quick_slots "$2"; fi
+    } | awk 'NF && !seen[$0]++'
+}
+
+# With PROTEUS_LIVECHECK=off nothing confirms or clears a flag, so a flag from
+# before the switch would keep its slot from new clients until the next
+# rotation. Drop it: the slot is unchecked, as after a reboot. A cf ok verdict
+# from a promotion stays.
+livecheck_off_clear_flags() { # <slot_list>
+    local inst
+    for inst in $1; do
+        if grep -qx 'CF_CLEAN=no' "$HEALTH_DIR/.cf-state.$inst" 2>/dev/null; then
+            rm -f "$HEALTH_DIR/.cf-state.$inst"
+        fi
+    done
+    return 0
 }
 
 # Resolve the warmup target without touching any slot's tunnel: local unbound
@@ -612,9 +695,12 @@ fi
 # Offset by 5 more passes: throughput fires at pass%60==0, playability at
 # pass%20==10, live checks at pass%20==15, so no slot ever gets two heavy
 # probes in one pass.
-lc_slot=""
+lc_slot=""; lc_slots=""
 if [[ "$LIVECHECK" == "on" ]]; then
     lc_slot=$(pick_throughput_slot "$((pass_counter + 5))" "$LIVECHECK_EVERY_N_PASSES" "$slot_list")
+    [[ -n "$lc_slot" ]] && lc_slots=$(livecheck_turn_slots "$lc_slot" "$slot_list")
+else
+    livecheck_off_clear_flags "$slot_list"
 fi
 
 # The web UI runs unprivileged and cannot ask WireGuard anything, so record the
@@ -652,5 +738,7 @@ warm_dns6 &
 [[ -n "$pl_slot" ]] && playability_check "$pl_slot" &
 # Not backgrounded here: its own unit, so a long canary run cannot hold the pass
 # open. systemd serialises repeat starts for the same slot by itself.
-[[ -n "$lc_slot" ]] && systemctl start --no-block "proteus-livecheck@$lc_slot.service"
+for s in $lc_slots; do
+    systemctl start --no-block "proteus-livecheck@$s.service"
+done
 wait

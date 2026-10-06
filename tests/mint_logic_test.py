@@ -14,9 +14,12 @@ def cand(entry_ip, name="L", load=10):
     return (NS(name=name, load=load), NS(entry_ip=entry_ip))
 
 
-def rec(ts, entry_ip, source="gate", verdict="pass", canaries=None):
-    return {"ts": ts, "exit_ip": "9." + entry_ip, "entry_ip": entry_ip, "source": source,
-            "verdict": verdict, "canaries": canaries if canaries is not None else {"discord.com": "clean"}}
+def rec(ts, entry_ip, source="gate", verdict="pass", canaries=None, checks=None):
+    r = {"ts": ts, "exit_ip": "9." + entry_ip, "entry_ip": entry_ip, "source": source,
+         "verdict": verdict, "canaries": canaries if canaries is not None else {"discord.com": "clean"}}
+    if checks is not None:
+        r["checks"] = checks
+    return r
 
 
 class FixedRng:
@@ -281,3 +284,42 @@ def test_rank_prefers_proven_slash24_over_proven_slash16():
     c = [cand("10.70.1.1"), cand("10.70.251.130")]
     ip, _ = pick(c, [], attempt=1, good_prefixes={"10.70"}, good_prefixes24={"10.70.251"})
     assert ip == "10.70.251.130"
+
+
+# cf_mint_inputs: the tier decides the canary standard and which 1005s ban a
+# range. q.invalid challenged two distinct exits and passed none, so with a
+# quarantine threshold of 2 it is quarantined. 10.120/16 has a canary 1005 and
+# 10.110/16 a 1005 from the operator's own check.
+def _tier_records():
+    return [
+        rec(NOW - 100, "10.0.0.1", canaries={"discord.com": "clean", "q.invalid": "challenge"}),
+        rec(NOW - 100, "10.0.0.2", canaries={"discord.com": "clean", "q.invalid": "challenge"}),
+        rec(NOW - 100, "10.120.5.6", source="live", verdict="fail",
+            canaries={"discord.com": "block-1005"}),
+        rec(NOW - 100, "10.110.3.4", verdict="fail", checks={"custom:x.invalid": "block-1005"}),
+    ]
+
+
+def test_cf_mint_inputs_mandatory_uses_active_canaries_and_canary_bans():
+    hosts, banned = mint_logic.cf_mint_inputs(_tier_records(), ["discord.com", "q.invalid"],
+                                              NOW, 2, "mandatory")
+    assert hosts == ["discord.com"]
+    assert banned == {"10.110", "10.120"}
+
+
+def test_cf_mint_inputs_advisory_has_no_standard_and_only_check_bans():
+    hosts, banned = mint_logic.cf_mint_inputs(_tier_records(), ["discord.com", "q.invalid"],
+                                              NOW, 2, "advisory")
+    assert hosts == []
+    assert banned == {"10.110"}
+
+
+def test_cf_mint_inputs_empty_tier_is_mandatory():
+    hosts, banned = mint_logic.cf_mint_inputs(_tier_records(), ["discord.com", "q.invalid"],
+                                              NOW, 2, "")
+    assert hosts == ["discord.com"] and banned == {"10.110", "10.120"}
+
+
+def test_cf_mint_inputs_any_other_tier_is_advisory():
+    hosts, banned = mint_logic.cf_mint_inputs(_tier_records(), ["discord.com"], NOW, 2, "bogus")
+    assert hosts == [] and banned == {"10.110"}

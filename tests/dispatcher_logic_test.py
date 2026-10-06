@@ -370,8 +370,8 @@ def test_degraded_still_excluded_regardless_of_playability(tmp_path):
     assert got == ("proton-2", 2)          # degraded loses even to a gated slot
 
 
-# --- Cloudflare verdict bias ---------------------------------------------------
-from dispatcher_logic import is_cf_clean, pick_distributed
+# --- Cloudflare verdict --------------------------------------------------------
+from dispatcher_logic import is_cf_clean, pick_distributed, prefer_cf_clean
 
 
 def _cf(p: Path, clean: str, at: int, failing: str = "") -> None:
@@ -382,19 +382,39 @@ def _pl(p: Path, playable: str, at: int) -> None:
     p.write_text(f"PLAYABLE={playable}\nAT={at}\n")
 
 
-def test_is_cf_clean_fails_open(tmp_path: Path) -> None:
+def test_is_cf_clean_unknown_is_clean_and_a_flag_holds_at_any_age(tmp_path: Path) -> None:
     now = 1_800_000_000
-    assert is_cf_clean(str(tmp_path), "proton-1", now)                       # no file
+    assert is_cf_clean(str(tmp_path), "proton-1")                            # no file
     (tmp_path / ".cf-state.proton-1").write_text("garbage\n")
-    assert is_cf_clean(str(tmp_path), "proton-1", now)                       # malformed
-    _cf(tmp_path / ".cf-state.proton-1", "no", now - 7200)
-    assert is_cf_clean(str(tmp_path), "proton-1", now)                       # stale "no"
+    assert is_cf_clean(str(tmp_path), "proton-1")                            # malformed
+    _cf(tmp_path / ".cf-state.proton-1", "no", now - 30 * 86400, "discord.com")
+    assert not is_cf_clean(str(tmp_path), "proton-1")                        # old "no" still holds
     (tmp_path / ".cf-state.proton-1").write_text("CF_CLEAN=no\nAT=abc\n")
-    assert is_cf_clean(str(tmp_path), "proton-1", now)                       # bad timestamp
-    _cf(tmp_path / ".cf-state.proton-1", "no", now - 60, "discord.com")
-    assert not is_cf_clean(str(tmp_path), "proton-1", now)                   # fresh "no"
+    assert not is_cf_clean(str(tmp_path), "proton-1")                        # bad timestamp: still a flag
     _cf(tmp_path / ".cf-state.proton-1", "yes", now - 60)
-    assert is_cf_clean(str(tmp_path), "proton-1", now)
+    assert is_cf_clean(str(tmp_path), "proton-1")
+
+
+def test_prefer_cf_clean_returns_the_clean_subset_or_everything(tmp_path: Path) -> None:
+    now = 1_800_000_000
+    cands = [("proton-1", 1), ("proton-2", 2), ("proton-3", 3)]
+    _cf(tmp_path / ".cf-state.proton-1", "no", now, "discord.com")
+    _cf(tmp_path / ".cf-state.proton-2", "yes", now)
+    # proton-3 has no verdict yet: eligible
+    assert prefer_cf_clean(cands, str(tmp_path)) == [("proton-2", 2), ("proton-3", 3)]
+    _cf(tmp_path / ".cf-state.proton-2", "no", now, "discord.com")
+    _cf(tmp_path / ".cf-state.proton-3", "no", now, "discord.com")
+    assert prefer_cf_clean(cands, str(tmp_path)) == cands                    # none clean: all
+    assert prefer_cf_clean([], str(tmp_path)) == []
+
+
+def test_pick_cf_filter_applies_even_without_the_playability_preference(tmp_path: Path) -> None:
+    now = 1_800_000_000
+    inst = _three_equal_slots(tmp_path, now)
+    _cf(tmp_path / ".cf-state.proton-1", "no", now - 10, "discord.com")
+    _cf(tmp_path / ".cf-state.proton-2", "no", now - 10, "discord.com")
+    got = pick_distributed(inst, str(tmp_path), {3: 5, 1: 0, 2: 0}, now=now, prefer_playable=False)
+    assert got == ("proton-3", 3)
 
 
 def _three_equal_slots(tmp_path: Path, now: int):
@@ -427,7 +447,7 @@ def test_pick_keeps_full_set_when_every_slot_is_challenged_and_gated(tmp_path: P
     assert pick_distributed(inst, str(tmp_path), {2: 0, 1: 5, 3: 5}, now=now) == ("proton-2", 2)
 
 
-def test_pick_cf_bias_only_narrows_within_scored_slots(tmp_path: Path) -> None:
+def test_pick_cf_filter_only_narrows_within_scored_slots(tmp_path: Path) -> None:
     now = 1_800_000_000
     inst = _three_equal_slots(tmp_path, now)
     _write_state(tmp_path / "proton-3.state", "degraded", 99.0, now)      # degraded stays out
@@ -435,16 +455,33 @@ def test_pick_cf_bias_only_narrows_within_scored_slots(tmp_path: Path) -> None:
     assert pick_distributed(inst, str(tmp_path), {}, now=now) == ("proton-2", 2)
 
 
-def test_cf_bias_is_off_in_advisory_tier(tmp_path: Path, monkeypatch) -> None:
-    """Shadow mode records verdicts but never acts, including on new-pin placement."""
+def test_prefer_cf_clean_keeps_flagged_candidates_when_cf_ok_is_not_required(
+        tmp_path: Path, monkeypatch) -> None:
+    now = 1_800_000_000
+    cands = [("proton-1", 1), ("proton-2", 2), ("proton-3", 3)]
+    _cf(tmp_path / ".cf-state.proton-1", "no", now, "discord.com")
+    _cf(tmp_path / ".cf-state.proton-2", "yes", now)
+    monkeypatch.setattr(dispatcher_logic, "CF_REQUIRED", False)
+    got = prefer_cf_clean(cands, str(tmp_path))
+    assert got == cands                                   # the flagged slot stays
+    assert got is not cands                               # a copy, not the input
+
+
+def test_pick_can_choose_a_flagged_slot_when_cf_ok_is_not_required(
+        tmp_path: Path, monkeypatch) -> None:
     now = 1_800_000_000
     inst = _three_equal_slots(tmp_path, now)
     _cf(tmp_path / ".cf-state.proton-1", "no", now - 10, "discord.com")
-    _cf(tmp_path / ".cf-state.proton-2", "no", now - 10, "discord.com")
-    monkeypatch.setattr(dispatcher_logic, "CF_BIAS", False)
-    assert pick_distributed(inst, str(tmp_path), {3: 5, 1: 0, 2: 0}, now=now) == ("proton-1", 1)
-    monkeypatch.setattr(dispatcher_logic, "CF_BIAS", True)
-    assert pick_distributed(inst, str(tmp_path), {3: 5, 1: 0, 2: 0}, now=now) == ("proton-3", 3)
+    loads = {1: 0, 2: 5, 3: 5}                            # proton-1 is least loaded
+    assert pick_distributed(inst, str(tmp_path), loads, now=now) == ("proton-2", 2)
+    monkeypatch.setattr(dispatcher_logic, "CF_REQUIRED", False)
+    assert pick_distributed(inst, str(tmp_path), loads, now=now) == ("proton-1", 1)
+
+
+def test_cf_required_one_rule() -> None:
+    # Same rule as checklib.sh (${PROTEUS_CF_TIER:-mandatory}): unset or empty is mandatory.
+    for value, want in [(None, True), ("", True), ("mandatory", True), ("advisory", False), ("bogus", False)]:
+        assert dispatcher_logic.cf_required(value) is want, value
 
 
 # --- pinning trusted sources -------------------------------------------------

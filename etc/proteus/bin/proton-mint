@@ -234,70 +234,47 @@ async def run(args: argparse.Namespace) -> int:
 
     user_tier = api.user_tier if api.user_tier is not None else 0
     pick = None
-    if args.target_entry:
-        # Step-down re-mint from rotate-slot.sh: exactly this physical server.
-        # The caller already verified it end to end, so match only on enabled
-        # + tier — never on load, streaming or country — across ALL logicals,
-        # not just the (possibly narrower) `cands` set below.
-        all_tier_physicals = [
-            (l, p) for l in sl.logicals if l.enabled and l.tier <= user_tier
-            for p in l.physical_servers if p.enabled and p.x25519_pk and p.entry_ip
-        ]
-        pick = next((c for c in all_tier_physicals if c[1].entry_ip == args.target_entry), None)
-        if not pick:
-            print(f"target entry {args.target_entry} is not in the current server list", file=sys.stderr)
-            return 2
-    else:
-        cands = mint_logic.candidate_servers(sl.logicals, args.country, args.streaming, user_tier,
-                                             ServerFeatureEnum.STREAMING)
-        use_legacy = True
-        if args.ledger:
-            try:
-                recs = ledger.load(args.ledger)
-                if recs:
-                    now = int(time.time())
-                    # Shadow tier (any value but "mandatory", the same rule
-                    # checklib.sh applies): the canaries are recorded and
-                    # displayed, and nothing else. An empty standard reduces
-                    # ledger.pool to "exits whose verdict passed", so a canary
-                    # nobody has calibrated yet cannot quietly steer which
-                    # exits get minted.
-                    mandatory = args.cf_tier == "mandatory"
-                    hosts = []
-                    if mandatory:
-                        hosts = [ledger.host_of(u) for u in ledger.canary_urls(args.canaries_file)]
-                        hosts = ledger.active_hosts(recs, hosts, now, args.quarantine_min_exits)
-                    # A 1005 is a ban on the whole hosting ASN, so the ledger's
-                    # 24h memory of individual IPs is the wrong unit: without
-                    # this, exploration keeps drawing fresh neighbours out of a
-                    # range that cannot pass, and the rotation ends all-fail.
-                    # In shadow mode only the operator's own checks can raise
-                    # one; a canary's 1005 is still just a canary opinion.
-                    banned = ledger.banned_prefixes(recs, now, canaries=mandatory)
-                    if banned:
-                        print(f"mint: {len(banned)} banned /16 ranges from 1005", file=sys.stderr)
-                    # The same range-level reasoning pointing the other way:
-                    # entry /16s that have produced a passing exit this week go
-                    # first among candidates the ledger knows nothing about, so
-                    # exploration starts where exits have actually come through.
-                    good = ledger.good_prefixes(recs, now)
-                    good24 = ledger.good_prefixes24(recs, now)
-                    pick = mint_logic.choose(
-                        cands, records=recs, hosts=hosts, now=now, attempt=args.attempt,
-                        sibling_entries=[e for e in args.exclude_endpoints.split(",") if e],
-                        banned_prefixes=banned, good_prefixes=good, good_prefixes24=good24,
-                        pool_target=args.pool_target, explore_p=args.explore,
-                        reuse_min_s=args.reuse_min_s, log=lambda m: print(m, file=sys.stderr))
-                    use_legacy = False
-                # else: empty or unreadable ledger — fall through to legacy.
-            except Exception as e:
-                print(f"ledger-aware selection failed: {e}; falling back to legacy pick", file=sys.stderr)
-                pick = None
-                use_legacy = True
-        if use_legacy:
-            # No --ledger, or empty/unreadable ledger, or ledger-aware
-            # selection blew up: legacy behaviour, unchanged.
-            pick = pick_server(sl, args.country, args.streaming, user_tier)
+    cands = mint_logic.candidate_servers(sl.logicals, args.country, args.streaming, user_tier,
+                                         ServerFeatureEnum.STREAMING)
+    use_legacy = True
+    if args.ledger:
+        try:
+            recs = ledger.load(args.ledger)
+            if recs:
+                now = int(time.time())
+                # The tier decides the canary standard and which 1005s ban a
+                # range; mint_logic.cf_mint_inputs says how. A 1005 is a ban
+                # on the whole hosting ASN, so the ledger's 24h memory of
+                # individual IPs is the wrong unit: without the range ban,
+                # exploration keeps drawing fresh neighbours out of a range
+                # that cannot pass, and the rotation ends all-fail.
+                canary_hosts = [ledger.host_of(u) for u in ledger.canary_urls(args.canaries_file)]
+                hosts, banned = mint_logic.cf_mint_inputs(
+                    recs, canary_hosts, now, args.quarantine_min_exits, args.cf_tier)
+                if banned:
+                    print(f"mint: {len(banned)} banned /16 ranges from 1005", file=sys.stderr)
+                # The same range-level reasoning pointing the other way:
+                # entry /16s that have produced a passing exit this week go
+                # first among candidates the ledger knows nothing about, so
+                # exploration starts where exits have actually come through.
+                good = ledger.good_prefixes(recs, now)
+                good24 = ledger.good_prefixes24(recs, now)
+                pick = mint_logic.choose(
+                    cands, records=recs, hosts=hosts, now=now, attempt=args.attempt,
+                    sibling_entries=[e for e in args.exclude_endpoints.split(",") if e],
+                    banned_prefixes=banned, good_prefixes=good, good_prefixes24=good24,
+                    pool_target=args.pool_target, explore_p=args.explore,
+                    reuse_min_s=args.reuse_min_s, log=lambda m: print(m, file=sys.stderr))
+                use_legacy = False
+            # else: empty or unreadable ledger — fall through to legacy.
+        except Exception as e:
+            print(f"ledger-aware selection failed: {e}; falling back to legacy pick", file=sys.stderr)
+            pick = None
+            use_legacy = True
+    if use_legacy:
+        # No --ledger, or empty/unreadable ledger, or ledger-aware
+        # selection blew up: legacy behaviour, unchanged.
+        pick = pick_server(sl, args.country, args.streaming, user_tier)
     if not pick:
         print(f"no servers matched country={args.country} streaming={args.streaming} tier={user_tier}",
               file=sys.stderr)
@@ -387,15 +364,14 @@ def main() -> int:
     p.add_argument("--canaries-file", default=ledger.DEFAULT_CANARIES_FILE)
     p.add_argument("--quarantine-min-exits", type=int, default=8)
     p.add_argument("--cf-tier", default="mandatory",
-                   help="anything but 'mandatory' is advisory: canary verdicts, including "
-                        "their 1005s, stay out of the draw (shadow rollout)")
+                   help="mandatory or advisory; anything but 'mandatory' is advisory: the canary "
+                        "verdicts, their 1005s included, stay out of the draw")
     p.add_argument("--exclude-endpoints", default="",
                    help="comma-separated entry IPs held by this slot and its siblings")
     p.add_argument("--attempt", type=int, default=1, help="verdict-attempt number (odd attempts explore)")
     p.add_argument("--pool-target", type=int, default=20)
     p.add_argument("--explore", type=float, default=0.5)
     p.add_argument("--reuse-min-s", type=int, default=604800)
-    p.add_argument("--target-entry", default=None, help="mint exactly this entry IP (step-down)")
     args = p.parse_args()
 
     try:

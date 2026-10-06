@@ -262,7 +262,7 @@ def banned_prefixes(records, now: int, window_s: int = 7 * 86400, canaries: bool
     connects; banned_exit_prefixes reports the other side. Seven days, because
     a whole-ASN ban is a policy decision that outlives the 24h the
     individual-IP memory keeps. `canaries=False` counts only the operator's
-    own checks, for the advisory tier.
+    own checks.
     """
     return _banned(records, now, window_s, canaries, "entry_ip")
 
@@ -279,8 +279,7 @@ def good_prefixes(records, now: int, window_s: int = 7 * 86400) -> set[str]:
     range, not the individual address, so a range one exit already got through
     is a better place to explore than one nothing has ever come out of. Only
     gate and live records count, and only with verdict=pass — a promote record
-    is written for every promotion including a step-down, so it is not evidence
-    the range passes anything.
+    says the exit went live, not which canaries it passed.
     """
     out: set = set()
     for r in records:

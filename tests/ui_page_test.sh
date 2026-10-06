@@ -36,6 +36,17 @@ assert_eq "$r" ok "a displayed pairing suppresses the settings redraw"
 grep -qF '"done, hide this"' "$PAGE" && r=ok || r=fail
 assert_eq "$r" ok "and the operator's own action is what clears it"
 
+# cf ok is a setting: the page words the advisory case and hides the all-flagged
+# banner there. A rename would otherwise pass every other check.
+grep -qF 'cf ok is not required, so this tunnel still takes new clients.' "$PAGE" && r=ok || r=fail
+assert_eq "$r" ok "the flagged badge tooltip has an advisory wording"
+grep -qF 'std.tier!=="advisory"&&px.length' "$PAGE" && r=ok || r=fail
+assert_eq "$r" ok "the no-cf-ok banner is gated on the mandatory tier"
+grep -qF 'std.attainable&&std.tier!=="advisory"' "$PAGE" && r=ok || r=fail
+assert_eq "$r" ok "the not-attainable banner is gated on the mandatory tier"
+grep -qF '"cf ok not required":"cf ok required"' "$PAGE" && r=ok || r=fail
+assert_eq "$r" ok "the summary bar says whether cf ok is required"
+
 # Syntax check. The page has no build step, so an error here would otherwise
 # reach the gateway and blank the panel for everyone.
 python3 -c '

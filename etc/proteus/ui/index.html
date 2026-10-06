@@ -118,6 +118,7 @@ text-transform:uppercase;letter-spacing:.5px;white-space:nowrap;max-width:100%;
 overflow:hidden;text-overflow:ellipsis;cursor:default}
 .cfb.ok{color:var(--mut)}
 .cfb.bad{color:var(--warn);border-color:var(--warn)}
+.cfb.unk{color:var(--mut);border-style:dashed}
 .bannerw{border:1px solid var(--warn);color:var(--warn);padding:6px 10px;margin:8px 0;font-size:12px}
 .cstat{color:var(--dim);font-size:10px;white-space:nowrap}
 .cstat.q{color:var(--warn)}
@@ -229,7 +230,7 @@ function serverName(s){ // "US-TX #97" from "US-TX#97"
 /* --- overview --- */
 function renderSummary(){
   const sys=S.system,sb=$("sumbar");
-  const rot=S.slots.filter(s=>/^proton-[1-9]$/.test(s.name));
+  const rot=S.slots.filter(s=>/^proton-\d+$/.test(s.name));
   const healthy=rot.filter(s=>s.status==="ok").length;
   const clients=(S.clients||[]).length;
   const parts=[
@@ -240,7 +241,9 @@ function renderSummary(){
   ];
   const pool=S.pool||{},std=S.standard||{};
   if(pool.target!=null)parts.push(["known-good exits",`${pool.known_good}/${pool.target} · ${pool.distinct_exits_7d} distinct 7d`,pool.known_good>=pool.target?"ok":"warn"]);
-  if(std.size!=null)parts.push(["cloudflare standard",std.attainable?`${std.size} canaries · ${std.tier}`:"not attainable",std.attainable?"ok":"warn"]);
+  // In advisory the standard is empty (size 0), so count the canaries that run.
+  const nCan=std.tier==="advisory"?((S.checks&&S.checks.canaries)||[]).length:std.size;
+  if(std.size!=null)parts.push(["cloudflare standard",std.attainable?`${nCan} canaries · ${std.tier==="advisory"?"cf ok not required":"cf ok required"}`:"not attainable",std.attainable?"ok":"warn"]);
   const tr=S.trusted||{};
   if(tr.cidrs&&tr.cidrs.length)parts.push(["udm tunnel",
     tr.tunnel_up?(tr.pinned||0)+" pinned":"down", tr.tunnel_up?"ok":"bad"]);
@@ -254,7 +257,11 @@ function renderSummary(){
     sb.append(st);
   });
   const b=$("cfbanner");const msgs=[];
-  if(std.size!=null&&!std.attainable)msgs.push(`Cloudflare standard not attainable: ${std.passing_exits_24h} exit(s) met it in 24h; canary rotations are on hold.`);
+  if(std.size!=null&&!std.attainable&&std.tier!=="advisory")msgs.push(`Cloudflare standard not attainable: ${std.passing_exits_24h} exit(s) met it in 24h; canary rotations are on hold.`);
+  // Same slot list as the exit cards (rot), so the DNS tunnel does not count.
+  const px=rot.filter(s=>s.status!=="down");
+  if(std.tier!=="advisory"&&px.length&&px.every(s=>s.cf&&s.cf.clean===false))
+    msgs.push("No tunnel is cf ok. New clients use flagged tunnels until one gets a clean exit.");
   (S.canary_stats||[]).filter(c=>c.quarantined).forEach(c=>msgs.push(`${c.host} blocks every exit seen (${c.exits_seen_24h}); quarantined until one passes.`));
   b.className=msgs.length?"bannerw":"hidden";b.textContent=msgs.join("  ");
 }
@@ -273,10 +280,20 @@ function exitCard(s){
     // count and hang the list off the tooltip.
     const f=s.cf.failing||[];
     const cb=el("span","cfb bad",f.length?`cf ${f.length} flagged`:"cf challenged");
-    if(f.length)cb.title="Cloudflare flagged this exit on: "+f.join(", ");
+    const adv=((S.standard||{}).tier)==="advisory";
+    cb.title=(f.length?"Cloudflare flagged this exit on: "+f.join(", ")+". ":"")+(adv
+      ?"cf ok is not required, so this tunnel still takes new clients."
+      :"New clients go to a tunnel that is cf ok, if one is.");
     top.append(cb);
   }
   else if(s.cf&&s.cf.clean===true)top.append(el("span","cfb ok","cf ok"));
+  else if(s.status!=="down"){
+    const cb=el("span","cfb unk","cf unchecked");
+    const lc=((S.knobs&&S.knobs.values)||{}).PROTEUS_LIVECHECK;
+    cb.title=lc==="off"?"No Cloudflare verdict yet. Live checks are off, so the next rotation gives one."
+      :"No Cloudflare verdict yet. The next live check gives one.";
+    top.append(cb);
+  }
   c.append(top);
   // server
   c.append(el("div","server",s.rotating?"rotating…":serverName(s)));
@@ -315,12 +332,12 @@ function exitCard(s){
 }
 
 function renderExits(){
-  const rot=S.slots.filter(s=>/^proton-[1-9]$/.test(s.name));
+  const rot=S.slots.filter(s=>/^proton-\d+$/.test(s.name));
   $("exits").replaceChildren(...rot.map(exitCard));
 }
 
 function renderDns(){
-  const d=S.slots.find(s=>!/^proton-[1-9]$/.test(s.name));
+  const d=S.slots.find(s=>!/^proton-\d+$/.test(s.name));
   const box=$("dns");box.replaceChildren();
   if(!d){box.append(el("span","dim","no dns tunnel"));return;}
   // The DNS tunnel has no per-slot health prober (it rotates on resolver
@@ -483,8 +500,9 @@ function renderChecks(root){
   // Cloudflare canaries (editable): judged only on Cloudflare's verdict.
   g.append(el("div","subh","Cloudflare canaries"));
   g.append(el("div","kh","Sites behind Cloudflare, probed from every new exit and from live exits. "+
-    "A challenge page or a 1xxx block on any of them flags the exit. The tier is the "+
-    "\u201cCloudflare canaries\u201d setting under Quality gates. Pass rate is over distinct exits in the last 24h."));
+    "A challenge page or a 1xxx block on any of them flags the exit. The \u201cRequire cf ok\u201d setting "+
+    "under Quality gates decides whether a flag acts. With the setting at mandatory, a flagged exit is never promoted, and a "+
+    "flagged live tunnel gets no new clients until it has a clean exit. Pass rate is over distinct exits in the last 24h."));
   const stats={};(S.canary_stats||[]).forEach(x=>stats[x.host]=x);
   const cl=el("div","clist");
   const addCanaryRow=(url)=>{

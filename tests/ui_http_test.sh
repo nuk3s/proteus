@@ -33,8 +33,24 @@ printf 'STATUS=ok\nCOMPOSITE_SCORE=81\nSCORE_UPDATED_AT=%s\n' "$(date +%s)" > "$
   echo '{"ts":3,"slot":"proton-1","old_logical":"B","new_logical":"C","trigger":"manual","outcome":"promoted","attempts":2}'
 } > "$TMP/run/rotation-history.jsonl"
 
+# A stub systemctl first on PATH. `systemctl is-active` prints the state in
+# $TMP/unit-state. For a oneshot unit that still runs it prints "activating"
+# and exits 3, like the real one (checked on systemd 258).
+mkdir -p "$TMP/bin"
+cat > "$TMP/bin/systemctl" <<STUB
+#!/usr/bin/env bash
+if [[ "\$1" == is-active ]]; then
+  cat "$TMP/unit-state"
+  [[ "\$(cat "$TMP/unit-state")" == active ]] && exit 0
+  exit 3
+fi
+exit 0
+STUB
+chmod +x "$TMP/bin/systemctl"
+echo inactive > "$TMP/unit-state"
+
 PORT=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')
-PROTEUS_UI_SECRETS="$TMP/secrets" PROTEUS_UI_PORT="$PORT" \
+PATH="$TMP/bin:$PATH" PROTEUS_UI_SECRETS="$TMP/secrets" PROTEUS_UI_PORT="$PORT" \
   PROTEUS_UI_STATE_DIR="$TMP/state" PROTEUS_UI_HEALTH_DIR="$TMP/health" PROTEUS_UI_RUN_DIR="$TMP/run" \
   python3 "$ROOT/etc/proteus/bin/proteus-ui" >"$TMP/srv.log" 2>&1 &
 SRV=$!
@@ -85,7 +101,29 @@ assert slot["name"] == "proton-1" and slot["logical"] == "US-TX#97" and slot["ex
 assert slot["status"] == "ok" and slot["health"]["score"] == "81" and slot["health"]["stale"] is False, slot
 assert slot["endpoint_ip"] == "192.0.2.10", slot
 print("  ✓ history newest-first with the torn row dropped; slot merges .state + .meta + health")
+# The cf ok tier travels with the status: the standard block and the listed canaries agree.
+tier = s["standard"]["tier"]
+assert tier in ("mandatory", "advisory"), tier
+canaries = [c for c in s["checks"]["builtin"] if c.get("canary")]
+assert canaries and all(c["tier"] == tier for c in canaries), canaries
+assert any(k["key"] == "PROTEUS_CF_TIER" for k in s["knobs"]["schema"]), "knob missing"
+print("  ✓ status carries the cf ok tier and lists the canaries at it")
 PY
+
+echo "a rotation that is still running shows as rotating and answers 409"
+rotating() {
+  code "${AUTH[@]}" "$U/api/status" >/dev/null
+  python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["slots"][0]["rotating"])' "$TMP/body"
+}
+echo activating > "$TMP/unit-state"
+assert_eq "$(rotating)" "True" "oneshot unit in state activating -> slot is rotating"
+assert_eq "$(post "${AUTH[@]}" -d '{"action":"rotate","slot":"proton-1"}' "$U/api/action")" "409" "rotate while activating -> 409"
+echo active > "$TMP/unit-state"
+assert_eq "$(rotating)" "True" "unit in state active (exit 0) -> slot is rotating"
+echo inactive > "$TMP/unit-state"
+assert_eq "$(rotating)" "False" "unit in state inactive -> slot is not rotating"
+# The broker socket does not exist here, so a rotate that passes the guard is a clean 400.
+assert_eq "$(post "${AUTH[@]}" -d '{"action":"rotate","slot":"proton-1"}' "$U/api/action")" "400" "rotate while inactive passes the guard"
 
 echo "the daemon logged no traceback for any of the above"
 grep -q 'Traceback' "$TMP/srv.log" && r=traceback || r=clean

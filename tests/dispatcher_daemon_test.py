@@ -96,6 +96,29 @@ def test_request_reload_is_applied_by_janitor(monkeypatch):
     assert d._instances == []
 
 
+def test_pick_fallbacks_prefer_a_cf_ok_slot(monkeypatch):
+    """With no fresh score the daemon picks at random among healthy slots, and
+    with every slot degraded among all of them. Both draws keep a flagged slot
+    out while another slot is cf ok."""
+    sd = _state_dir("proton-1", "proton-2", "proton-3")
+    hd = tempfile.mkdtemp()
+    monkeypatch.setattr(dispatcher, "STATE_DIR", sd)
+    monkeypatch.setattr(dispatcher, "HEALTH_DIR", hd)
+    _quiet(monkeypatch)
+    for n in ("proton-1", "proton-3"):
+        Path(hd, f".cf-state.{n}").write_text("CF_CLEAN=no\nAT=1\nFAILING=discord.com\n")
+    d = dispatcher.Dispatcher()
+    # No health files: no fresh score, every slot healthy -> fallback 2.
+    assert {d.pick() for _ in range(40)} == {("proton-2", 2)}
+    # Every slot degraded -> fallback 3.
+    for n in ("proton-1", "proton-2", "proton-3"):
+        Path(hd, f"{n}.state").write_text("STATUS=degraded\nCOMPOSITE_SCORE=0\nSCORE_UPDATED_AT=1\n")
+    assert {d.pick() for _ in range(40)} == {("proton-2", 2)}
+    # Every slot flagged: a flagged exit beats none.
+    Path(hd, ".cf-state.proton-2").write_text("CF_CLEAN=no\nAT=1\nFAILING=discord.com\n")
+    assert {d.pick() for _ in range(60)} == {("proton-1", 1), ("proton-2", 2), ("proton-3", 3)}
+
+
 def test_pending_reloads_run_one_at_a_time(monkeypatch):
     """The janitor and the NFQUEUE callback can both apply a pending reload.
     Two at once were last-writer-wins: the one that read the state files first

@@ -31,6 +31,21 @@ def slash24(ip: str) -> str:
 slash16 = ledger.slash16
 
 
+def cf_mint_inputs(records, canary_hosts, now: int, quarantine_min_exits: int,
+                   tier: str) -> tuple[list, set]:
+    """(hosts, banned) for choose(): the canary standard and the entry /16s that
+    a Cloudflare 1005 banned. Any tier other than "mandatory" is advisory, the
+    same rule checklib.sh applies. In advisory the canaries are recorded and
+    shown, and they must not steer which exits get minted. So the standard is
+    empty, which makes ledger.pool keep every exit whose verdict passed. Only
+    the operator's own checks can raise a ban, because a canary's 1005 is a
+    canary verdict too."""
+    if (tier or "mandatory") != "mandatory":
+        return [], ledger.banned_prefixes(records, now, canaries=False)
+    hosts = ledger.active_hosts(records, list(canary_hosts), now, quarantine_min_exits)
+    return hosts, ledger.banned_prefixes(records, now)
+
+
 def candidate_servers(logicals, country: str, require_streaming: bool, user_tier: int,
                       streaming_feature) -> list:
     """Every enabled physical of every logical that matches country, tier,

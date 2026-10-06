@@ -6,7 +6,7 @@
   <img src="https://img.shields.io/badge/gateway-transparent%20L3-E0883C?style=flat-square&labelColor=1B1815">
   <img src="https://img.shields.io/badge/tunnels-Proton%20WireGuard-D7A55F?style=flat-square&labelColor=1B1815">
   <img src="https://img.shields.io/badge/OS-Debian%2013-7E7A46?style=flat-square&labelColor=1B1815">
-  <img src="https://img.shields.io/badge/tests-1706%20passing-7E8A4E?style=flat-square&labelColor=1B1815">
+  <img src="https://img.shields.io/badge/tests-1726%20passing-7E8A4E?style=flat-square&labelColor=1B1815">
   <img src="https://img.shields.io/badge/deps-bash%20%2B%20python3-8F8A7A?style=flat-square&labelColor=1B1815">
 </p>
 
@@ -78,6 +78,48 @@ video to. Mandatory checks reject the exit; advisory ones are recorded and don't
 Screenshots are rendered from synthetic data: exit addresses are RFC 5737 documentation ranges,
 client addresses are the project's default RFC 1918 client VLAN (`172.16.1.0/24`).
 
+## The cf ok rule
+
+Many sites sit behind Cloudflare. Cloudflare scores the address a request comes from. When it does
+not trust a VPN exit, it shows a challenge page or a block page in place of the site. For a device
+on the VLAN that exit is broken, even if its latency and throughput are good.
+
+Proteus checks for this. It loads a few canary sites that sit behind Cloudflare (Discord,
+DigitalOcean and Patreon by default, set in `/etc/proteus/canaries.json`). It does this from every
+candidate exit before promotion, and from each live exit in turn, about every 17 minutes with five
+tunnels. An exit is "cf ok" when no canary challenges or blocks it. Each tunnel card in the panel
+shows `cf ok`, `cf N flagged` or `cf unchecked`.
+
+The setting is "Require cf ok" under Quality gates (`PROTEUS_CF_TIER`). It is on by default
+(`mandatory`):
+
+- A candidate that fails a canary is never promoted. If no candidate passes, the rotation ends and
+  the current exit stays.
+- When a live tunnel is flagged, it gets no new clients from that moment. Devices already pinned to
+  it stay until a rotation gives it a clean exit, so they change address once.
+- A flag gets a second check at the next live-check turn, about three and a half minutes later.
+  Two flags in a row start a rotation, at most one per tunnel per hour.
+- If no tunnel is cf ok, new clients still get a tunnel and the panel shows a banner. A flagged
+  exit is better than no connection.
+
+Set it to `advisory` and the canaries still run and the badges still show, but nothing acts on
+them. Use that while you tune your own canary list, or if your exits cannot meet the standard.
+
+I made it the default because the measurements showed the margin to do it. Until October 2026 a
+fallback called step-down promoted the best candidate that failed only the canaries when no clean
+one turned up. I needed it while I calibrated the canaries and did not know yet how many Proton
+exits could pass. In the 25 days before the change, step-down promoted 5 flagged exits, the last
+one on 24 September. About 90 different exits met the standard in a week, against a target pool of
+20. Each tunnel was flagged for 0.2 to 1.8 percent of that week. So step-down is gone: if no clean
+exit turns up, I want the rotation to fail and say so. The off switch stays for a setup where the
+standard is out of reach.
+
+I left pinned devices where they are because a change of address in the middle of a session breaks
+it. A device that holds a long TLS session, such as a printer that talks to its cloud service, drops
+that session when its exit changes. One change, at the rotation, is the minimum. The second check
+is there for the same reason: some challenges clear on the next request, and a rotation on a single
+flag would move those devices for nothing.
+
 ## What keeps it from stranding you
 
 The install is the dangerous part. It rewrites the firewall and routing on a box you may only reach over SSH. Proteus assumes that and builds in the recovery.
@@ -94,10 +136,10 @@ Everything installs under `/etc/proteus/` and runs as `proteus-*` systemd units.
 
 | Component | Job |
 |-----------|-----|
-| `dispatcher.py` | NFQUEUE consumer. Per-source pinning, conntrack-backed stickiness, health-aware slot selection. |
-| `rotate-slot.sh` | Mint → stage → handshake → egress → reputation → streaming gate → promote, up to 5 attempts. Old slot stays live until the new one passes. |
+| `dispatcher.py` | NFQUEUE consumer. Per-source pinning, conntrack-backed stickiness, slot selection that skips unhealthy and flagged exits. |
+| `rotate-slot.sh` | Mint → stage → handshake → egress → reputation and canaries → streaming gate → promote, up to 8 verdict attempts. Old slot stays live until the new one passes. |
 | `proton-mint` | Registers a WireGuard key against a cached Proton session and picks a streaming-friendly US exit. |
-| `slot-warmup.sh` | Keeps each exit's Proton-side flow state warm and scores slots on latency, jitter, and throughput. Triggers an unscheduled rotation for a slot that keeps failing. |
+| `slot-warmup.sh` | Keeps each exit's Proton-side flow state warm, scores slots on latency, jitter, and throughput, and re-checks the canaries on live exits. Triggers an unscheduled rotation for a slot that keeps failing. |
 | `rotate-dns.sh` / `dns-latency-check.sh` | Run and health-check the dedicated DNS tunnel; re-mint it when the DNS path degrades. |
 | nftables kill-switch | Default-drop egress with a narrow allow-list, plus the `@vpn_dispatch` / `@wg_peers` / `@proton_api` sets the dispatcher and rotation maintain. |
 

@@ -94,10 +94,13 @@ def timer_next(slot: str) -> int | None:
 
 
 def unit_active(slot: str) -> bool:
+    """True while a rotation of `slot` runs. `systemctl is-active` exits 3
+    for a oneshot unit that is still running ("activating"), so read the
+    state it prints, not its exit status."""
     try:
-        r = subprocess.run(["systemctl", "is-active", "--quiet",
-                            f"proteus-rotate-slot@{slot}.service"], timeout=10)
-        return r.returncode == 0
+        r = subprocess.run(["systemctl", "is-active", f"proteus-rotate-slot@{slot}.service"],
+                           capture_output=True, text=True, timeout=10)
+        return r.stdout.strip() in ("active", "activating", "deactivating", "reloading")
     except Exception:
         return False
 
@@ -158,7 +161,7 @@ def status() -> dict:
     # runs: canary_urls drops bad entries, dedupes and truncates to MAX_CANARIES,
     # where parse_canaries is all-or-nothing (that is the broker's job).
     canaries = ledger.canary_urls(CANARIES_FILE)
-    cf_tier = env.get("PROTEUS_CF_TIER") or "mandatory"
+    cf_tier = ui_logic.cf_tier(env.get("PROTEUS_CF_TIER"))
     live_slots = sum(1 for s in slots if s["name"].startswith("proton-"))
     # /sys rather than `wg show`: the UI daemon is unprivileged by design, and
     # interface presence is the part it can see for itself. The handshake age
@@ -168,7 +171,7 @@ def status() -> dict:
         trusted.load(TRUSTED_FILE), tunnel_up, HEALTH_DIR, disp.get("pins", []))
     led = ui_logic.ledger_view(LEDGER_FILE, CANARIES_FILE, int(now), max(1, live_slots),
                                _int(env.get("PROTEUS_MINT_POOL_TARGET"), 20),
-                               _int(env.get("PROTEUS_CF_QUARANTINE_MIN_EXITS"), 8))
+                               _int(env.get("PROTEUS_CF_QUARANTINE_MIN_EXITS"), 8), cf_tier)
     return {
         "generated_at": int(now),
         "system": {

@@ -396,7 +396,7 @@ def test_good_prefixes_ignores_failures_and_promotions() -> None:
     chal = [rec(NOW - 100, "10.60.1.2", entry_ip="10.90.1.1", verdict="fail",
                 canaries={"discord.com": "challenge", "www.patreon.com": "clean"})]
     assert ledger.good_prefixes(chal, NOW) == set()
-    # promote records are written for step-downs too, so they prove nothing.
+    # promote records say an exit went live, not which canaries it passed.
     promo = [rec(NOW - 100, "10.60.1.2", entry_ip="10.130.4.4", source="promote")]
     assert ledger.good_prefixes(promo, NOW) == set()
 

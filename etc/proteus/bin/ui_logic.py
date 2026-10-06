@@ -120,32 +120,24 @@ KNOBS = {k.key: k for k in [
               "working — otherwise they keep serving until their next daily rotation."),
     Knob("PROTEUS_CF_TIER", "gates", "str", choices=("mandatory", "advisory"),
          applies="next rotation and next live check", kick="proteus-dispatcher.service",
-         label="Cloudflare canaries", unit="", default="mandatory",
-         help="Canary sites behind Cloudflare are probed from every new exit and from live "
-              "exits. mandatory: an exit that Cloudflare challenges or hard-blocks on any "
-              "canary is never promoted, and a live exit that starts failing is rotated out. "
-              "advisory: verdicts are recorded and shown but never act (shadow mode)."),
-    Knob("PROTEUS_CF_FALLBACK", "gates", "str", choices=("step-down", "strict"),
-         applies="next rotation",
-         label="If no candidate meets the standard", unit="", default="step-down",
-         help="step-down: promote the best candidate that passed everything except the "
-              "canaries, mark it, and retry later. strict: leave the current exit in place "
-              "(the rotation reports all-fail)."),
+         label="Require cf ok", unit="", default="mandatory",
+         help="mandatory (default): a tunnel must be cf ok. A candidate that fails a canary "
+              "is never promoted. A flagged tunnel gets no new clients and is replaced. "
+              "advisory: the canaries still run and the badges still show, but nothing acts on them."),
     Knob("PROTEUS_LIVECHECK", "gates", "str", choices=("on", "off"), applies="next warmup pass",
          label="Keep checking canaries after go-live", unit="", default="on",
          help="Re-test live exits against the canaries and your mandatory checks about "
-              "every 15 minutes and rotate one that keeps failing."),
+              "every 15 minutes. With Require cf ok set to mandatory, a tunnel that fails a canary gets no new "
+              "clients at once, is re-checked at the next turn (about 4 minutes) and is rotated "
+              "if it fails again."),
     Knob("PROTEUS_LIVECHECK_FAILS", "gates", "int", 1, 10, applies="next warmup pass",
          label="Live-check failures before rotating", unit="fails", default="2",
-         help="Consecutive failures of one canary or check before the exit is rotated. "
-              "Cloudflare challenges are often transient; two (about 30 minutes) avoids churn."),
+         help="Consecutive failures of one check before the exit is rotated. In advisory a "
+              "canary never rotates an exit. With Require cf ok set to mandatory, a flagged tunnel "
+              "is re-checked at the next turn, so two failures take about 4 minutes."),
     Knob("PROTEUS_LIVECHECK_ROT_COOLDOWN", "gates", "int", 300, 86400, applies="next warmup pass",
          label="Min time between live-check rotations", unit="s", default="3600",
          help="Per exit, shared with the streaming re-check."),
-    Knob("PROTEUS_CF_STEPDOWN_RETRY_S", "gates", "int", 3600, 172800, applies="next warmup pass",
-         label="Retry a stepped-down exit after", unit="s", default="21600",
-         help="An exit promoted below the standard is left alone this long before the "
-              "live check may rotate it again."),
     Knob("PROTEUS_PROTON_COUNTRY", "proton-dns", "str", pattern=r"^[A-Z]{2}$", applies="next rotation",
          label="Exit country", unit="", default="US",
          help="Two-letter country code for newly-minted Proton exit servers (e.g. US, CH, NL)."),
@@ -511,14 +503,25 @@ def parse_canaries(text: str) -> list[str]:
     return [c["url"] for c in clean] if ok else list(ledger.DEFAULT_CANARIES)
 
 
+def cf_tier(value: str | None) -> str:
+    """The PROTEUS_CF_TIER rule shared with checklib.sh (${PROTEUS_CF_TIER:-mandatory}):
+    unset or empty is mandatory, anything but "mandatory" is advisory."""
+    return "mandatory" if (value or "mandatory") == "mandatory" else "advisory"
+
+
 def builtin_checks(cf_tier: str, canary_urls: list[str]) -> list[dict]:
     """BUILTIN_CHECKS plus the canaries at the configured tier, for display."""
     return BUILTIN_CHECKS + [{"url": u, "tier": cf_tier, "canary": True} for u in canary_urls]
 
 
 def ledger_view(records_path: str, canaries_path: str, now: int, slots: int,
-                target: int, min_exits: int) -> dict:
+                target: int, min_exits: int, tier: str = "mandatory") -> dict:
     """Ledger rollup for /api/status: {"standard","canaries","pool"}.
+
+    In advisory the canaries gate nothing, so the standard numbers (size,
+    attainable, passing exits) and the known-good pool use an empty standard,
+    as proteus-cf-report and proton-mint do. Canary stats and quarantine
+    still use the full basket.
 
     The ledger is append-only JSONL written by the probes, not by this daemon,
     so a record that is valid JSON but the wrong shape ({"canaries":"boom"},
@@ -529,7 +532,16 @@ def ledger_view(records_path: str, canaries_path: str, now: int, slots: int,
     """
     try:
         hosts = [ledger.host_of(u) for u in ledger.canary_urls(canaries_path)]
-        return ledger.status(ledger.load(records_path), hosts, now, slots, target, min_exits)
+        records = ledger.load(records_path)
+        st = ledger.status(records, hosts, now, slots, target, min_exits)
+        if cf_tier(tier) != "mandatory":
+            st["standard"].update({
+                "size": 0,
+                "attainable": ledger.attainable(records, [], now, slots),
+                "passing_exits_24h": len(ledger.pool(records, [], now, ttl_s=86400)),
+            })
+            st["pool"]["known_good"] = len(ledger.pool(records, [], now))
+        return st
     except Exception as e:  # noqa: BLE001 — the panel outlives a bad ledger line
         _log.warning("ledger unreadable (%s): %s", records_path, e)
         return {"standard": {}, "canaries": [], "pool": {}}

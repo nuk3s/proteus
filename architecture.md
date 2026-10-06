@@ -91,16 +91,40 @@ challenge is what a client on a bad exit actually experiences. So:
   all five, patreon three, udemy two. udemy left the default basket on
   2026-09-04: it challenges about 90% of Proton exits and flags rejected and
   accepted candidates at the same rate, so it costs a probe per exit and tells
-  the two apart no better than a coin. `PROTEUS_CF_TIER` makes the basket
-  mandatory (default) or advisory (shadow mode: recorded, never acts).
+  the two apart no better than a coin. `PROTEUS_CF_TIER` ("Require cf ok" in
+  the UI) decides what a canary verdict does. With `mandatory`, the default,
+  every active canary gates and "cf ok" is required. With `advisory` the
+  canaries run and the badges show, but nothing acts on them: the gate does not
+  reject on a canary, mint does not steer by canary results, the dispatcher
+  keeps flagged slots eligible, and a live check never rotates on a canary.
+  Set it in the UI or in `proteus-local.env`: `rotate-slot.sh` and
+  `reputation-probe.sh` do not read `proteus.env`.
 - `slot-warmup.sh` re-runs the canaries and the mandatory custom checks on
   promoted slots (one slot every 20 passes, offset from the streaming check) and
   rotates a slot after two consecutive failures of one check, behind a shared
-  per-slot cooldown. It never touches the health score or existing pins; the
-  dispatcher only steers new pins away via `.cf-state.<slot>`. Each live check
-  runs as its own oneshot unit, `proteus-livecheck@<slot>.service` (started
-  from the warmup pass with `--no-block`), so a slow canary run never stalls
-  the ten-second warmup, and it skips itself while that slot is rotating.
+  per-slot cooldown. The first flagged canary writes `CF_CLEAN=no` to
+  `.cf-state.<slot>`. With cf ok required, from then on the dispatcher gives
+  the slot no new clients on every pick path. When no slot is cf ok, new clients use a flagged
+  slot. A flag holds until a newer verdict replaces it. Existing pins stay
+  until the rotation. A run writes a verdict only from an observation: a run
+  with an unreachable canary and no flagged canary leaves the verdict as it was.
+  With cf ok required, a slot with no verdict, or with a flag, gets a quick
+  check at the next live-check turn, about 200 s later, beside the round-robin
+  slot. So a flag is
+  confirmed or cleared in one turn. The canary streak counts flags and
+  unreachable results. It caps the quick checks per exit at
+  `PROTEUS_LIVECHECK_FAILS`. A slot that is rotating gets none. With
+  `PROTEUS_LIVECHECK=off` nothing can confirm a flag, so each warmup pass
+  removes a `CF_CLEAN=no` verdict. A live check never touches the health score.
+  Each live check runs as its own oneshot unit,
+  `proteus-livecheck@<slot>.service` (started from the warmup pass with
+  `--no-block`), so a slow canary run never stalls the ten-second warmup, and
+  it skips itself while that slot is rotating. The rotation guards in
+  `slot-warmup.sh` and the UI read the state that `systemctl is-active` prints
+  for `proteus-rotate-slot@<slot>.service`, because it exits 3 for a running
+  oneshot unit.
+- The web UI shows `cf ok`, `cf N flagged` or `cf unchecked` on each tunnel
+  card. With cf ok required, a banner shows when no running tunnel is cf ok.
 - Every verdict lands in `/etc/proteus/state/exit-ledger.jsonl`, keyed by exit
   and entry IP. `proton-mint` uses it: load is a filter, not a ranking; odd
   rotation attempts explore servers with no history until the known-good pool
@@ -113,9 +137,12 @@ challenge is what a client on a bad exit actually experiences. So:
   exit passes across 8 distinct exits is quarantined (probed, not counted). When
   fewer exits than slots met the standard in 24 h the standard is "not
   attainable" and canary-triggered live rotations pause. When a rotation
-  exhausts its verdict attempts, it steps down to the best candidate that
-  passed everything except the canaries, marks it, and retries six hours later
-  (`PROTEUS_CF_FALLBACK=strict` restores the old all-fail behaviour).
+  exhausts its verdict attempts it ends all-fail and the current exit stays.
+  With cf ok required, a candidate that fails a canary is never promoted. A flagged slot then keeps
+  its place with no new clients, and the next confirmed flag after the cooldown
+  starts the next attempt. A promotion writes the verdict its gate observed:
+  flagged when a canary challenged or blocked it (possible only in advisory),
+  cf ok when every active canary was clean, unchecked when one was unreachable.
 - `rotate-slot.sh` now counts only verdict failures against `MAX_ATTEMPTS`;
   mint errors, endpoint collisions and staging or egress transients no longer
   burn an attempt (the loop is bounded at 14 iterations regardless). With

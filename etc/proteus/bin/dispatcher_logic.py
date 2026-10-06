@@ -207,12 +207,17 @@ def pick_by_score(
 # before this module is imported).
 SPREAD_BAND = float(os.environ.get("PROTEUS_SPREAD_BAND", "40.0"))
 
-# Shadow mode: with PROTEUS_CF_TIER=advisory the Cloudflare verdict is recorded
-# and displayed but never acts, including on new-pin placement. Read at import
-# like SPREAD_BAND (dispatcher.py loads proteus.env / proteus-local.env into the
-# environment first); the UI knob restarts the dispatcher when it changes.
-CF_BIAS = os.environ.get("PROTEUS_CF_TIER", "mandatory") == "mandatory"
+def cf_required(value: str | None) -> bool:
+    """One tier rule for every component: unset or empty is mandatory (checklib.sh
+    uses ${PROTEUS_CF_TIER:-mandatory}); any other value than "mandatory" is advisory."""
+    return (value or "mandatory") == "mandatory"
 
+
+# Whether "cf ok" is required for new clients. PROTEUS_CF_TIER=mandatory (the
+# default) requires it; advisory keeps flagged tunnels eligible. Read at import
+# like SPREAD_BAND: dispatcher.py loads proteus.env / proteus-local.env first,
+# and the UI knob restarts the dispatcher when it changes.
+CF_REQUIRED = cf_required(os.environ.get("PROTEUS_CF_TIER"))
 
 # How long a playability verdict is trusted. Comfortably longer than the
 # ~16-minute re-check interval, so a slot isn't treated as "unknown" between
@@ -252,14 +257,15 @@ def is_playable(health_dir: str, name: str, now: int,
     return False
 
 
-def is_cf_clean(health_dir: str, name: str, now: int,
-                fresh_seconds: int = PLAYABILITY_FRESH_SECONDS) -> bool:
-    """Last known Cloudflare verdict for a slot. Unknown counts as clean.
+def is_cf_clean(health_dir: str, name: str) -> bool:
+    """Last known Cloudflare verdict for a slot: False only for CF_CLEAN=no.
 
-    slot-warmup's live_check writes .cf-state.<slot> on every run and
-    rotate-slot.sh writes it on a step-down promotion. Absent, unreadable,
-    malformed or stale all resolve to True for the same reason is_playable
-    does: presuming bad would empty the eligible pool on a monitoring hiccup.
+    A flag holds at any age. slot-warmup's live check replaces it on every run
+    that observes the canaries. rotate-slot.sh replaces or removes it on
+    promotion, so a "no" never outlives the exit it describes. An absent,
+    unreadable or malformed file is a slot with no verdict yet (a reboot clears
+    /run) and counts as clean: nothing has observed it, and the next live-check
+    turn does.
     """
     try:
         with open(f"{health_dir}/.cf-state.{name}") as f:
@@ -271,14 +277,22 @@ def is_cf_clean(health_dir: str, name: str, now: int,
                     kv[k] = v
     except OSError:
         return True
-    if kv.get("CF_CLEAN", "yes") != "no":
-        return True
-    try:
-        if now - int(kv.get("AT", "0")) > fresh_seconds:
-            return True
-    except ValueError:
-        return True
-    return False
+    return kv.get("CF_CLEAN", "yes") != "no"
+
+
+def prefer_cf_clean(candidates, health_dir: str) -> list:
+    """The "cf ok" members of `candidates` (tuples that start with the slot
+    name), or all of them when none is.
+
+    "cf ok" is mandatory for new clients: a slot whose exit Cloudflare flagged
+    takes none while another slot is cf ok. When every slot is flagged, a
+    flagged exit beats no exit, so new clients still get one. When cf ok is
+    not required (CF_REQUIRED is False), all candidates are returned.
+    """
+    if not CF_REQUIRED:
+        return list(candidates)
+    clean = [c for c in candidates if is_cf_clean(health_dir, c[0])]
+    return clean or list(candidates)
 
 
 def pick_distributed(
@@ -298,7 +312,8 @@ def pick_distributed(
     the least-loaded by `load_counts` (mark -> #entries), tie-breaking toward
     the higher score. This fans new work out across the strong slots —
     spreading bandwidth and handing out distinct exit IPs — instead of piling
-    everything onto the single top slot.
+    everything onto the single top slot. When cf ok is required, a slot whose
+    exit Cloudflare flagged is left out while another scored slot is cf ok.
 
     `load_counts` must come from a SINGLE source, because the numbers are only
     ever compared with each other. The caller has two candidate maps and they
@@ -324,20 +339,15 @@ def pick_distributed(
     if not scored:
         return None
 
-    # Preference cascade, each step applied only if it leaves at least one slot:
-    # clean of Cloudflare challenges AND playable, then clean, then playable,
-    # then everybody. A challenged or gated exit stays eligible for scoring,
-    # routing and rotation; it is only moved to the back of the queue for NEW
-    # pins. If every slot is bad, keep the full set: a bad exit beats none.
+    # "cf ok" first, on every pick: a flagged exit takes no new pins while
+    # another scored slot without a flag exists. Then streaming playability
+    # inside that set, under the same rule. A flagged or gated exit stays
+    # eligible for scoring, routing and rotation, and when every slot is bad
+    # the full set stays: a bad exit beats none.
+    scored = prefer_cf_clean(scored, health_dir)
     if prefer_playable:
-        clean = [t for t in scored if is_cf_clean(health_dir, t[0], now)] if CF_BIAS else list(scored)
         playable = [t for t in scored if is_playable(health_dir, t[0], now)]
-        both = [t for t in clean if t in playable]
-        if both:
-            scored = both
-        elif clean:
-            scored = clean
-        elif playable:
+        if playable:
             scored = playable
 
     best = max(score for _, _, score in scored)

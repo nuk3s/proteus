@@ -132,10 +132,10 @@ def agreement(records, hosts, active_hosts, now: int, window_s: int = 7 * DAY) -
 
 def build(records, hosts, now: int, slots: int, target: int, min_exits: int,
           tier: str = "mandatory") -> dict:
-    """`tier` mirrors PROTEUS_CF_TIER: in advisory (shadow) mode the canaries do not
-    gate anything, so the standard used for the pool and attainability is empty and
-    "known-good" means verdict-pass exits, exactly as proton-mint computes it. Canary
-    pass rates and the agreement table are informational and use the full basket."""
+    """`tier` mirrors PROTEUS_CF_TIER. In advisory the canaries do not gate anything,
+    so the standard used for the pool and attainability is empty and "known-good"
+    means verdict-pass exits, as proton-mint computes it. Canary pass rates and the
+    agreement table are informational and use the full basket."""
     records = _sanitize(records)
     active = ledger.active_hosts(records, hosts, now, min_exits)
     standard = active if tier == "mandatory" else []
@@ -254,7 +254,7 @@ def main(argv=None) -> int:
     min_exits = args.min_exits if args.min_exits is not None else env_int("PROTEUS_CF_QUARANTINE_MIN_EXITS", 8)
     hosts = [ledger.host_of(u) for u in ledger.canary_urls(args.canaries_file)]
     tier = args.cf_tier if args.cf_tier is not None else env_str("PROTEUS_CF_TIER", "mandatory")
-    tier = "mandatory" if tier == "mandatory" else "advisory"
+    tier = "mandatory" if tier in ("", "mandatory") else "advisory"     # empty is mandatory, as in checklib.sh
     st = build(ledger.load(args.path), hosts, now, max(1, slots), target, min_exits, tier=tier)
     print(json.dumps(st) if args.json else render(st))
     return 0

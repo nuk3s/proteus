@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # tests/rotate_attempts_test.sh — rotate-slot.sh with every external dependency
 # stubbed: transient failures must not consume verdict attempts, the loop must
-# stay bounded, the ledger must see every verdict and promotion, and the
-# step-down path must promote the best baseline-passing candidate (or not,
-# in strict mode).
+# stay bounded, the ledger must see every verdict and promotion, in the mandatory
+# tier a canary failure is never promoted, and a promotion records the gate's verdict.
 set -euo pipefail
 . "$(dirname "$0")/_assert.sh"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -13,15 +12,15 @@ mkdir -p "$TMP/bin" "$TMP/state" "$TMP/run" "$TMP/health" "$TMP/auto" "$FIX"
 cp "$ROOT/etc/proteus/bin/checklib.sh" "$ROOT/etc/proteus/bin/ledger.py" \
    "$ROOT/etc/proteus/bin/history.sh" "$TMP/bin/"
 
-# proton-mint: pops the next endpoint from fix/mint.queue (or honours
-# --target-entry), writes a minimal conf, prints its path, logs its argv.
+# proton-mint: pops the next endpoint from fix/mint.queue, writes a minimal
+# conf, prints its path, logs its argv.
 cat > "$TMP/bin/proton-mint" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >> "$FIX/mint.log"
-target=""; slot=""; out=""
+slot=""; out=""
 while [ $# -gt 0 ]; do case "$1" in
-  --slot) slot=$2; shift 2;; --out-dir) out=$2; shift 2;; --target-entry) target=$2; shift 2;; *) shift;; esac; done
-if [ -n "$target" ]; then ep=$target; else ep=$(head -n1 "$FIX/mint.queue"); sed -i '1d' "$FIX/mint.queue"; fi
+  --slot) slot=$2; shift 2;; --out-dir) out=$2; shift 2;; *) shift;; esac; done
+ep=$(head -n1 "$FIX/mint.queue"); sed -i '1d' "$FIX/mint.queue"
 [ -n "$ep" ] || exit 2
 f="$out/$slot-US-XX_${ep##*.}-$(date +%s%N).conf"
 printf '# logical=US-XX#%s\n# exit_country=US\n# physical_domain=x.invalid\n[Interface]\n[Peer]\nEndpoint = %s:51820\n' "${ep##*.}" "$ep" > "$f"
@@ -54,7 +53,8 @@ case "$*" in
 esac
 EOF
 # reputation-probe: pops fix/probe.queue lines "rc|standing|of|baseline|canaries|checks"
-# and prints the real trailer format. The step-down override forces PASS.
+# and prints the real trailer format. A canary value "class:quarantined" prints
+# the fourth token: q=challenge:quarantined -> "CANARY q challenge quarantined".
 # rc=sleep:N hangs for N seconds (via /bin/sleep, since `sleep` on PATH is
 # stubbed to a no-op) so the caller's `timeout`, or a signal, can reap it.
 cat > "$TMP/bin/reputation-probe.sh" <<'EOF'
@@ -63,8 +63,7 @@ echo "$*" >> "$FIX/probe.log"
 line=$(head -n1 "$FIX/probe.queue"); sed -i '1d' "$FIX/probe.queue"
 IFS='|' read -r rc standing of baseline canaries checks <<<"$line"
 case "$rc" in sleep:*) exec /bin/sleep "${rc#sleep:}";; esac
-[ "${PROTEUS_CF_TIER_OVERRIDE:-}" = "advisory" ] && rc=0
-IFS=',' read -ra cs <<<"$canaries"; for c in "${cs[@]}"; do [ -n "$c" ] && echo "CANARY ${c%%=*} ${c#*=}"; done
+IFS=',' read -ra cs <<<"$canaries"; for c in "${cs[@]}"; do v=${c#*=}; [ -n "$c" ] && echo "CANARY ${c%%=*} ${v/:/ }"; done
 IFS=',' read -ra ks <<<"$checks";   for k in "${ks[@]}"; do [ -n "$k" ] && echo "CHECK ${k%%=*} ${k#*=}"; done
 echo "STANDING $standing/$of"; echo "BASELINE $baseline"
 echo "SUMMARY mandatory: pass=5 block=$rc error=0 | advisory: block=0"
@@ -103,14 +102,15 @@ run_rotation() { # run_rotation [VAR=val ...]
 lines() { wc -l < "$1" | tr -d ' '; }
 out_has() { grep -qF -- "$1" "$TMP/out.log" && echo y || echo n; }
 hist_last() { tail -n1 "$TMP/history.jsonl" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['$1'])"; }
-ledger_count() { grep -c "\"source\":\"$1\"" "$TMP/ledger.jsonl" 2>/dev/null || echo 0; }
+# grep -c prints 0 and exits 1 on no match, so the fallback must not echo a second 0.
+ledger_count() { local n; n=$(grep -c "\"source\":\"$1\"" "$TMP/ledger.jsonl" 2>/dev/null) || true; echo "${n:-0}"; }
 ledger_field() { grep "\"source\":\"$1\"" "$TMP/ledger.jsonl" | tail -n1 | python3 -c "import json,sys; print(json.load(sys.stdin)['$2'])"; }
 
 echo "transient failures do not consume verdict attempts"
 reset
 printf '10.0.0.2\n10.0.0.3\n10.0.0.4\n' > "$FIX/mint.queue"
 printf '1|3|4|PASS|discord.com=clean,www.patreon.com=challenge|youtube=clean\n0|4|4|PASS|discord.com=clean,www.patreon.com=clean|youtube=clean\n' > "$FIX/probe.queue"
-echo 'CF_CLEAN=no' > "$TMP/health/.cf-state.proton-1"; echo 1 > "$TMP/health/.stepdown-at.proton-1"
+echo 'CF_CLEAN=no' > "$TMP/health/.cf-state.proton-1"
 echo 'PLAYABLE=no' > "$TMP/health/.playability-state.proton-1"
 echo 2 > "$TMP/health/.livecheck-fails.proton-1.cf:x"
 run_rotation PROTEUS_CF_QUARANTINE_MIN_EXITS=3 PROTEUS_CANARIES_FILE="$TMP/canaries.json"
@@ -125,10 +125,10 @@ assert_eq "$(ledger_count gate)" 2 "two gate records (one fail, one pass)"
 assert_eq "$(ledger_count promote)" 1 "one promote record"
 assert_eq "$(ledger_field promote exit_ip)" 10.0.0.4 "promote record carries the exit"
 assert_eq "$(ledger_field promote verdict)" pass "clean promotion is verdict pass"
-[[ -e "$TMP/health/.cf-state.proton-1" ]] && r=present || r=absent
-assert_eq "$r" absent "stale cf-state removed on a clean promotion"
-[[ -e "$TMP/health/.stepdown-at.proton-1" ]] && r=present || r=absent
-assert_eq "$r" absent "step-down marker removed on a clean promotion"
+assert_eq "$(grep -cx 'CF_CLEAN=yes' "$TMP/health/.cf-state.proton-1")" 1 \
+  "a promotion whose gate saw every canary clean is cf ok at once"
+assert_eq "$(grep -cx 'FAILING=' "$TMP/health/.cf-state.proton-1")" 1 "nothing failing"
+assert_eq "$(grep -c '^AT=[0-9][0-9]*$' "$TMP/health/.cf-state.proton-1")" 1 "verdict is time-stamped"
 [[ -e "$TMP/health/.playability-state.proton-1" ]] && r=present || r=absent
 assert_eq "$r" absent "stale playability verdict removed on a clean promotion"
 [[ -e "$TMP/health/.livecheck-fails.proton-1.cf:x" ]] && r=present || r=absent
@@ -146,17 +146,56 @@ assert_eq "$(sed -n 1p "$FIX/mint.log" | grep -c -- "--ledger $TMP/ledger.jsonl"
 # guaranteed to match what the operator configured.
 assert_eq "$(sed -n 1p "$FIX/mint.log" | grep -c -- '--quarantine-min-exits 3')" 1 "quarantine threshold passed to mint"
 assert_eq "$(sed -n 1p "$FIX/mint.log" | grep -c -- "--canaries-file $TMP/canaries.json")" 1 "canary basket passed to mint"
-# In advisory tier the canaries are shadow data: they must not steer the draw
-# either, or the "shadow" rollout quietly changes which exits get minted.
-assert_eq "$(sed -n 1p "$FIX/mint.log" | grep -c -- '--cf-tier mandatory')" 1 "canary tier passed to mint"
+# In the advisory tier the canaries are shadow data, so they must not steer the
+# draw either. Mint has to know the tier to leave them out.
+assert_eq "$(sed -n 1p "$FIX/mint.log" | grep -c -- '--cf-tier mandatory')" 1 "the default tier mandatory is passed to mint"
 
-echo "the mint call carries the advisory tier"
+echo "advisory tier: a candidate with a flagged canary promotes and the card shows the flag"
 reset
 printf '10.0.0.9\n' > "$FIX/mint.queue"
-printf '0|4|4|PASS|a=clean|\n' > "$FIX/probe.queue"
+printf '0|3|4|PASS|a=clean,b=clean,c=clean,d=challenge|\n' > "$FIX/probe.queue"
+echo 'CF_CLEAN=yes' > "$TMP/health/.cf-state.proton-1"
 run_rotation PROTEUS_CF_TIER=advisory
-assert_eq "$RC" "0" "rotation succeeded"
-assert_eq "$(sed -n 1p "$FIX/mint.log" | grep -c -- '--cf-tier advisory')" 1 "advisory tier passed to mint"
+assert_eq "$RC" "0" "promoted"
+assert_eq "$(sed -n 1p "$FIX/mint.log" | grep -c -- '--cf-tier advisory')" 1 "the advisory tier is passed to mint"
+assert_eq "$(hist_last outcome)" promoted "history says promoted"
+assert_eq "$(ledger_field gate verdict)" pass "the gate record is a pass"
+assert_eq "$(ledger_field promote verdict)" pass "the promote record is a pass"
+assert_eq "$(grep -cx 'CF_CLEAN=no' "$TMP/health/.cf-state.proton-1")" 1 "the flagged canary is recorded"
+assert_eq "$(grep -cx 'FAILING=d' "$TMP/health/.cf-state.proton-1")" 1 "the flagged canary is named"
+assert_eq "$(grep -c '^AT=[0-9][0-9]*$' "$TMP/health/.cf-state.proton-1")" 1 "verdict is time-stamped"
+
+echo "mandatory tier: a quarantined canary's challenge does not flag a promotion"
+reset
+printf '10.0.0.9\n' > "$FIX/mint.queue"
+printf '0|3|3|PASS|a=clean,b=clean,c=clean,q=challenge:quarantined|\n' > "$FIX/probe.queue"
+run_rotation
+assert_eq "$RC" "0" "promoted"
+assert_eq "$(grep -cx 'CF_CLEAN=yes' "$TMP/health/.cf-state.proton-1")" 1 "cf ok, as before PROTEUS_CF_TIER came back"
+assert_eq "$(grep -cx 'FAILING=' "$TMP/health/.cf-state.proton-1")" 1 "nothing failing"
+assert_eq "$(grep '"source":"gate"' "$TMP/ledger.jsonl" | tail -n1 \
+    | python3 -c "import json,sys; print(json.load(sys.stdin)['canaries'].get('q'))")" challenge \
+  "the gate record still carries the quarantined result (it is how the canary recovers)"
+
+echo "only challenge and block classes flag a promotion"
+reset
+printf '10.0.0.9\n' > "$FIX/mint.queue"
+printf '0|2|2|PASS|a=clean,b=clean,x=,y=weird|\n' > "$FIX/probe.queue"
+run_rotation
+assert_eq "$RC" "0" "promoted"
+assert_eq "$(grep -cx 'CF_CLEAN=yes' "$TMP/health/.cf-state.proton-1")" 1 \
+  "an empty or unknown canary class never writes a flag"
+assert_eq "$(grep -cx 'FAILING=' "$TMP/health/.cf-state.proton-1")" 1 "nothing failing"
+
+echo "a flagged canary outranks an unreached one, and every flagged canary is named"
+reset
+printf '10.0.0.9\n' > "$FIX/mint.queue"
+printf '0|1|4|PASS|a=clean,b=transport,c=block-1020,d=challenge,e=not-cloudflare|\n' > "$FIX/probe.queue"
+run_rotation PROTEUS_CF_TIER=advisory
+assert_eq "$RC" "0" "promoted"
+assert_eq "$(grep -cx 'CF_CLEAN=no' "$TMP/health/.cf-state.proton-1")" 1 "flagged, not unchecked"
+assert_eq "$(grep -cx 'FAILING=c,d' "$TMP/health/.cf-state.proton-1")" 1 \
+  "only challenge and block classes are named, not transport or not-cloudflare"
 
 echo "the loop is bounded whatever the failure mix"
 reset
@@ -167,43 +206,57 @@ assert_eq "$(out_has 'no promotable candidate after 3 attempts (0 verdicts)')" y
 assert_eq "$(hist_last outcome)" all-fail "history all-fail"
 assert_eq "$(wc -l < "$FIX/mint.log" | tr -d ' ')" 3 "exactly three mints"
 
-echo "step-down promotes the highest-standing baseline-passing candidate"
+echo "a candidate that fails only the canaries is never promoted"
 reset
 printf '10.0.0.5\n10.0.0.6\n' > "$FIX/mint.queue"
-# The third line (the step-down re-probe) fails a DIFFERENT canary than the
-# candidate did when it was rejected, so .cf-state can only be right if it is
-# built from the re-probe's trailer.
-printf '1|2|4|PASS|a=clean,b=clean,c=challenge,d=challenge|\n1|3|4|PASS|a=clean,b=clean,c=clean,d=challenge|\n1|3|4|PASS|a=clean,b=clean,c=challenge,d=clean|\n' > "$FIX/probe.queue"
+printf '1|2|4|PASS|a=clean,b=clean,c=challenge,d=challenge|\n1|3|4|PASS|a=clean,b=clean,c=clean,d=challenge|\n' > "$FIX/probe.queue"
+printf 'CF_CLEAN=no\nAT=7\nFAILING=d\n' > "$TMP/health/.cf-state.proton-1"
 run_rotation MAX_ATTEMPTS=2
-assert_eq "$RC" "0" "step-down rotation succeeded"
-assert_eq "$(out_has 'stepping down to US-XX#6 (standing 3/4)')" y "step-down announced with the best candidate"
-assert_eq "$(sed -n 3p "$FIX/mint.log" | grep -c -- '--target-entry 10.0.0.6')" 1 "re-mint targets the best candidate"
-assert_eq "$(hist_last outcome)" promoted-stepdown "history outcome"
-assert_eq "$(grep -c 'CF_CLEAN=no' "$TMP/health/.cf-state.proton-1")" 1 "cf-state written as not clean"
-assert_eq "$(grep -c 'FAILING=c' "$TMP/health/.cf-state.proton-1")" 1 "failing canary comes from the re-probe, not the reject"
-[[ -s "$TMP/health/.stepdown-at.proton-1" ]] && r=present || r=absent
-assert_eq "$r" present "step-down marker written"
-assert_eq "$(ledger_field promote verdict)" fail "step-down promotion is verdict fail"
-assert_eq "$(ledger_count gate)" 3 "three gate records (two rejects, one step-down re-probe)"
-
-echo "strict mode never steps down"
-reset
-printf '10.0.0.5\n10.0.0.6\n' > "$FIX/mint.queue"
-printf '1|2|4|PASS|a=clean,c=challenge|\n1|3|4|PASS|a=clean,d=challenge|\n' > "$FIX/probe.queue"
-run_rotation MAX_ATTEMPTS=2 PROTEUS_CF_FALLBACK=strict
 assert_eq "$RC" "2" "all-fail"
-assert_eq "$(grep -c -- '--target-entry' "$FIX/mint.log")" 0 "no step-down mint"
 assert_eq "$(hist_last outcome)" all-fail "history all-fail"
+assert_eq "$(lines "$FIX/mint.log")" 2 "no extra mint after the budget"
+assert_eq "$(ledger_count promote)" 0 "nothing promoted"
+assert_eq "$(grep -cx 'AT=7' "$TMP/health/.cf-state.proton-1")" 1 \
+  "the current exit keeps its verdict (the rotation saw nothing about it)"
+assert_eq "$(grep -c 'stepping down' "$TMP/out.log" || true)" 0 "no step-down"
 
-echo "a candidate whose baseline fails is never a step-down candidate"
+echo "a promotion whose gate could not reach a canary is cf unchecked"
 reset
-printf '10.0.0.7\n' > "$FIX/mint.queue"
-printf '1|3|4|FAIL|a=clean|custom:x.invalid=block\n' > "$FIX/probe.queue"
-run_rotation MAX_ATTEMPTS=1
-assert_eq "$RC" "2" "all-fail"
-assert_eq "$(grep -c -- '--target-entry' "$FIX/mint.log")" 0 "no step-down mint"
+printf '10.0.0.9\n' > "$FIX/mint.queue"
+printf '0|2|3|PASS|a=clean,b=clean,c=transport|\n' > "$FIX/probe.queue"
+printf 'CF_CLEAN=no\nAT=7\nFAILING=c\n' > "$TMP/health/.cf-state.proton-1"
+run_rotation
+assert_eq "$RC" "0" "promoted"
+[[ -e "$TMP/health/.cf-state.proton-1" ]] && r=present || r=absent
+assert_eq "$r" absent "no verdict: the old exit's flag is gone and nothing claims cf ok"
+assert_eq "$(ledger_field promote verdict)" pass "promote record is a pass"
 
-echo "a throughput reject consumes a verdict attempt and is not a step-down candidate"
+echo "a promotion with no active canary at the gate is cf ok by default"
+reset
+printf '10.0.0.9\n' > "$FIX/mint.queue"
+printf '0|0|0|PASS|a=not-cloudflare|\n' > "$FIX/probe.queue"
+run_rotation
+assert_eq "$RC" "0" "promoted"
+assert_eq "$(grep -cx 'CF_CLEAN=yes' "$TMP/health/.cf-state.proton-1")" 1 "no active canary is still cf ok"
+assert_eq "$(out_has 'no active canary at the gate; proton-1 is cf ok by default')" y "the default is logged"
+
+# A root user ignores directory modes, so this case cannot run as root.
+if (( $(id -u) != 0 )); then
+  echo "a promotion that cannot write the cf verdict still completes"
+  reset
+  printf '10.0.0.9\n' > "$FIX/mint.queue"
+  printf '0|4|4|PASS|a=clean|\n' > "$FIX/probe.queue"
+  chmod 555 "$TMP/health"
+  run_rotation
+  chmod 755 "$TMP/health"
+  assert_eq "$RC" "0" "promoted"
+  assert_eq "$(hist_last outcome)" promoted "history says promoted"
+  assert_eq "$(out_has 'could not write the cf verdict for proton-1')" y "the failed write is logged"
+  [[ -e "$TMP/health/.cf-state.proton-1" ]] && r=present || r=absent
+  assert_eq "$r" absent "no verdict file was left behind"
+fi
+
+echo "a throughput reject consumes a verdict attempt"
 reset
 printf '10.0.0.8\n' > "$FIX/mint.queue"
 printf '0|4|4|PASS|a=clean|\n' > "$FIX/probe.queue"
@@ -263,14 +316,6 @@ assert_eq "$(out_has 'no promotable candidate after 2 attempts (0 verdicts)')" y
 assert_eq "$(hist_last outcome)" all-fail "history all-fail"
 assert_eq "$(lines "$FIX/probe.log")" 0 "no candidate ever reached the probe"
 
-echo "a step-down candidate that fails the throughput gate is not promoted"
-reset
-printf '10.0.0.5\n10.0.0.6\n' > "$FIX/mint.queue"
-printf '1|2|4|PASS|a=clean,b=clean,c=challenge,d=challenge|\n1|3|4|PASS|a=clean,b=clean,c=clean,d=challenge|\n1|3|4|PASS|a=clean,b=clean,c=challenge,d=clean|\n' > "$FIX/probe.queue"
-run_rotation MAX_ATTEMPTS=2 PROTEUS_STREAMING_MIN_MBPS=500
-assert_eq "$RC" "2" "all-fail"
-assert_eq "$(out_has 'step-down candidate failed (rc=12)')" y "throughput reject blocks the step-down promotion"
-
 echo "the wall-clock deadline stops the loop before it starts"
 reset
 printf '10.0.0.4\n' > "$FIX/mint.queue"
@@ -316,5 +361,18 @@ assert_eq "$(grep -c 'checkip.amazonaws.com' "$ROOT/etc/proteus/bin/rotate-slot.
     "rotate-slot.sh no longer resolves checkip.amazonaws.com"
 assert_eq "$(grep -c 'https://1.1.1.1/cdn-cgi/trace' "$ROOT/etc/proteus/bin/rotate-slot.sh")" 1 \
     "the egress probe fetches the trace endpoint by IP literal"
+
+echo "the cf verdict is written after the new exit is recorded"
+# A live check of the old exit discards its result once .meta names a new
+# EXIT_IP, so the verdict must land after that write.
+meta_ln=$(grep -n '^} > "\$meta"' "$ROOT/etc/proteus/bin/rotate-slot.sh" | head -n1 | cut -d: -f1)
+# shellcheck disable=SC2016  # the pattern is the literal source text, not an expansion.
+cf_ln=$(grep -nF '> "$HEALTH_DIR/.cf-state.$SLOT.tmp"' "$ROOT/etc/proteus/bin/rotate-slot.sh" | head -n1 | cut -d: -f1)
+assert_eq "$(( ${cf_ln:-0} > ${meta_ln:-999999} ? 1 : 0 ))" 1 "the verdict write follows the .meta write"
+
+echo "step-down is gone"
+# CF_TIER and --cf-tier are legitimate again; the pattern must not match them.
+assert_eq "$(grep -ciE 'CF_FALLBACK|step-?down|target-entry' "$ROOT/etc/proteus/bin/rotate-slot.sh" || true)" 0 \
+    "rotate-slot.sh has no step-down, fallback or target entry left"
 
 summary

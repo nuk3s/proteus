@@ -14,8 +14,11 @@
 #   3. Verify handshake + basic TLS egress in the staging namespace.
 #   4. Run reputation-probe.sh inside the staging ns.
 #   5. If probe fails: tear down staging, delete the config, loop (transient
-#      failures do not count against MAX_ATTEMPTS; step-down applies when the
-#      Cloudflare standard is unattainable).
+#      failures do not count against MAX_ATTEMPTS). With PROTEUS_CF_TIER=
+#      mandatory (the default) a candidate that fails a Cloudflare canary is
+#      never promoted: when no candidate passes, the rotation ends all-fail
+#      and the current exit stays. In the advisory tier the canaries do not
+#      gate, so a promoted candidate can have a flagged canary.
 # After a successful attempt:
 #   6. Promote: replace the live slot via vpnns-up (idempotent in-place
 #      reconfigure), SIGHUP the dispatcher.
@@ -53,8 +56,7 @@ MAX_TOTAL_ATTEMPTS="${MAX_TOTAL_ATTEMPTS:-14}"
 # Wall-clock stop, 25 min: attempts are minutes long now, so a bound on
 # their count is not a bound on their duration. The unit's
 # TimeoutStartSec=45min is the backstop — worst case here is one in-flight
-# attempt plus a step-down starting just under the deadline, about 18 more
-# minutes, which still lands inside it.
+# attempt starting just under the deadline, which lands well inside it.
 ROTATION_DEADLINE_S="${ROTATION_DEADLINE_S:-1500}"
 RETRY_SLEEP="${RETRY_SLEEP:-3}"
 # Overridable so the test harness can run this script against a temp tree.
@@ -79,10 +81,6 @@ LOG_TAG="rotate-${SLOT}"
 # shellcheck source=/dev/null
 . "$BIN/checklib.sh"
 
-# What to do when no candidate meets the Cloudflare standard: step-down
-# promotes the best baseline-passing candidate and marks the slot; strict
-# leaves the slot untouched (the pre-ledger all-fail behaviour).
-CF_FALLBACK="${PROTEUS_CF_FALLBACK:-step-down}"
 MINT_POOL_TARGET="${PROTEUS_MINT_POOL_TARGET:-20}"
 MINT_EXPLORE="${PROTEUS_MINT_EXPLORE:-0.5}"
 MINT_REUSE_MIN_S="${PROTEUS_MINT_REUSE_MIN_S:-604800}"
@@ -154,23 +152,29 @@ fi
 OLD_LOGICAL=$(grep -s '^LOGICAL_NAME=' "$STATE_DIR/$SLOT.meta" | cut -d= -f2- || true)
 
 # --- probe trailer + ledger helpers ---------------------------------------------
-# parse_probe_trailer <probe-output>: reads the CANARY/CHECK/STANDING/BASELINE
-# lines reputation-probe.sh prints and sets probe_standing probe_of
-# probe_baseline probe_canaries probe_checks probe_failing.
+# parse_probe_trailer <probe-output>: reads the CANARY/CHECK/STANDING lines
+# reputation-probe.sh prints and sets probe_standing probe_of probe_canaries
+# probe_checks probe_failing. probe_failing lists the canaries whose class is
+# challenge or block-*, the fail classes ledger.is_fail_class names. Any other
+# class (clean, transport, not-cloudflare, empty or unknown) is no flag. A
+# CANARY line with a fourth token (quarantined) does not count toward the
+# standard, so it never enters probe_failing. probe_canaries keeps it with its
+# class: the ledger needs that result to lift the quarantine.
 parse_probe_trailer() {
     local out=$1 line std
-    probe_standing=0; probe_of=0; probe_baseline=FAIL
+    probe_standing=0; probe_of=0
     probe_canaries=""; probe_checks=""; probe_failing=""
-    # Trailer lines are three whitespace-free tokens by construction, but the
-    # probe may be killed mid-line, so every field is read with a default
-    # rather than trusting the count under `set -u`.
+    # Trailer lines are three whitespace-free tokens by construction (four for
+    # a quarantined canary), but the probe may be killed mid-line, so every
+    # field is read with a default rather than trusting the count under `set -u`.
     while IFS= read -r line; do
         case "$line" in
             "CANARY "*)
                 set -- $line
                 probe_canaries="$probe_canaries${probe_canaries:+,}${2:-}=${3:-}"
-                case "${3:-}" in clean|not-cloudflare|transport) ;;
-                    *) probe_failing="$probe_failing${probe_failing:+,}${2:-}" ;; esac ;;
+                [[ -z "${4:-}" ]] || continue
+                case "${3:-}" in challenge|block-*)
+                    probe_failing="$probe_failing${probe_failing:+,}${2:-}" ;; esac ;;
             "CHECK "*)
                 set -- $line
                 probe_checks="$probe_checks${probe_checks:+,}${2:-}=${3:-}" ;;
@@ -178,9 +182,6 @@ parse_probe_trailer() {
                 set -- $line
                 std=${2:-0/0}
                 probe_standing=${std%%/*}; probe_of=${std##*/} ;;
-            "BASELINE "*)
-                set -- $line
-                probe_baseline=${2:-FAIL} ;;
         esac
     done <<<"$out"
 }
@@ -338,8 +339,6 @@ try_candidate() {
 # --- attempt loop ------------------------------------------------------------------
 good_conf=""; good_exit_ip=""; good_endpoint=""
 verdict_attempts=0; total=0
-# Best step-down candidate seen so far (baseline PASS, highest standing).
-sd_entry=""; sd_standing=-1; sd_logical=""; sd_of=0
 sibling_eps=$(own_and_sibling_endpoints)
 while (( verdict_attempts < MAX_ATTEMPTS && total < MAX_TOTAL_ATTEMPTS && SECONDS < ROTATION_DEADLINE_S )); do
     total=$((total + 1))
@@ -369,45 +368,15 @@ while (( verdict_attempts < MAX_ATTEMPTS && total < MAX_TOTAL_ATTEMPTS && SECOND
             break ;;
         11|12)
             verdict_attempts=$((verdict_attempts + 1))
-            if [[ "$rc" == 11 && "$probe_baseline" == "PASS" ]] && (( probe_standing > sd_standing )); then
-                sd_entry="$new_endpoint"; sd_standing="$probe_standing"
-                sd_logical="$new_logical"; sd_of="$probe_of"
-            fi
             rm -f "$new_conf"; sleep "$RETRY_SLEEP" ;;
         *)
             rm -f "$new_conf"; sleep "$RETRY_SLEEP" ;;
     esac
 done
 
-# --- step-down ---------------------------------------------------------------------
-# No candidate met the standard. Rather than leave the slot on an exit that is
-# possibly worse, promote the best candidate whose non-canary mandatory checks
-# passed, mark the slot so the dispatcher deprioritises it, and let the live
-# watch lift it back to the standard after PROTEUS_CF_STEPDOWN_RETRY_S.
-outcome="promoted"
 if [[ -z "$good_conf" ]] && (( SECONDS >= ROTATION_DEADLINE_S )); then
-    log "deadline reached after ${SECONDS}s — no time for a step-down attempt"
+    log "deadline reached after ${SECONDS}s"
 fi
-if [[ -z "$good_conf" && -n "$sd_entry" && "$CF_FALLBACK" == "step-down" ]] \
-   && (( SECONDS < ROTATION_DEADLINE_S )); then
-    log "no candidate met the standard after $verdict_attempts verdict attempts — stepping down to $sd_logical (standing $sd_standing/$sd_of)"
-    if new_conf=$("$BIN"/proton-mint --slot "$SLOT" --out-dir "$AUTO_DIR" --target-entry "$sd_entry") \
-       && [[ -n "$new_conf" && -r "$new_conf" ]]; then
-        export PROTEUS_CF_TIER_OVERRIDE=advisory
-        rc=0; try_candidate "$new_conf" || rc=$?
-        unset PROTEUS_CF_TIER_OVERRIDE
-        if (( rc == 0 )); then
-            good_conf="$new_conf"; good_exit_ip="$exit_ip"
-            good_endpoint="$new_endpoint"
-            outcome="promoted-stepdown"
-        else
-            log "step-down candidate failed (rc=$rc)"; rm -f "$new_conf"
-        fi
-    else
-        log "step-down mint failed"
-    fi
-fi
-
 if [[ -z "$good_conf" ]]; then
     log "ERR: no promotable candidate after $total attempts ($verdict_attempts verdicts) — leaving current slot untouched"
     history_append "$SLOT" "${OLD_LOGICAL:-?}" "${OLD_LOGICAL:-?}" "$TRIGGER" "all-fail" "$total"
@@ -437,23 +406,12 @@ systemctl kill --kill-who=main --signal=HUP proteus-dispatcher.service 2>/dev/nu
     log "WARN: dispatcher SIGHUP failed (not running?)"
 
 ln -sfn "$good_conf" "${AUTO_DIR}/${SLOT}.conf"
-# Verdicts recorded against the OLD exit say nothing about this one. A clean
-# promotion just passed every gate, so drop both files; a step-down promotion
-# is known to be below the standard, so say so for the dispatcher and start
-# the retry clock.
+# Verdicts recorded against the OLD exit say nothing about this one.
 rm -f "$HEALTH_DIR/.playability-state.$SLOT"
 # The live watches' consecutive-failure counters belong to the OLD exit too: a
 # fresh one must not inherit a streak and rotate again on its first bad check.
 # The trailing dot keeps the glob off sibling slots (proton-1 vs proton-10).
 rm -f "$HEALTH_DIR/.playability-fails.$SLOT" "$HEALTH_DIR/.livecheck-fails.$SLOT."*
-if [[ "$outcome" == "promoted-stepdown" ]]; then
-    mkdir -p "$HEALTH_DIR"
-    printf 'CF_CLEAN=no\nAT=%s\nFAILING=%s\n' "$(date +%s)" "$probe_failing" \
-        > "$HEALTH_DIR/.cf-state.$SLOT.tmp" && mv "$HEALTH_DIR/.cf-state.$SLOT.tmp" "$HEALTH_DIR/.cf-state.$SLOT"
-    date +%s > "$HEALTH_DIR/.stepdown-at.$SLOT"
-else
-    rm -f "$HEALTH_DIR/.cf-state.$SLOT" "$HEALTH_DIR/.stepdown-at.$SLOT"
-fi
 log "promoted $SLOT -> $good_conf (exit_ip=$good_exit_ip)"
 
 # Display metadata for the web UI. proton-mint stamps every minted conf with
@@ -485,9 +443,36 @@ meta="$STATE_DIR/$SLOT.meta"
 } > "$meta"
 chgrp proteus-ui "$meta" 2>/dev/null || true
 chmod 640 "$meta" 2>/dev/null || true
-history_append "$SLOT" "${OLD_LOGICAL:-?}" "$logical_clean" "$TRIGGER" "$outcome" "$total"
-ledger_record --source promote --slot "$SLOT" \
-    --verdict "$([[ "$outcome" == promoted ]] && echo pass || echo fail)" \
+# The Cloudflare verdict is the one the gate just observed on this exit. It is
+# written after the .meta file above, which records the new EXIT_IP. A live
+# check discards a run that ends during a rotation or after the exit changed,
+# so it cannot overwrite this verdict. In the mandatory tier a promoted
+# candidate has no flagged canary. In the advisory tier it can have one, and
+# the card must show it, so a flagged canary writes CF_CLEAN=no. The gate
+# counts an unreachable canary as SKIP, so STANDING below OF means at least
+# one canary was never seen: leave the slot unchecked, and the next live-check
+# turn checks it first. The slot is promoted already, so nothing here may
+# abort the script. If the write fails, drop the old file: the old exit's flag
+# must not outlive it.
+cf_line=""
+if [[ -n "$probe_failing" ]]; then
+    log "promoted with flagged canaries ($probe_failing); cf ok is not required"
+    cf_line="CF_CLEAN=no"
+elif (( probe_of == probe_standing )); then
+    (( probe_of > 0 )) || log "no active canary at the gate; $SLOT is cf ok by default"
+    cf_line="CF_CLEAN=yes"
+fi
+if [[ -n "$cf_line" ]]; then
+    { mkdir -p "$HEALTH_DIR" \
+        && printf '%s\nAT=%s\nFAILING=%s\n' "$cf_line" "$(date +%s)" "$probe_failing" > "$HEALTH_DIR/.cf-state.$SLOT.tmp" \
+        && mv "$HEALTH_DIR/.cf-state.$SLOT.tmp" "$HEALTH_DIR/.cf-state.$SLOT"; } \
+        || { rm -f "$HEALTH_DIR/.cf-state.$SLOT" 2>/dev/null || true
+             log "WARN: could not write the cf verdict for $SLOT; it stays unchecked"; }
+else
+    rm -f "$HEALTH_DIR/.cf-state.$SLOT" || log "WARN: could not remove the old cf verdict for $SLOT"
+fi
+history_append "$SLOT" "${OLD_LOGICAL:-?}" "$logical_clean" "$TRIGGER" "promoted" "$total"
+ledger_record --source promote --slot "$SLOT" --verdict pass \
     --exit-ip "$good_exit_ip" --entry-ip "$good_endpoint" --logical="$logical_clean"
 
 # 7) Prune — keep newest 2 auto-mints per slot.

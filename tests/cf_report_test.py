@@ -206,26 +206,61 @@ def test_render_says_none_when_nothing_is_asn_banned():
 
 
 def test_build_advisory_tier_scores_pool_on_verdicts_only() -> None:
-    # In shadow mode the canaries must not shape the pool: a verdict-pass exit
-    # with a challenged canary is known-good, and the standard is empty.
+    # In advisory mode the canaries do not gate anything: a verdict-pass exit with
+    # a challenged canary is known-good, and the standard is empty.
     recs = [rec(NOW - 10, "10.1.1.1", canaries={"discord.com": "clean", "www.patreon.com": "challenge"})]
     strict = cf_report.build(recs, H, NOW, slots=1, target=20, min_exits=8, tier="mandatory")
     shadow = cf_report.build(recs, H, NOW, slots=1, target=20, min_exits=8, tier="advisory")
     assert strict["pool"]["known_good"] == 0 and strict["standard"]["size"] == 2
     assert shadow["pool"]["known_good"] == 1 and shadow["standard"]["size"] == 0
     assert shadow["standard"]["tier"] == "advisory" and shadow["standard"]["passing_exits_24h"] == 1
-    assert "advisory" in cf_report.render(shadow)
+    assert "tier: advisory" in cf_report.render(shadow)
+    assert "tier: mandatory" in cf_report.render(strict)
     assert [c["host"] for c in shadow["canaries"]] == H          # canary stats still use the full basket
+
+
+def test_build_defaults_to_mandatory() -> None:
+    st = cf_report.build([], H, NOW, slots=1, target=20, min_exits=8)
+    assert st["standard"]["tier"] == "mandatory"
+    assert "advisory" not in cf_report.render(st)
 
 
 def test_cli_cf_tier_flag(tmp_path: Path, capsys) -> None:
     p = tmp_path / "l.jsonl"
     ledger.append(str(p), rec(NOW - 10, "10.1.1.1", canaries={"discord.com": "challenge", "www.patreon.com": "clean"}))
-    rc = cf_report.main(["--path", str(p), "--canaries-file", str(tmp_path / "none.json"), "--slots", "1",
-                         "--target", "20", "--min-exits", "8", "--now", str(NOW), "--cf-tier", "advisory", "--json"])
-    assert rc == 0
+    args = ["--path", str(p), "--canaries-file", str(tmp_path / "none.json"), "--slots", "1",
+            "--target", "20", "--min-exits", "8", "--now", str(NOW), "--json"]
+    assert cf_report.main(args + ["--cf-tier", "advisory"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["standard"]["tier"] == "advisory" and out["pool"]["known_good"] == 1
+    assert cf_report.main(args + ["--cf-tier", "bogus"]) == 0           # anything but mandatory is advisory
+    assert json.loads(capsys.readouterr().out)["standard"]["tier"] == "advisory"
+    assert cf_report.main(args + ["--cf-tier", ""]) == 0                # empty is mandatory, as in checklib.sh
+    assert json.loads(capsys.readouterr().out)["standard"]["tier"] == "mandatory"
+
+
+def test_cf_report_env_path_reads_an_empty_tier_as_mandatory(tmp_path: Path, monkeypatch) -> None:
+    env = tmp_path / "proteus.env"
+    env.write_text("PROTEUS_CF_TIER=\n")
+    monkeypatch.setattr(cf_report, "ENV_FILES", (str(env),))
+    assert cf_report.env_str("PROTEUS_CF_TIER", "mandatory") == "mandatory"
+    env.write_text('PROTEUS_CF_TIER=""\n')
+    assert cf_report.env_str("PROTEUS_CF_TIER", "mandatory") == "mandatory"
+
+
+def test_cli_cf_tier_defaults_to_the_env_files(tmp_path: Path, capsys, monkeypatch) -> None:
+    p = tmp_path / "l.jsonl"
+    ledger.append(str(p), rec(NOW - 10, "10.1.1.1", canaries={"discord.com": "challenge", "www.patreon.com": "clean"}))
+    env = tmp_path / "proteus.env"
+    env.write_text('PROTEUS_CF_TIER="advisory"\n')
+    monkeypatch.setattr(cf_report, "ENV_FILES", (str(env),))
+    args = ["--path", str(p), "--canaries-file", str(tmp_path / "none.json"), "--slots", "1",
+            "--target", "20", "--min-exits", "8", "--now", str(NOW), "--json"]
+    assert cf_report.main(args) == 0
+    assert json.loads(capsys.readouterr().out)["standard"]["tier"] == "advisory"
+    monkeypatch.setattr(cf_report, "ENV_FILES", (str(tmp_path / "missing.env"),))
+    assert cf_report.main(args) == 0
+    assert json.loads(capsys.readouterr().out)["standard"]["tier"] == "mandatory"
 
 
 # RFC 1918 stand-ins (see the block below this one too): good_prefixes is

@@ -17,10 +17,10 @@ dispatchable origins and they are mapped differently:
   entry: trusted traffic is dispatched per destination.
 
 Each decision is balanced by pick_distributed (fresh score, not degraded,
-within SPREAD_BAND of the best, least-loaded, playable preferred) against
-the one map it lands in. We then set the packet's fwmark and accept it, and
-policy routing steers it to the slot's namespace. Later packets that hit a
-map entry are marked in the kernel and never reach us.
+cf ok first, within SPREAD_BAND of the best, least-loaded, playable
+preferred) against the one map it lands in. We then set the packet's fwmark
+and accept it, and policy routing steers it to the slot's namespace. Later
+packets that hit a map entry are marked in the kernel and never reach us.
 
 The list of active instances is read from /etc/proteus/state/*.state.
 Send SIGHUP to reload it (rotate-slot.sh does after every promotion, and
@@ -90,8 +90,9 @@ def _load_env_file(path: str, *, protected: frozenset[str]) -> None:
 
 # Load proteus.env then proteus-local.env (UI overrides) into os.environ
 # BEFORE importing dispatcher_logic or computing our own env-derived module
-# constants (CLIENT_VLAN, PIN_TTL_S) below — dispatcher_logic.SPREAD_BAND is
-# computed at import time from os.environ, so the env files must land first.
+# constants (CLIENT_VLAN, PIN_TTL_S) below — dispatcher_logic.SPREAD_BAND and
+# CF_REQUIRED are computed at import time from os.environ, so the env files
+# must land first.
 _PROTECTED_ENV = frozenset(os.environ)
 _load_env_file("/etc/proteus/proteus.env", protected=_PROTECTED_ENV)
 _load_env_file("/etc/proteus/proteus-local.env", protected=_PROTECTED_ENV)
@@ -103,7 +104,7 @@ from dispatcher_logic import (
     load_instances, load_state_files, is_live_slot, unclaimed_slot_marks,
     degraded_marks, parse_source_pin_elements,
     parse_source_pin_elements_with_ttl, parse_get_element_mark,
-    pick_distributed, is_pinnable_source, is_udm_tunnel_source,
+    pick_distributed, prefer_cf_clean, is_pinnable_source, is_udm_tunnel_source,
     build_status_snapshot,
 )
 import ipaddress
@@ -594,17 +595,17 @@ class Dispatcher:
         if chosen is not None:
             return chosen
 
-        # 2. No fresh scores yet — fall back to today's healthy random.
+        # 2. No fresh scores yet — a random healthy slot, "cf ok" first.
         healthy = [(n, m) for (n, m) in instances if _is_healthy(n)]
         if healthy:
-            return random.choice(healthy)
+            return random.choice(prefer_cf_clean(healthy, HEALTH_DIR))
 
-        # 3. Everything degraded — log loudly, ride a known-bad slot.
+        # 3. Everything degraded — log loudly, ride a known-bad slot, "cf ok" first.
         log.warning(
             "all %d instance(s) DEGRADED; falling back to full pool",
             len(instances),
         )
-        return random.choice(instances)
+        return random.choice(prefer_cf_clean(instances, HEALTH_DIR))
 
     def handle(self, pkt) -> None:
         try:
